@@ -388,15 +388,23 @@ export function useTradingTerminal() {
             const vol = Number(live.quoteVolume);
             const bVol = Number(live.volume);
             if (!Number.isFinite(p) || p <= 0) return pair;
+            const chgRounded = Number(chg.toFixed(2));
+            const nextSignal: PairMarketData['signal'] =
+              pair.rsi14 > 56 && chgRounded > 0.4
+                ? 'BUY'
+                : pair.rsi14 < 40 || chgRounded < -2.0
+                  ? 'SELL'
+                  : 'HOLD';
             return {
               ...pair,
               price: p,
-              change24h: Number(chg.toFixed(2)),
+              change24h: chgRounded,
               high24h: hi,
               low24h: lo,
               volume24h: vol,
               baseVolume24h: bVol,
-              perf: { ...pair.perf, today: Number(chg.toFixed(2)) },
+              signal: nextSignal,
+              perf: { ...pair.perf, today: chgRounded },
               sparkline: [
                 ...pair.sparkline.slice(1),
                 {
@@ -678,53 +686,102 @@ export function useTradingTerminal() {
     const interval = window.setInterval(() => {
       if (document.hidden) return;
 
-      setMarketPairs((prevPairs) => {
-        const nextPairs = prevPairs.map((pair) => {
-          const drift = binanceFeedLive ? 0 : (Math.random() - 0.482) * 0.0042;
-          const nextPrice =
-            drift === 0
-              ? pair.price
-              : Number((pair.price * (1 + drift)).toFixed(pair.price > 10 ? 2 : 5));
-          const nextChange =
-            drift === 0 ? pair.change24h : Number((pair.change24h + drift * 100).toFixed(2));
-          const nextRsi = Number(
-            Math.max(18, Math.min(84, pair.rsi14 + (Math.random() - 0.5) * 1.4)).toFixed(1)
-          );
-          const nextInflow = Number(
-            Math.max(25, Math.min(78, pair.inflowPct + (Math.random() - 0.5) * 1.8)).toFixed(1)
-          );
-          const signal: PairMarketData['signal'] =
-            nextRsi > 56 && nextChange > 0.4
-              ? 'BUY'
-              : nextRsi < 40 || nextChange < -2.0
-                ? 'SELL'
-                : 'HOLD';
+      const prevPairs = marketPairsRef.current;
+      const generatedAlerts: SmartAlert[] = [];
 
-          const nextSpark =
-            drift === 0
-              ? pair.sparkline
-              : [
-                  ...pair.sparkline.slice(1),
-                  {
-                    t: new Date().toLocaleTimeString([], { minute: '2-digit', second: '2-digit' }),
-                    p: nextPrice,
-                  },
-                ];
+      const nextPairs = prevPairs.map((pair) => {
+        const drift = binanceFeedLive ? 0 : (Math.random() - 0.482) * 0.0042;
+        const nextPrice =
+          drift === 0
+            ? pair.price
+            : Number((pair.price * (1 + drift)).toFixed(pair.price > 10 ? 2 : 5));
+        const nextChange =
+          drift === 0 ? pair.change24h : Number((pair.change24h + drift * 100).toFixed(2));
+        const nextRsi = Number(
+          Math.max(18, Math.min(84, pair.rsi14 + (Math.random() - 0.5) * 1.4)).toFixed(1)
+        );
+        const nextInflow = Number(
+          Math.max(25, Math.min(78, pair.inflowPct + (Math.random() - 0.5) * 1.8)).toFixed(1)
+        );
+        const signal: PairMarketData['signal'] =
+          nextRsi > 56 && nextChange > 0.4
+            ? 'BUY'
+            : nextRsi < 40 || nextChange < -2.0
+              ? 'SELL'
+              : 'HOLD';
 
+        const nextSpark =
+          drift === 0
+            ? pair.sparkline
+            : [
+                ...pair.sparkline.slice(1),
+                {
+                  t: new Date().toLocaleTimeString([], { minute: '2-digit', second: '2-digit' }),
+                  p: nextPrice,
+                },
+              ];
+
+        if (signal !== pair.signal && (signal === 'BUY' || signal === 'SELL')) {
+          generatedAlerts.push({
+            id: createUniqueId('ALT', pair.base),
+            pair: pair.symbol,
+            title: signal === 'BUY' ? 'BUY Signal Triggered' : 'SELL Signal Triggered',
+            desc:
+              signal === 'BUY'
+                ? `RSI ${nextRsi.toFixed(1)} · Inflow ${nextInflow.toFixed(1)}% · Momentum breakout @ $${nextPrice}`
+                : `RSI ${nextRsi.toFixed(1)} · 24h ${nextChange >= 0 ? '+' : ''}${nextChange.toFixed(2)}% · Bearish pressure @ $${nextPrice}`,
+            deltaPct: nextChange,
+            time: new Date().toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+            }),
+            spark: nextSpark.slice(-7).map((pt) => pt.p),
+          });
+        }
+
+        return {
+          ...pair,
+          price: nextPrice,
+          change24h: nextChange,
+          high24h: Math.max(pair.high24h, nextPrice),
+          low24h: Math.min(pair.low24h, nextPrice),
+          inflowPct: nextInflow,
+          rsi14: nextRsi,
+          signal,
+          sparkline: nextSpark,
+        };
+      });
+
+      setMarketPairs(nextPairs);
+
+      if (generatedAlerts.length > 0) {
+        setSmartAlerts((prev) => [...generatedAlerts, ...prev].slice(0, 5));
+      }
+
+      setDemoTrades((prevTrades) =>
+        prevTrades.map((trade) => {
+          if (trade.status !== 'OPEN') return trade;
+          const matched = nextPairs.find((p) => p.symbol === trade.pair);
+          if (!matched) return trade;
+          const currentPrice = matched.price;
+          const profitUsdt = Number(
+            ((currentPrice - trade.entry_price) * trade.quantity).toFixed(2)
+          );
+          const profitPct = Number(
+            ((profitUsdt / Math.max(0.01, trade.invested_usdt)) * 100).toFixed(2)
+          );
           return {
-            ...pair,
-            price: nextPrice,
-            change24h: nextChange,
-            high24h: Math.max(pair.high24h, nextPrice),
-            low24h: Math.min(pair.low24h, nextPrice),
-            inflowPct: nextInflow,
-            rsi14: nextRsi,
-            signal,
-            sparkline: nextSpark,
+            ...trade,
+            current_price: currentPrice,
+            profit_usdt: profitUsdt,
+            profit_pct: profitPct,
           };
-        });
+        })
+      );
 
-        setDemoTrades((prevTrades) =>
+      if (isDemoMode) {
+        setLiveTrades((prevTrades) =>
           prevTrades.map((trade) => {
             if (trade.status !== 'OPEN') return trade;
             const matched = nextPairs.find((p) => p.symbol === trade.pair);
@@ -744,32 +801,7 @@ export function useTradingTerminal() {
             };
           })
         );
-
-        if (isDemoMode) {
-          setLiveTrades((prevTrades) =>
-            prevTrades.map((trade) => {
-              if (trade.status !== 'OPEN') return trade;
-              const matched = nextPairs.find((p) => p.symbol === trade.pair);
-              if (!matched) return trade;
-              const currentPrice = matched.price;
-              const profitUsdt = Number(
-                ((currentPrice - trade.entry_price) * trade.quantity).toFixed(2)
-              );
-              const profitPct = Number(
-                ((profitUsdt / Math.max(0.01, trade.invested_usdt)) * 100).toFixed(2)
-              );
-              return {
-                ...trade,
-                current_price: currentPrice,
-                profit_usdt: profitUsdt,
-                profit_pct: profitPct,
-              };
-            })
-          );
-        }
-
-        return nextPairs;
-      });
+      }
 
       logCycleRef.current += 1;
 

@@ -1,13 +1,17 @@
-import React, { useState } from 'react';
-import { motion, useReducedMotion } from 'framer-motion';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import {
   Activity,
+  Bell,
+  BellOff,
+  BellRing,
   Power,
   Radio,
   RotateCcw,
   ShieldAlert,
   ShieldCheck,
   TrendingUp,
+  X,
 } from 'lucide-react';
 import {
   Area,
@@ -19,6 +23,12 @@ import {
   YAxis,
 } from 'recharts';
 import { audioSynth } from '../../lib/audioSynth';
+import {
+  DesktopNotificationPermission,
+  getDesktopNotificationPermission,
+  requestDesktopNotificationPermission,
+  sendDesktopNotification,
+} from '../../lib/desktopNotifications';
 import { TERMINAL_THEMES } from '../../lib/themes';
 import {
   BotSettings,
@@ -76,6 +86,18 @@ interface CommandCenterProps {
 }
 
 const TIMEFRAMES: EquityTimeframe[] = ['1D', '1W', '1M', 'ALL'];
+const DESKTOP_ALERTS_STORAGE_KEY = 'aegis_desktop_alerts_enabled_v1';
+
+interface LiveSignalNotice {
+  id: string;
+  pair: string;
+  signal: 'BUY' | 'SELL';
+  price: number;
+  title: string;
+  detail: string;
+  time: string;
+  desktopDelivered: boolean;
+}
 
 export const CommandCenter: React.FC<CommandCenterProps> = ({
   t,
@@ -103,10 +125,255 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   const [chartPair, setChartPair] = useState<string>('BTCUSDT');
   const [toggling, setToggling] = useState(false);
 
+  const [desktopAlertsEnabled, setDesktopAlertsEnabled] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    try {
+      const saved = window.localStorage.getItem(DESKTOP_ALERTS_STORAGE_KEY);
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
+  const [notifPermission, setNotifPermission] = useState<DesktopNotificationPermission>(() =>
+    getDesktopNotificationPermission()
+  );
+  const [activeSignalNotice, setActiveSignalNotice] = useState<LiveSignalNotice | null>(null);
+
+  const prevSignalsRef = useRef<Map<string, PairMarketData['signal']> | null>(null);
+  const seenAlertIdsRef = useRef<Set<string> | null>(null);
+  const seenTradeStatesRef = useRef<Map<string, Trade['status']> | null>(null);
+  const pairCooldownRef = useRef<Map<string, number>>(new Map());
+
   const equityData = getEquitySeries(timeframe);
   const isRunning = botStatus === 'RUNNING';
   const isOffline = botStatus === 'OFFLINE';
   const theme = TERMINAL_THEMES[effectiveTheme];
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(DESKTOP_ALERTS_STORAGE_KEY, String(desktopAlertsEnabled));
+    } catch {
+      // ignore storage errors
+    }
+  }, [desktopAlertsEnabled]);
+
+  useEffect(() => {
+    const syncPerm = () => setNotifPermission(getDesktopNotificationPermission());
+    window.addEventListener('focus', syncPerm);
+    document.addEventListener('visibilitychange', syncPerm);
+    return () => {
+      window.removeEventListener('focus', syncPerm);
+      document.removeEventListener('visibilitychange', syncPerm);
+    };
+  }, []);
+
+  const dispatchTradeSignalNotification = useCallback(
+    (payload: {
+      pair: string;
+      signal: 'BUY' | 'SELL';
+      price: number;
+      title: string;
+      detail: string;
+      bypassCooldown?: boolean;
+    }) => {
+      const nowMs = Date.now();
+      const lastSent = pairCooldownRef.current.get(`${payload.pair}:${payload.signal}`) ?? 0;
+      if (!payload.bypassCooldown && nowMs - lastSent < 25_000) {
+        return;
+      }
+      pairCooldownRef.current.set(`${payload.pair}:${payload.signal}`, nowMs);
+
+      const desktopDelivered = desktopAlertsEnabled
+        ? sendDesktopNotification({
+            title: payload.title,
+            body: `${payload.detail} · Click to inspect ${payload.pair}`,
+            tag: `aegis-signal-${payload.pair}`,
+            onClick: () => setChartPair(payload.pair),
+          })
+        : false;
+
+      if (desktopAlertsEnabled) {
+        audioSynth.playTradeChime(payload.signal === 'BUY');
+      }
+
+      setActiveSignalNotice({
+        id: `${payload.pair}-${nowMs}`,
+        pair: payload.pair,
+        signal: payload.signal,
+        price: payload.price,
+        title: payload.title,
+        detail: payload.detail,
+        time: new Date(nowMs).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+        desktopDelivered,
+      });
+    },
+    [desktopAlertsEnabled]
+  );
+
+  // Auto-clear in-app signal toast banner after 12 seconds
+  useEffect(() => {
+    if (!activeSignalNotice) return;
+    const timer = window.setTimeout(() => {
+      setActiveSignalNotice((prev) => (prev?.id === activeSignalNotice.id ? null : prev));
+    }, 12_000);
+    return () => window.clearTimeout(timer);
+  }, [activeSignalNotice]);
+
+  // Watch real-time market pair signal transitions (HOLD/SELL -> BUY or HOLD/BUY -> SELL)
+  useEffect(() => {
+    if (!prevSignalsRef.current) {
+      prevSignalsRef.current = new Map(marketPairs.map((p) => [p.symbol, p.signal]));
+      return;
+    }
+
+    const prevMap = prevSignalsRef.current;
+    for (const pair of marketPairs) {
+      const prevSig = prevMap.get(pair.symbol);
+      if (prevSig && prevSig !== pair.signal && (pair.signal === 'BUY' || pair.signal === 'SELL')) {
+        if (desktopAlertsEnabled) {
+          dispatchTradeSignalNotification({
+            pair: pair.symbol,
+            signal: pair.signal,
+            price: pair.price,
+            title: `${pair.signal === 'BUY' ? '▲ BUY' : '▼ SELL'} Trade Signal: ${pair.symbol}`,
+            detail: `@ $${pair.price.toLocaleString('en-US', { maximumFractionDigits: 5 })} · RSI ${pair.rsi14.toFixed(1)} · 24h ${pair.change24h >= 0 ? '+' : ''}${pair.change24h.toFixed(2)}%`,
+          });
+        }
+      }
+      prevMap.set(pair.symbol, pair.signal);
+    }
+  }, [marketPairs, desktopAlertsEnabled, dispatchTradeSignalNotification]);
+
+  // Watch real-time Smart Tracker signal alerts
+  useEffect(() => {
+    if (!seenAlertIdsRef.current) {
+      seenAlertIdsRef.current = new Set(smartAlerts.map((a) => a.id));
+      return;
+    }
+    const seen = seenAlertIdsRef.current;
+    for (const alert of smartAlerts) {
+      if (!seen.has(alert.id)) {
+        seen.add(alert.id);
+        if (desktopAlertsEnabled) {
+          const matchedPair = marketPairs.find((p) => p.symbol === alert.pair);
+          const sig: 'BUY' | 'SELL' =
+            alert.title.toUpperCase().includes('SELL') || alert.deltaPct < 0 ? 'SELL' : 'BUY';
+          dispatchTradeSignalNotification({
+            pair: alert.pair,
+            signal: sig,
+            price: matchedPair?.price ?? 0,
+            title: `${sig === 'BUY' ? '▲' : '▼'} ${alert.pair}: ${alert.title}`,
+            detail: alert.desc,
+          });
+        }
+      }
+    }
+  }, [smartAlerts, marketPairs, desktopAlertsEnabled, dispatchTradeSignalNotification]);
+
+  // Watch new or closed bot trades in real time
+  useEffect(() => {
+    if (!seenTradeStatesRef.current) {
+      seenTradeStatesRef.current = new Map(trades.map((tr) => [tr.id, tr.status]));
+      return;
+    }
+    const seen = seenTradeStatesRef.current;
+    for (const tr of trades) {
+      const prevStatus = seen.get(tr.id);
+      if (!prevStatus) {
+        seen.set(tr.id, tr.status);
+        if (desktopAlertsEnabled && tr.status === 'OPEN') {
+          dispatchTradeSignalNotification({
+            pair: tr.pair,
+            signal: tr.side,
+            price: tr.entry_price,
+            title: `⚡ ${tr.side} Trigger Executed: ${tr.pair}`,
+            detail: `Entry $${tr.entry_price} · Lot $${tr.invested_usdt} USDT (${workspace})`,
+            bypassCooldown: true,
+          });
+        }
+      } else if (prevStatus === 'OPEN' && tr.status === 'CLOSED') {
+        seen.set(tr.id, tr.status);
+        if (desktopAlertsEnabled) {
+          dispatchTradeSignalNotification({
+            pair: tr.pair,
+            signal: 'SELL',
+            price: tr.exit_price ?? tr.current_price,
+            title: `✓ Trade Closed: ${tr.pair} (${tr.profit_usdt >= 0 ? '+' : ''}$${tr.profit_usdt.toFixed(2)})`,
+            detail: `Exit @ $${tr.exit_price ?? tr.current_price} · Return ${tr.profit_pct >= 0 ? '+' : ''}${tr.profit_pct.toFixed(2)}%`,
+            bypassCooldown: true,
+          });
+        }
+      }
+    }
+  }, [trades, workspace, desktopAlertsEnabled, dispatchTradeSignalNotification]);
+
+  const handleToggleDesktopAlerts = async () => {
+    audioSynth.playClick();
+    const currentPerm = getDesktopNotificationPermission();
+    setNotifPermission(currentPerm);
+
+    if (currentPerm === 'default') {
+      const nextPerm = await requestDesktopNotificationPermission();
+      setNotifPermission(nextPerm);
+      if (nextPerm === 'granted') {
+        setDesktopAlertsEnabled(true);
+        sendDesktopNotification({
+          title: 'Aegis Quant — Desktop Signal Alerts Active',
+          body: 'You will now receive instant browser alerts when BUY/SELL trade signals fire.',
+          tag: 'aegis-alerts-armed',
+        });
+      }
+      return;
+    }
+
+    setDesktopAlertsEnabled((prev) => !prev);
+  };
+
+  const handleTestSignalAlert = async () => {
+    audioSynth.playClick();
+    let perm = getDesktopNotificationPermission();
+    if (perm === 'default') {
+      perm = await requestDesktopNotificationPermission();
+    }
+    setNotifPermission(perm);
+    if (!desktopAlertsEnabled) {
+      setDesktopAlertsEnabled(true);
+    }
+
+    const activePair = marketPairs.find((p) => p.symbol === chartPair) ?? marketPairs[0];
+    const sig: 'BUY' | 'SELL' = activePair.signal === 'SELL' ? 'SELL' : 'BUY';
+
+    const title = `${sig === 'BUY' ? '▲ BUY' : '▼ SELL'} Signal Alert: ${activePair.symbol}`;
+    const detail = `@ $${activePair.price.toLocaleString('en-US', { maximumFractionDigits: 5 })} · RSI ${activePair.rsi14.toFixed(1)} · 24h ${activePair.change24h >= 0 ? '+' : ''}${activePair.change24h.toFixed(2)}%`;
+
+    const desktopDelivered = sendDesktopNotification({
+      title,
+      body: `${detail} · Click to view chart`,
+      tag: `aegis-test-${activePair.symbol}`,
+      onClick: () => setChartPair(activePair.symbol),
+    });
+
+    audioSynth.playTradeChime(sig === 'BUY');
+    setActiveSignalNotice({
+      id: `test-${Date.now()}`,
+      pair: activePair.symbol,
+      signal: sig,
+      price: activePair.price,
+      title,
+      detail,
+      time: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }),
+      desktopDelivered,
+    });
+  };
 
   const handlePowerClick = async () => {
     setToggling(true);
@@ -268,7 +535,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           <span className="font-mono-tech text-[11px] text-slate-300">
             LOT: <strong className="text-emerald-300">${settings.amount_per_trade}</strong>
           </span>
@@ -292,6 +559,144 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           )}
         </div>
       </div>
+
+      {/* Real-Time Desktop Trade Signal Notification Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800/90 bg-[#070a12]/90 px-4 py-2.5">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div
+            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+              notifPermission === 'denied'
+                ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                : desktopAlertsEnabled && notifPermission === 'granted'
+                  ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
+                  : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+            }`}
+          >
+            {desktopAlertsEnabled && notifPermission !== 'denied' ? (
+              <BellRing className="h-4 w-4" />
+            ) : (
+              <BellOff className="h-4 w-4" />
+            )}
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 font-display text-xs font-bold tracking-wider text-slate-100 uppercase">
+              <span>{t.desktopAlertsTitle}</span>
+              <InfoTip text={t.helpDesktopAlerts} label={t.desktopAlertsTitle} />
+            </div>
+            <p className="truncate font-mono-tech text-[11px] text-slate-400">
+              {notifPermission === 'unsupported'
+                ? t.desktopAlertsUnsupported
+                : notifPermission === 'denied'
+                  ? t.desktopAlertsBlockedHint
+                  : notifPermission === 'default'
+                    ? t.desktopAlertsGrantHint
+                    : t.desktopAlertsReadyHint}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            disabled={notifPermission === 'unsupported'}
+            onClick={handleToggleDesktopAlerts}
+            className={`flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-1 font-mono-tech text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+              notifPermission === 'denied'
+                ? 'border-rose-500/45 bg-rose-500/10 text-rose-300'
+                : notifPermission === 'default'
+                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
+                  : desktopAlertsEnabled
+                    ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                    : 'border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            {desktopAlertsEnabled && notifPermission === 'granted' ? (
+              <Bell className="h-3.5 w-3.5" />
+            ) : (
+              <BellOff className="h-3.5 w-3.5" />
+            )}
+            <span>
+              {notifPermission === 'unsupported'
+                ? t.desktopAlertsUnsupported
+                : notifPermission === 'denied'
+                  ? t.desktopAlertsBlocked
+                  : notifPermission === 'default'
+                    ? t.desktopAlertsEnableBtn
+                    : desktopAlertsEnabled
+                      ? t.desktopAlertsOn
+                      : t.desktopAlertsOff}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleTestSignalAlert}
+            className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-cyan-500/45 bg-cyan-500/12 px-3 py-1 font-mono-tech text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/22"
+          >
+            <BellRing className="h-3.5 w-3.5" />
+            <span>{t.desktopAlertsTestBtn}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Live Triggered Signal Notification Toast Banner */}
+      <AnimatePresence>
+        {activeSignalNotice && (
+          <motion.div
+            key={activeSignalNotice.id}
+            initial={reducedMotion ? false : { opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={reducedMotion ? undefined : { opacity: 0, y: -6 }}
+            transition={{ duration: 0.2 }}
+            className={`flex items-center justify-between gap-3 rounded-xl border px-4 py-2.5 ${
+              activeSignalNotice.signal === 'BUY'
+                ? 'border-emerald-400/55 bg-emerald-500/12 shadow-[0_0_20px_rgba(16,185,129,0.18)]'
+                : 'border-rose-400/55 bg-rose-500/12 shadow-[0_0_20px_rgba(244,63,94,0.18)]'
+            }`}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                audioSynth.playClick();
+                setChartPair(activeSignalNotice.pair);
+              }}
+              className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 text-left"
+            >
+              <BellRing
+                className={`h-4 w-4 shrink-0 ${
+                  activeSignalNotice.signal === 'BUY' ? 'text-emerald-300' : 'text-rose-300'
+                }`}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2 font-display text-xs font-bold tracking-wider uppercase">
+                  <span
+                    className={
+                      activeSignalNotice.signal === 'BUY' ? 'text-emerald-300' : 'text-rose-300'
+                    }
+                  >
+                    {activeSignalNotice.title}
+                  </span>
+                  <span className="font-mono-tech text-[10px] font-normal text-slate-400">
+                    {activeSignalNotice.time} ·{' '}
+                    {activeSignalNotice.desktopDelivered ? 'Desktop + Terminal' : 'Terminal Alert'}
+                  </span>
+                </div>
+                <p className="truncate font-mono-tech text-[11px] text-slate-200">
+                  {activeSignalNotice.detail}
+                </p>
+              </div>
+            </button>
+            <button
+              type="button"
+              aria-label="Dismiss notification"
+              onClick={() => setActiveSignalNotice(null)}
+              className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-slate-700/70 text-slate-400 transition-colors hover:border-slate-500 hover:text-slate-100"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {workspace === 'LIVE' && !settings.bot_enabled && (
         <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-2.5 font-mono-tech text-xs text-amber-200">
