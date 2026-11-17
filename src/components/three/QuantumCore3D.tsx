@@ -67,10 +67,12 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
     [trades]
   );
 
-  const lastClosedTrade = useMemo(
-    () => trades.find((tr) => tr.status === 'CLOSED'),
+  const closedTrades = useMemo(
+    () => trades.filter((tr) => tr.status === 'CLOSED').slice(0, 4),
     [trades]
   );
+
+  const lastClosedTrade = closedTrades[0];
 
   useEffect(() => {
     const container = containerRef.current;
@@ -237,7 +239,7 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
     depthGroup.rotation.x = 0.35;
     depthGroup.rotation.y = -0.35;
 
-    // --- 5. RADAR ORBITING TRADE NODES (Up to 8 active positions shown on radar) ---
+    // --- 5. RADAR ORBITING TRADE NODES + HISTORICAL ENTRY->EXIT GEOMETRIC CONNECTORS ---
     const blipGeo = new THREE.SphereGeometry(0.075, 10, 10);
     const radarBlips: { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial }[] = [];
     for (let i = 0; i < 8; i++) {
@@ -250,6 +252,44 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
       mesh.visible = false;
       radarBlipsGroup.add(mesh);
       radarBlips.push({ mesh, mat });
+    }
+
+    const histEntryGeo = new THREE.OctahedronGeometry(0.055, 0);
+    const histExitGeo = new THREE.SphereGeometry(0.058, 10, 10);
+    const histConnectors: {
+      line: THREE.Line;
+      lineGeo: THREE.BufferGeometry;
+      lineMat: THREE.LineBasicMaterial;
+      entryMesh: THREE.Mesh;
+      exitMesh: THREE.Mesh;
+      nodeMat: THREE.MeshBasicMaterial;
+    }[] = [];
+
+    for (let i = 0; i < 6; i++) {
+      const lineGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0, 0, 0),
+      ]);
+      const lineMat = new THREE.LineBasicMaterial({
+        color: 0x10b981,
+        transparent: true,
+        opacity: 0.88,
+      });
+      const line = new THREE.Line(lineGeo, lineMat);
+      line.visible = false;
+
+      const nodeMat = new THREE.MeshBasicMaterial({
+        color: 0x10b981,
+        transparent: true,
+        opacity: 0.95,
+      });
+      const entryMesh = new THREE.Mesh(histEntryGeo, nodeMat);
+      const exitMesh = new THREE.Mesh(histExitGeo, nodeMat);
+      entryMesh.visible = false;
+      exitMesh.visible = false;
+
+      radarBlipsGroup.add(line, entryMesh, exitMesh);
+      histConnectors.push({ line, lineGeo, lineMat, entryMesh, exitMesh, nodeMat });
     }
 
     const clock = new THREE.Clock();
@@ -369,6 +409,46 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
         const s = 1 + Math.sin(elapsed * 4 + i) * 0.22;
         b.mesh.scale.setScalar(s);
       });
+
+      // Position historical closed trades as Entry -> Exit geometric beams (Green=Profit, Red=Loss)
+      const histClosed = tradesRef.current.filter((tr) => tr.status === 'CLOSED').slice(0, 6);
+      histConnectors.forEach((hc, i) => {
+        const tr = histClosed[i];
+        if (!tr) {
+          hc.line.visible = false;
+          hc.entryMesh.visible = false;
+          hc.exitMesh.visible = false;
+          return;
+        }
+        hc.line.visible = true;
+        hc.entryMesh.visible = true;
+        hc.exitMesh.visible = true;
+
+        const isProfit = tr.profit_usdt >= 0;
+        const hex = isProfit ? 0x10b981 : 0xf43f5e;
+        hc.lineMat.color.setHex(hex);
+        hc.nodeMat.color.setHex(hex);
+
+        const baseAngle = elapsed * 0.35 + (i * Math.PI * 2) / Math.max(1, histClosed.length);
+        const exitAngle = baseAngle + 0.55;
+        const rIn = 0.88;
+        const rOut = 1.56;
+        const yIn = -0.35 + (i % 3) * 0.25;
+        const deltaLift = Math.max(-0.45, Math.min(0.45, (tr.profit_pct / 5) * 0.45));
+        const yOut = yIn + deltaLift;
+
+        const p1 = new THREE.Vector3(Math.cos(baseAngle) * rIn, yIn, Math.sin(baseAngle) * rIn);
+        const p2 = new THREE.Vector3(Math.cos(exitAngle) * rOut, yOut, Math.sin(exitAngle) * rOut);
+
+        hc.entryMesh.position.copy(p1);
+        hc.exitMesh.position.copy(p2);
+        hc.entryMesh.rotation.y = elapsed * 1.4;
+
+        const posAttr = hc.lineGeo.getAttribute('position') as THREE.BufferAttribute;
+        posAttr.setXYZ(0, p1.x, p1.y, p1.z);
+        posAttr.setXYZ(1, p2.x, p2.y, p2.z);
+        posAttr.needsUpdate = true;
+      });
     }
 
     function tick() {
@@ -428,6 +508,13 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
       askMat.dispose();
       blipGeo.dispose();
       radarBlips.forEach((b) => b.mat.dispose());
+      histEntryGeo.dispose();
+      histExitGeo.dispose();
+      histConnectors.forEach((hc) => {
+        hc.lineGeo.dispose();
+        hc.lineMat.dispose();
+        hc.nodeMat.dispose();
+      });
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
         container.removeChild(renderer.domElement);
@@ -460,6 +547,25 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
             <span className="text-slate-500">—</span>
           )}
         </div>
+        {closedTrades.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1 pt-0.5">
+            {closedTrades.map((tr) => {
+              const isPos = tr.profit_usdt >= 0;
+              return (
+                <span
+                  key={tr.id}
+                  className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold ${
+                    isPos
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                      : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                  }`}
+                >
+                  ◆─● {tr.pair.replace('USDT', '')} {isPos ? '+' : ''}${tr.profit_usdt.toFixed(2)}
+                </span>
+              );
+            })}
+          </div>
+        )}
         {openTrades.length > 0 && (
           <div className="flex flex-wrap gap-1 pt-0.5">
             {openTrades.map((tr) => (

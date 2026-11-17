@@ -82,6 +82,9 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
             const isSelected = pair.symbol === selectedPair?.symbol;
             const isEnabled = enabledPairs.includes(pair.symbol);
             const hasOpen = openTrades.some((tr) => tr.pair === pair.symbol && tr.status === 'OPEN');
+            const lastClosedForPair = openTrades.find(
+              (tr) => tr.pair === pair.symbol && tr.status === 'CLOSED'
+            );
 
             return (
               <motion.button
@@ -144,6 +147,45 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                       <span className="text-[10px] font-semibold text-amber-300">POS</span>
                     )}
                   </div>
+                  {lastClosedForPair && (
+                    <div className="mt-1.5 flex items-center justify-between gap-1.5 border-t border-white/10 pt-1 font-mono-tech text-[9px]">
+                      <svg viewBox="0 0 42 12" className="h-2.5 w-9 shrink-0 overflow-visible">
+                        <line
+                          x1="3"
+                          y1={lastClosedForPair.profit_usdt >= 0 ? '9' : '3'}
+                          x2="39"
+                          y2={lastClosedForPair.profit_usdt >= 0 ? '3' : '9'}
+                          stroke={lastClosedForPair.profit_usdt >= 0 ? '#10b981' : '#f43f5e'}
+                          strokeWidth="1.6"
+                          strokeLinecap="round"
+                        />
+                        <polygon
+                          points={`3,${lastClosedForPair.profit_usdt >= 0 ? 6.5 : 0.5} 5.5,${
+                            lastClosedForPair.profit_usdt >= 0 ? 9 : 3
+                          } 3,${lastClosedForPair.profit_usdt >= 0 ? 11.5 : 5.5} 0.5,${
+                            lastClosedForPair.profit_usdt >= 0 ? 9 : 3
+                          }`}
+                          fill="#05060a"
+                          stroke={lastClosedForPair.profit_usdt >= 0 ? '#10b981' : '#f43f5e'}
+                          strokeWidth="1.2"
+                        />
+                        <circle
+                          cx="39"
+                          cy={lastClosedForPair.profit_usdt >= 0 ? '3' : '9'}
+                          r="2.4"
+                          fill={lastClosedForPair.profit_usdt >= 0 ? '#10b981' : '#f43f5e'}
+                        />
+                      </svg>
+                      <span
+                        className={`font-bold ${
+                          lastClosedForPair.profit_usdt >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                        }`}
+                      >
+                        {lastClosedForPair.profit_usdt >= 0 ? '+' : ''}$
+                        {lastClosedForPair.profit_usdt.toFixed(2)}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </motion.button>
             );

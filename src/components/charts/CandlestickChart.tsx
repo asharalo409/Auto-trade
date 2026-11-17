@@ -163,7 +163,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   );
 
   const closedPairTrades = useMemo(
-    () => pairTrades.filter((tr) => tr.status === 'CLOSED').slice(0, 3),
+    () => pairTrades.filter((tr) => tr.status === 'CLOSED').slice(0, 5),
     [pairTrades]
   );
 
@@ -333,9 +333,33 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
     [displayCandles, stepX, minPrice, maxPrice]
   );
 
-  // Map open & closed trades onto closest candle indices for B / S markers on chart
-  const tradeChartMarkers = useMemo(() => {
-    if (displayCandles.length === 0) return [];
+  // Map open & historical closed trades onto geometric Entry -> Exit connectors + B / S markers
+  const { tradeChartMarkers, tradeConnectors } = useMemo(() => {
+    if (displayCandles.length === 0) {
+      return {
+        tradeChartMarkers: [] as {
+          id: string;
+          idx: number;
+          y: number;
+          kind: 'BUY' | 'SELL';
+          pnl: number;
+          entryPrice: number;
+        }[],
+        tradeConnectors: [] as {
+          id: string;
+          x1: number;
+          y1: number;
+          x2: number;
+          y2: number;
+          isProfit: boolean;
+          isHistorical: boolean;
+          pnl: number;
+          pct: number;
+          pair: string;
+        }[],
+      };
+    }
+
     const items: {
       id: string;
       idx: number;
@@ -345,46 +369,131 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       entryPrice: number;
     }[] = [];
 
-    const findBestIdx = (targetPrice: number, offsetFallback: number) => {
-      let bestI = Math.max(2, displayCandles.length - 1 - offsetFallback);
+    const connectors: {
+      id: string;
+      x1: number;
+      y1: number;
+      x2: number;
+      y2: number;
+      isProfit: boolean;
+      isHistorical: boolean;
+      pnl: number;
+      pct: number;
+      pair: string;
+    }[] = [];
+
+    const clampY = (y: number) => Math.max(padTop + 6, Math.min(padTop + pricePlotH - 6, y));
+    const idxToX = (idx: number) => padLeft + idx * stepX + stepX / 2;
+
+    const findBestIdxInRange = (
+      targetPrice: number,
+      minIdx: number,
+      maxIdx: number,
+      fallbackIdx: number
+    ) => {
+      const lo = Math.max(0, minIdx);
+      const hi = Math.min(displayCandles.length - 1, maxIdx);
+      if (lo > hi) return Math.max(0, Math.min(displayCandles.length - 1, fallbackIdx));
+      let bestI = fallbackIdx;
       let minDiff = Infinity;
-      displayCandles.forEach((c, i) => {
+      for (let i = lo; i <= hi; i++) {
+        const c = displayCandles[i];
         const d = Math.abs(c.close - targetPrice);
         if (d < minDiff) {
           minDiff = d;
           bestI = i;
         }
-      });
+      }
       return bestI;
     };
 
+    const lastIdx = displayCandles.length - 1;
+    const xLive = idxToX(lastIdx);
+    const yLive = clampY(priceToY(pair.price));
+
     openPairTrades.slice(0, 4).forEach((tr, k) => {
-      const idx = findBestIdx(tr.entry_price, 4 + k * 5);
+      const fallbackIdx = Math.max(2, lastIdx - (5 + k * 5));
+      const idx = findBestIdxInRange(tr.entry_price, 1, Math.max(1, lastIdx - 2), fallbackIdx);
+      const xEntry = idxToX(idx);
+      const yEntry = clampY(priceToY(tr.entry_price));
+
       items.push({
         id: `open-${tr.id}`,
         idx,
-        y: priceToY(tr.entry_price),
+        y: yEntry,
         kind: 'BUY',
         pnl: tr.profit_usdt,
         entryPrice: tr.entry_price,
       });
+
+      connectors.push({
+        id: `conn-open-${tr.id}`,
+        x1: xEntry,
+        y1: yEntry,
+        x2: xLive,
+        y2: yLive,
+        isProfit: tr.profit_usdt >= 0,
+        isHistorical: false,
+        pnl: tr.profit_usdt,
+        pct: tr.profit_pct,
+        pair: tr.pair,
+      });
     });
 
-    closedPairTrades.slice(0, 3).forEach((tr, k) => {
+    closedPairTrades.slice(0, 5).forEach((tr, k) => {
       const exitPx = tr.exit_price ?? tr.current_price;
-      const idx = findBestIdx(exitPx, 2 + k * 7);
+      const maxExitIdx = Math.max(4, lastIdx - 1 - k * 4);
+      const minExitIdx = Math.max(3, maxExitIdx - 6);
+      const exitIdx = findBestIdxInRange(exitPx, minExitIdx, maxExitIdx, maxExitIdx);
+
+      const minEntryIdx = Math.max(0, exitIdx - 10);
+      const maxEntryIdx = Math.max(0, exitIdx - 3);
+      const entryIdx = findBestIdxInRange(
+        tr.entry_price,
+        minEntryIdx,
+        maxEntryIdx,
+        Math.max(0, exitIdx - 5)
+      );
+
+      const x1 = idxToX(entryIdx);
+      const y1 = clampY(priceToY(tr.entry_price));
+      const x2 = idxToX(exitIdx);
+      const y2 = clampY(priceToY(exitPx));
+
+      connectors.push({
+        id: `conn-hist-${tr.id}`,
+        x1,
+        y1,
+        x2,
+        y2,
+        isProfit: tr.profit_usdt >= 0,
+        isHistorical: true,
+        pnl: tr.profit_usdt,
+        pct: tr.profit_pct,
+        pair: tr.pair,
+      });
+
+      items.push({
+        id: `hist-buy-${tr.id}`,
+        idx: entryIdx,
+        y: y1,
+        kind: 'BUY',
+        pnl: tr.profit_usdt,
+        entryPrice: tr.entry_price,
+      });
+
       items.push({
         id: `closed-${tr.id}`,
-        idx,
-        y: priceToY(exitPx),
+        idx: exitIdx,
+        y: y2,
         kind: 'SELL',
         pnl: tr.profit_usdt,
         entryPrice: exitPx,
       });
     });
 
-    return items;
-  }, [closedPairTrades, displayCandles, openPairTrades, minPrice, maxPrice]);
+    return { tradeChartMarkers: items, tradeConnectors: connectors };
+  }, [closedPairTrades, displayCandles, openPairTrades, minPrice, maxPrice, pair.price, pricePlotH, stepX]);
 
   const decimals = pair.price > 50 ? 2 : pair.price > 5 ? 3 : 4;
   const bdtPrice = pair.price * BDT_PER_USD;
@@ -775,46 +884,143 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
             />
           )}
 
+          {/* Geometric Entry -> Exit Connectors (Green = Profit, Red = Loss) */}
+          {tradeConnectors.map((conn) => {
+            const stroke = conn.isProfit ? '#10b981' : '#f43f5e';
+            const glowStroke = conn.isProfit
+              ? 'rgba(16,185,129,0.22)'
+              : 'rgba(244,63,94,0.22)';
+            const fillPoly = conn.isProfit
+              ? 'rgba(16,185,129,0.10)'
+              : 'rgba(244,63,94,0.10)';
+            const midX = (conn.x1 + conn.x2) / 2;
+            const midY = (conn.y1 + conn.y2) / 2;
+
+            return (
+              <g key={conn.id}>
+                {/* Geometric shaded Delta triangle between entry baseline and exit */}
+                {conn.isHistorical && (
+                  <polygon
+                    points={`${conn.x1},${conn.y1} ${conn.x2},${conn.y2} ${conn.x2},${conn.y1}`}
+                    fill={fillPoly}
+                    stroke={glowStroke}
+                    strokeWidth="0.8"
+                  />
+                )}
+                {/* Soft outer halo beam */}
+                <line
+                  x1={conn.x1}
+                  y1={conn.y1}
+                  x2={conn.x2}
+                  y2={conn.y2}
+                  stroke={glowStroke}
+                  strokeWidth={conn.isHistorical ? 5 : 3.5}
+                  strokeLinecap="round"
+                />
+                {/* Crisp geometric Entry -> Exit line */}
+                <line
+                  x1={conn.x1}
+                  y1={conn.y1}
+                  x2={conn.x2}
+                  y2={conn.y2}
+                  stroke={stroke}
+                  strokeWidth={conn.isHistorical ? 1.9 : 1.35}
+                  strokeDasharray={conn.isHistorical ? undefined : '4 3'}
+                  strokeLinecap="round"
+                />
+                {/* Entry Diamond Anchor */}
+                <polygon
+                  points={`${conn.x1},${conn.y1 - 4.5} ${conn.x1 + 4.5},${conn.y1} ${conn.x1},${conn.y1 + 4.5} ${conn.x1 - 4.5},${conn.y1}`}
+                  fill="#04060b"
+                  stroke={stroke}
+                  strokeWidth="1.6"
+                />
+                {/* Exit Circle Anchor (for closed historical trades) */}
+                {conn.isHistorical && (
+                  <>
+                    <circle
+                      cx={conn.x2}
+                      cy={conn.y2}
+                      r={4}
+                      fill={stroke}
+                      stroke="#04060b"
+                      strokeWidth="1.2"
+                    />
+                    {/* Midpoint PnL % tag along vector */}
+                    <rect
+                      x={midX - 19}
+                      y={midY - 7}
+                      width={38}
+                      height={13}
+                      rx={3}
+                      fill="#04060b"
+                      stroke={stroke}
+                      strokeWidth="0.9"
+                      opacity="0.94"
+                    />
+                    <text
+                      x={midX}
+                      y={midY + 2.5}
+                      textAnchor="middle"
+                      fill={conn.isProfit ? '#34d399' : '#fb7185'}
+                      fontSize="8"
+                      fontWeight="700"
+                      fontFamily="JetBrains Mono"
+                    >
+                      {conn.pct >= 0 ? '+' : ''}
+                      {conn.pct.toFixed(1)}%
+                    </text>
+                  </>
+                )}
+              </g>
+            );
+          })}
+
           {/* Open Trade Dashed Entry Lines + B / S Markers on Candles */}
           {tradeChartMarkers.map((mk) => {
             const x = padLeft + mk.idx * stepX + stepX / 2;
             const isBuy = mk.kind === 'BUY';
             const badgeColor = isBuy
-              ? '#10b981'
+              ? mk.id.startsWith('hist-')
+                ? mk.pnl >= 0
+                  ? '#059669'
+                  : '#e11d48'
+                : '#10b981'
               : mk.pnl >= 0
                 ? '#34d399'
                 : '#f43f5e';
             const badgeText = isBuy
               ? 'B'
               : `S ${mk.pnl >= 0 ? '+' : ''}$${mk.pnl.toFixed(1)}`;
-            const pillW = isBuy ? 18 : Math.max(46, badgeText.length * 6.5);
+            const pillW = isBuy ? 16 : Math.max(46, badgeText.length * 6.5);
+            const yPos = isBuy ? mk.y - 18 : mk.y - 19;
 
             return (
               <g key={mk.id}>
-                {isBuy && (
+                {mk.id.startsWith('open-') && (
                   <line
                     x1={padLeft}
                     x2={svgW - padRight}
                     y1={mk.y}
                     y2={mk.y}
-                    stroke="rgba(16,185,129,0.45)"
+                    stroke="rgba(16,185,129,0.38)"
                     strokeDasharray="4 4"
                   />
                 )}
                 <rect
                   x={x - pillW / 2}
-                  y={Math.max(padTop + 2, Math.min(padTop + pricePlotH - 16, mk.y - 8))}
+                  y={Math.max(padTop + 2, Math.min(padTop + pricePlotH - 16, yPos))}
                   width={pillW}
-                  height={15}
+                  height={14}
                   rx={4}
                   fill={badgeColor}
                 />
                 <text
                   x={x}
-                  y={Math.max(padTop + 12, Math.min(padTop + pricePlotH - 5, mk.y + 3))}
+                  y={Math.max(padTop + 11.5, Math.min(padTop + pricePlotH - 6.5, yPos + 10))}
                   textAnchor="middle"
                   fill="#04060b"
-                  fontSize="9"
+                  fontSize="8.5"
                   fontWeight="800"
                   fontFamily="JetBrains Mono"
                 >
