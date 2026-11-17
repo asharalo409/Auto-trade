@@ -12,10 +12,26 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
 const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || '';
-const BINANCE_BASE_URL =
-  process.env.BINANCE_TESTNET === 'true'
-    ? 'https://testnet.binance.vision'
-    : 'https://api.binance.com';
+const IS_TESTNET = process.env.BINANCE_TESTNET === 'true';
+
+const PUBLIC_BINANCE_ENDPOINTS = IS_TESTNET
+  ? ['https://testnet.binance.vision']
+  : [
+      'https://data-api.binance.vision',
+      'https://api1.binance.com',
+      'https://api2.binance.com',
+      'https://api3.binance.com',
+    ];
+
+const SIGNED_BINANCE_ENDPOINTS = IS_TESTNET
+  ? ['https://testnet.binance.vision']
+  : [
+      'https://api1.binance.com',
+      'https://api2.binance.com',
+      'https://api3.binance.com',
+    ];
+
+const BINANCE_ROUND_TRIP_FEE_PCT = 0.2; // 0.1% Buy + 0.1% Sell Spot taker fees
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
@@ -76,12 +92,76 @@ function signBinanceQuery(queryString) {
     .digest('hex');
 }
 
+async function fetchPublicWithFallback(pathAndQuery) {
+  let lastErr = null;
+  for (const base of PUBLIC_BINANCE_ENDPOINTS) {
+    try {
+      const res = await fetch(`${base}${pathAndQuery}`);
+      if (res.status === 418 || res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`Binance public HTTP ${res.status} (${base})`);
+        console.warn(`[BINANCE RETRY] ${lastErr.message}`);
+        continue;
+      }
+      if (!res.ok) {
+        lastErr = new Error(`Binance public HTTP ${res.status} (${base})`);
+        continue;
+      }
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('All public Binance market endpoints failed');
+}
+
+async function signedBinanceRequest(method, path, extraParams = {}) {
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+    throw new Error('Binance API credentials missing');
+  }
+
+  let lastErr = null;
+  for (const base of SIGNED_BINANCE_ENDPOINTS) {
+    try {
+      const params = new URLSearchParams({
+        ...extraParams,
+        recvWindow: '10000',
+        timestamp: String(Date.now()),
+      });
+      const sig = signBinanceQuery(params.toString());
+      params.set('signature', sig);
+
+      const res = await fetch(`${base}${path}?${params.toString()}`, {
+        method,
+        headers: { 'X-MBX-APIKEY': BINANCE_API_KEY },
+      });
+
+      if (res.status === 418 || res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`Binance signed HTTP ${res.status} (${base})`);
+        console.warn(`[BINANCE SIGNED RETRY] ${lastErr.message}`);
+        continue;
+      }
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.msg || `Binance HTTP ${res.status}`);
+      }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      // Only continue fallback loop on transient / rate-limit errors, rethrow API validation errors
+      const msg = String(err.message || '');
+      if (!msg.includes('HTTP 418') && !msg.includes('HTTP 429') && !msg.includes('HTTP 5')) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr || new Error('All Binance signed endpoints failed');
+}
+
 async function fetchBinancePrices(symbols) {
   if (!symbols || symbols.length === 0) return {};
   const param = encodeURIComponent(JSON.stringify(symbols));
-  const res = await fetch(`${BINANCE_BASE_URL}/api/v3/ticker/price?symbols=${param}`);
-  if (!res.ok) throw new Error(`Binance price HTTP ${res.status}`);
-  const rows = await res.json();
+  const rows = await fetchPublicWithFallback(`/api/v3/ticker/price?symbols=${param}`);
   const map = {};
   for (const row of rows) {
     map[row.symbol] = Number(row.price);
@@ -89,34 +169,27 @@ async function fetchBinancePrices(symbols) {
   return map;
 }
 
+async function fetchBinanceSpotUsdtBalance() {
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) return null;
+  const account = await signedBinanceRequest('GET', '/api/v3/account');
+  if (!account || !Array.isArray(account.balances)) return null;
+  const usdt = account.balances.find((b) => b.asset === 'USDT');
+  if (!usdt) return 0;
+  return Number((Number(usdt.free || 0) + Number(usdt.locked || 0)).toFixed(2));
+}
+
 async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity) {
-  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
-    throw new Error('Binance API credentials missing');
-  }
-  const timestamp = Date.now();
-  const params = new URLSearchParams({
+  const params = {
     symbol,
     side,
     type: 'MARKET',
-    timestamp: String(timestamp),
-  });
+  };
   if (side === 'BUY') {
-    params.set('quoteOrderQty', Number(quoteOrderQty).toFixed(2));
+    params.quoteOrderQty = Number(quoteOrderQty).toFixed(2);
   } else {
-    params.set('quantity', Number(quantity).toFixed(5));
+    params.quantity = Number(quantity).toFixed(5);
   }
-  const sig = signBinanceQuery(params.toString());
-  params.set('signature', sig);
-
-  const res = await fetch(`${BINANCE_BASE_URL}/api/v3/order?${params.toString()}`, {
-    method: 'POST',
-    headers: { 'X-MBX-APIKEY': BINANCE_API_KEY },
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.msg || `Binance order HTTP ${res.status}`);
-  }
-  return data;
+  return signedBinanceRequest('POST', '/api/v3/order', params);
 }
 
 async function runCycle() {
@@ -129,10 +202,22 @@ async function runCycle() {
 
     if (setErr || !settings) return;
 
-    // 1. Update Heartbeat
+    // 1. Sync Real Binance Spot USDT Balance (if API credentials provided) + Heartbeat
+    const heartbeatPatch = { last_heartbeat: new Date().toISOString() };
+    if (BINANCE_API_KEY && BINANCE_API_SECRET) {
+      try {
+        const spotUsdt = await fetchBinanceSpotUsdtBalance();
+        if (spotUsdt !== null && Number.isFinite(spotUsdt)) {
+          heartbeatPatch.balance_usdt = spotUsdt;
+        }
+      } catch (balErr) {
+        console.warn('[BALANCE SYNC WARNING]', balErr.message);
+      }
+    }
+
     await supabase
       .from('settings')
-      .update({ last_heartbeat: new Date().toISOString() })
+      .update(heartbeatPatch)
       .eq('id', settings.id);
 
     if (!settings.bot_enabled) {
@@ -178,10 +263,16 @@ async function runCycle() {
     const dcaEnabled = settings.dca_enabled !== false;
     const dcaStepPct = Math.max(0.2, Number(settings.dca_step_pct || 1.5));
     const dcaMaxBuys = Math.max(1, Number(settings.dca_max_buys || 12));
-    const zeroLoss = settings.zero_loss_mode !== false;
+    // Zero-Loss Shield: checks zero_loss_shield -> zero_loss_mode -> sell_only_in_profit
+    const zeroLoss = Boolean(
+      settings.zero_loss_shield ?? settings.zero_loss_mode ?? settings.sell_only_in_profit ?? true
+    );
+    const stopLossEnabled = !zeroLoss && Boolean(settings.stop_loss_enabled);
+    const stopLossPct = Math.abs(Number(settings.stop_loss_pct || 1.5));
     const maxPerPair = Number(settings.max_amount_per_pair || 500);
+    const maxOpenTrades = Math.max(1, Number(settings.max_open_trades || 5));
 
-    // 3. Evaluate Batch Sell-All or DCA Re-Buy per pair
+    // 3. Evaluate Batch Sell-All (Fee-Aware Zero-Loss Shield) or DCA Re-Buy per pair
     for (const symbol of enabledPairs) {
       const livePx = prices[symbol];
       if (!livePx) continue;
@@ -191,9 +282,18 @@ async function runCycle() {
         const totalInvested = pairOpen.reduce((s, t) => s + Number(t.invested_usdt), 0);
         const totalPnl = pairOpen.reduce((s, t) => s + Number(t.profit_usdt), 0);
         const aggPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+        const estimatedFeesUsdt = totalInvested * (BINANCE_ROUND_TRIP_FEE_PCT / 100);
+        const netPnlAfterFees = totalPnl - estimatedFeesUsdt;
+        const requiredTpWithFees = zeroLoss ? tpPct + BINANCE_ROUND_TRIP_FEE_PCT : tpPct;
 
-        // Sell ALL stacked positions together when net ROI hits Take Profit
-        if (aggPct >= tpPct && (!zeroLoss || totalPnl > 0)) {
+        // STRICT ZERO-LOSS CHECK: Never sell unless gross PnL covers Binance 0.2% round-trip fees + net profit > 0
+        const takeProfitTriggered =
+          aggPct >= requiredTpWithFees && (!zeroLoss || netPnlAfterFees > 0);
+
+        const stopLossTriggered =
+          stopLossEnabled && !zeroLoss && aggPct <= -stopLossPct;
+
+        if (takeProfitTriggered || stopLossTriggered) {
           for (const tr of pairOpen) {
             if (BINANCE_API_KEY && BINANCE_API_SECRET) {
               await placeBinanceMarketOrder(symbol, 'SELL', 0, tr.quantity);
@@ -207,7 +307,10 @@ async function runCycle() {
               })
               .eq('id', tr.id);
           }
-          const msg = `BATCH SELL ALL ${symbol} (${pairOpen.length} orders) @ $${livePx} | Profit +$${totalPnl.toFixed(2)} (+${aggPct.toFixed(2)}%)`;
+          const tag = takeProfitTriggered ? 'BATCH SELL ALL' : 'STOP-LOSS EXIT';
+          const msg = `${tag} ${symbol} (${pairOpen.length} orders) @ $${livePx} | Net PnL ${
+            netPnlAfterFees >= 0 ? '+' : ''
+          }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`;
           await appendLog('TRADE', msg, symbol);
           if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`);
           continue;
@@ -235,7 +338,9 @@ async function runCycle() {
               invested_usdt: lot,
               profit_usdt: 0,
               profit_pct: 0,
-              take_profit_price: Number((livePx * (1 + tpPct / 100)).toFixed(4)),
+              take_profit_price: Number(
+                (livePx * (1 + (tpPct + (zeroLoss ? BINANCE_ROUND_TRIP_FEE_PCT : 0)) / 100)).toFixed(4)
+              ),
               opened_at: new Date().toISOString(),
             });
             const msg = `DCA RE-BUY #${pairOpen.length + 1} ${symbol} @ $${livePx} (-${dropPct.toFixed(2)}% dip) | $${lot} USDT`;
@@ -243,6 +348,34 @@ async function runCycle() {
             if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`);
           }
         }
+      } else if (activeTrades.length < maxOpenTrades) {
+        // Initial Spot entry on enabled pair when capacity permits
+        let filledQty = Number((lot / livePx).toFixed(5));
+        if (BINANCE_API_KEY && BINANCE_API_SECRET) {
+          const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0);
+          if (order.executedQty) filledQty = Number(order.executedQty);
+        }
+        const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
+        await supabase.from('trades').insert({
+          id,
+          pair: symbol,
+          side: 'BUY',
+          status: 'OPEN',
+          entry_price: livePx,
+          current_price: livePx,
+          quantity: filledQty,
+          invested_usdt: lot,
+          profit_usdt: 0,
+          profit_pct: 0,
+          take_profit_price: Number(
+            (livePx * (1 + (tpPct + (zeroLoss ? BINANCE_ROUND_TRIP_FEE_PCT : 0)) / 100)).toFixed(4)
+          ),
+          opened_at: new Date().toISOString(),
+        });
+        activeTrades.push({ pair: symbol });
+        const msg = `ENTRY BUY ${symbol} @ $${livePx} | $${lot} USDT (${zeroLoss ? 'Zero-Loss Shield ON' : 'Standard'})`;
+        await appendLog('TRADE', msg, symbol);
+        if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`);
       }
     }
   } catch (err) {
@@ -251,6 +384,6 @@ async function runCycle() {
   }
 }
 
-console.log('[AEGIS WORKER] Started. Polling every 15s...');
+console.log('[AEGIS WORKER] Started (Endpoints: data-api.binance.vision + api1/2/3). Polling every 15s...');
 runCycle();
 setInterval(runCycle, 15_000);

@@ -13,6 +13,7 @@ import {
   SUPPORTED_PAIRS,
 } from '../data/demoData';
 import { audioSynth } from '../lib/audioSynth';
+import { fetchBinance24hrTickers, openBinanceStream } from '../lib/binanceMarket';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { dispatchTelegramAlert } from '../lib/telegram';
 import { getTimeBasedTheme } from '../lib/themes';
@@ -42,6 +43,7 @@ interface StoredPrefs {
   sound_enabled?: boolean;
   theme?: ThemeId;
   auto_theme_by_time?: boolean;
+  zero_loss_mode?: boolean;
   dca_enabled?: boolean;
   dca_step_pct?: number;
   dca_max_buys?: number;
@@ -83,16 +85,24 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
     }
   }
 
+  const zeroLossResolved = Boolean(
+    row.zero_loss_shield ?? row.zero_loss_mode ?? row.sell_only_in_profit ?? fallback.zero_loss_mode
+  );
+
   return {
     ...fallback,
     id: (row.id as number | string) ?? fallback.id,
     bot_enabled: Boolean(row.bot_enabled),
     amount_per_trade: Math.max(1, Number(row.amount_per_trade ?? fallback.amount_per_trade)),
     take_profit_pct: Number(row.take_profit_pct ?? fallback.take_profit_pct),
-    stop_loss_enabled: Boolean(row.stop_loss_enabled ?? fallback.stop_loss_enabled),
+    stop_loss_enabled: zeroLossResolved
+      ? false
+      : Boolean(row.stop_loss_enabled ?? fallback.stop_loss_enabled),
     stop_loss_pct: Number(row.stop_loss_pct ?? fallback.stop_loss_pct),
-    sell_only_in_profit: Boolean(row.sell_only_in_profit ?? fallback.sell_only_in_profit),
-    zero_loss_mode: Boolean(row.zero_loss_mode ?? row.sell_only_in_profit ?? fallback.zero_loss_mode),
+    sell_only_in_profit: zeroLossResolved
+      ? true
+      : Boolean(row.sell_only_in_profit ?? fallback.sell_only_in_profit),
+    zero_loss_mode: zeroLossResolved,
     dca_enabled: Boolean(row.dca_enabled ?? fallback.dca_enabled),
     dca_step_pct: Math.max(0.2, Number(row.dca_step_pct ?? fallback.dca_step_pct)),
     dca_max_buys: Math.max(1, Number(row.dca_max_buys ?? fallback.dca_max_buys)),
@@ -171,6 +181,7 @@ export function useTradingTerminal() {
         sound_enabled: true,
         theme: 'CYBER_CYAN',
         auto_theme_by_time: false,
+        zero_loss_mode: true,
         dca_enabled: true,
         dca_step_pct: 1.5,
         dca_max_buys: 12,
@@ -189,17 +200,23 @@ export function useTradingTerminal() {
 
   const [activeWorkspace, setActiveWorkspace] = useState<TradingMode>('DEMO');
 
-  const [demoSettings, setDemoSettings] = useState<BotSettings>(() => ({
-    ...INITIAL_DEMO_SETTINGS,
-    sound_enabled: initialPrefs.sound_enabled ?? true,
-    theme: initialPrefs.theme ?? 'CYBER_CYAN',
-    auto_theme_by_time: initialPrefs.auto_theme_by_time ?? false,
-    dca_enabled: initialPrefs.dca_enabled ?? true,
-    dca_step_pct: initialPrefs.dca_step_pct ?? 1.5,
-    dca_max_buys: initialPrefs.dca_max_buys ?? 12,
-    core_visual: initialPrefs.core_visual ?? 'torus',
-    candle_style: initialPrefs.candle_style ?? 'japanese',
-  }));
+  const [demoSettings, setDemoSettings] = useState<BotSettings>(() => {
+    const zLoss = initialPrefs.zero_loss_mode ?? INITIAL_DEMO_SETTINGS.zero_loss_mode;
+    return {
+      ...INITIAL_DEMO_SETTINGS,
+      sound_enabled: initialPrefs.sound_enabled ?? true,
+      theme: initialPrefs.theme ?? 'CYBER_CYAN',
+      auto_theme_by_time: initialPrefs.auto_theme_by_time ?? false,
+      zero_loss_mode: zLoss,
+      sell_only_in_profit: zLoss ? true : INITIAL_DEMO_SETTINGS.sell_only_in_profit,
+      stop_loss_enabled: zLoss ? false : INITIAL_DEMO_SETTINGS.stop_loss_enabled,
+      dca_enabled: initialPrefs.dca_enabled ?? true,
+      dca_step_pct: initialPrefs.dca_step_pct ?? 1.5,
+      dca_max_buys: initialPrefs.dca_max_buys ?? 12,
+      core_visual: initialPrefs.core_visual ?? 'torus',
+      candle_style: initialPrefs.candle_style ?? 'japanese',
+    };
+  });
   const [demoTrades, setDemoTrades] = useState<Trade[]>(INITIAL_DEMO_TRADES);
   const [demoLogs, setDemoLogs] = useState<LogEntry[]>(INITIAL_DEMO_LOGS);
 
@@ -256,6 +273,7 @@ export function useTradingTerminal() {
       sound_enabled: settings.sound_enabled,
       theme: settings.theme,
       auto_theme_by_time: settings.auto_theme_by_time,
+      zero_loss_mode: settings.zero_loss_mode,
       dca_enabled: settings.dca_enabled,
       dca_step_pct: settings.dca_step_pct,
       dca_max_buys: settings.dca_max_buys,
@@ -266,6 +284,7 @@ export function useTradingTerminal() {
     settings.sound_enabled,
     settings.theme,
     settings.auto_theme_by_time,
+    settings.zero_loss_mode,
     settings.dca_enabled,
     settings.dca_step_pct,
     settings.dca_max_buys,
@@ -302,26 +321,15 @@ export function useTradingTerminal() {
     [demoSettings, liveSettings, telegramConfig]
   );
 
-  // Sync real Binance Spot public 24h prices periodically (silent fallback if unreachable)
+  // Sync real Binance Spot public 24h prices via data-api.binance.vision + api1/2/3 fallback + live !miniTicker@arr WebSocket
   useEffect(() => {
     let active = true;
+    const supportedSet = new Set<string>(SUPPORTED_PAIRS);
+
     const syncBinancePublic = async () => {
       if (document.hidden) return;
       try {
-        const symbolsParam = encodeURIComponent(JSON.stringify(SUPPORTED_PAIRS));
-        const res = await fetch(
-          `https://api.binance.com/api/v3/ticker/24hr?symbols=${symbolsParam}`
-        );
-        if (!res.ok) return;
-        const rows = (await res.json()) as {
-          symbol: string;
-          lastPrice: string;
-          priceChangePercent: string;
-          highPrice: string;
-          lowPrice: string;
-          volume: string;
-          quoteVolume: string;
-        }[];
+        const rows = await fetchBinance24hrTickers(SUPPORTED_PAIRS);
         if (!active || !Array.isArray(rows) || rows.length === 0) return;
 
         setBinanceFeedLive(true);
@@ -361,10 +369,101 @@ export function useTradingTerminal() {
     };
 
     syncBinancePublic();
-    const id = window.setInterval(syncBinancePublic, 15_000);
+    const restId = window.setInterval(syncBinancePublic, 20_000);
+
+    // Live per-second Binance WebSocket miniTicker stream for all 10 pairs
+    const pendingUpdates = new Map<
+      string,
+      { c: number; o: number; h: number; l: number; v: number; q: number }
+    >();
+
+    const closeWs = openBinanceStream(
+      '!miniTicker@arr',
+      (payload) => {
+        if (!Array.isArray(payload)) return;
+        for (const item of payload as Record<string, string>[]) {
+          const sym = item.s;
+          if (!sym || !supportedSet.has(sym)) continue;
+          const c = Number(item.c);
+          const o = Number(item.o);
+          const h = Number(item.h);
+          const l = Number(item.l);
+          const v = Number(item.v);
+          const q = Number(item.q);
+          if (Number.isFinite(c) && c > 0) {
+            pendingUpdates.set(sym, { c, o, h, l, v, q });
+          }
+        }
+      },
+      () => {
+        if (active) setBinanceFeedLive(true);
+      }
+    );
+
+    const flushId = window.setInterval(() => {
+      if (!active || document.hidden || pendingUpdates.size === 0) return;
+      const snapshot = new Map(pendingUpdates);
+      pendingUpdates.clear();
+
+      setBinanceFeedLive(true);
+      setMarketPairs((prev) => {
+        const nextPairs = prev.map((pair) => {
+          const tick = snapshot.get(pair.symbol);
+          if (!tick) return pair;
+          const chg = tick.o > 0 ? ((tick.c - tick.o) / tick.o) * 100 : pair.change24h;
+          const nextSpark =
+            tick.c !== pair.price
+              ? [
+                  ...pair.sparkline.slice(1),
+                  {
+                    t: new Date().toLocaleTimeString([], { minute: '2-digit', second: '2-digit' }),
+                    p: tick.c,
+                  },
+                ]
+              : pair.sparkline;
+          return {
+            ...pair,
+            price: tick.c,
+            change24h: Number(chg.toFixed(2)),
+            high24h: Number.isFinite(tick.h) && tick.h > 0 ? tick.h : pair.high24h,
+            low24h: Number.isFinite(tick.l) && tick.l > 0 ? tick.l : pair.low24h,
+            baseVolume24h: Number.isFinite(tick.v) && tick.v > 0 ? tick.v : pair.baseVolume24h,
+            volume24h: Number.isFinite(tick.q) && tick.q > 0 ? tick.q : pair.volume24h,
+            perf: { ...pair.perf, today: Number(chg.toFixed(2)) },
+            sparkline: nextSpark,
+          };
+        });
+
+        const recalcTrades = (list: Trade[]) =>
+          list.map((trade) => {
+            if (trade.status !== 'OPEN') return trade;
+            const matched = nextPairs.find((p) => p.symbol === trade.pair);
+            if (!matched) return trade;
+            const profitUsdt = Number(
+              ((matched.price - trade.entry_price) * trade.quantity).toFixed(2)
+            );
+            const profitPct = Number(
+              ((profitUsdt / Math.max(0.01, trade.invested_usdt)) * 100).toFixed(2)
+            );
+            return {
+              ...trade,
+              current_price: matched.price,
+              profit_usdt: profitUsdt,
+              profit_pct: profitPct,
+            };
+          });
+
+        setDemoTrades(recalcTrades);
+        setLiveTrades(recalcTrades);
+        return nextPairs;
+      });
+    }, 750);
+
     return () => {
       active = false;
-      window.clearInterval(id);
+      window.clearInterval(restId);
+      window.clearInterval(flushId);
+      closeWs();
     };
   }, []);
 
@@ -635,9 +734,21 @@ export function useTradingTerminal() {
                 const totalInvested = pairOpen.reduce((s, t) => s + t.invested_usdt, 0);
                 const totalPnl = pairOpen.reduce((s, t) => s + t.profit_usdt, 0);
                 const aggPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+                const feeCostUsdt = totalInvested * 0.002; // 0.2% Binance round-trip fee
+                const netPnlAfterFees = totalPnl - feeCostUsdt;
+                const requiredTpPct = activeCfg.zero_loss_mode
+                  ? activeCfg.take_profit_pct + 0.2
+                  : activeCfg.take_profit_pct;
 
-                // 1) Batch Sell-All when combined stack reaches take-profit (never sell low if zero_loss_mode ON)
-                if (aggPct >= activeCfg.take_profit_pct && (!activeCfg.zero_loss_mode || totalPnl > 0)) {
+                // 1) Batch Sell-All when combined stack covers fees + Take Profit (strict Zero-Loss Shield)
+                const takeProfitHit =
+                  aggPct >= requiredTpPct && (!activeCfg.zero_loss_mode || netPnlAfterFees > 0);
+                const stopLossHit =
+                  !activeCfg.zero_loss_mode &&
+                  activeCfg.stop_loss_enabled &&
+                  aggPct <= -Math.abs(activeCfg.stop_loss_pct);
+
+                if (takeProfitHit || stopLossHit) {
                   const openIds = new Set(pairOpen.map((t) => t.id));
                   nextTrades = nextTrades.map((t) =>
                     openIds.has(t.id)
@@ -645,18 +756,21 @@ export function useTradingTerminal() {
                       : t
                   );
                   mutated = true;
-                  audioSynth.playTradeChime(true);
+                  audioSynth.playTradeChime(netPnlAfterFees >= 0);
+                  const exitTag = takeProfitHit ? 'BATCH SELL ALL' : 'STOP-LOSS EXIT';
                   appendLog(ws, {
                     id: `LOG-${Date.now().toString().slice(-5)}-${pair.base}`,
                     level: 'TRADE',
                     pair: pair.symbol,
-                    message: `BATCH SELL ALL (${pairOpen.length} orders) @ $${pair.price} | Total Profit +$${totalPnl.toFixed(
-                      2
-                    )} (+${aggPct.toFixed(2)}%)`,
+                    message: `${exitTag} (${pairOpen.length} orders) @ $${pair.price} | Net Profit ${
+                      netPnlAfterFees >= 0 ? '+' : ''
+                    }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`,
                     created_at: nowIso,
                   });
                   void notifyTelegramIfConfigured(
-                    `BATCH SELL ALL ${pair.symbol} (${pairOpen.length} trades) @ $${pair.price} | Profit +$${totalPnl.toFixed(2)}`,
+                    `${exitTag} ${pair.symbol} (${pairOpen.length} trades) @ $${pair.price} | Net $${netPnlAfterFees.toFixed(
+                      2
+                    )}`,
                     ws
                   );
                   continue;
@@ -944,31 +1058,53 @@ export function useTradingTerminal() {
       }
 
       if (activeWorkspace === 'LIVE' && !isDemoMode && supabase) {
+        const corePayload = {
+          bot_enabled: next.bot_enabled,
+          amount_per_trade: next.amount_per_trade,
+          take_profit_pct: next.take_profit_pct,
+          stop_loss_enabled: next.stop_loss_enabled,
+          stop_loss_pct: next.stop_loss_pct,
+          sell_only_in_profit: next.sell_only_in_profit,
+          max_open_trades: next.max_open_trades,
+          max_amount_per_pair: next.max_amount_per_pair,
+          daily_loss_limit: next.daily_loss_limit,
+          mode: next.mode,
+          enabled_pairs: next.enabled_pairs,
+          telegram_enabled: next.telegram_enabled,
+        };
+        const extendedPayload = {
+          ...corePayload,
+          zero_loss_mode: next.zero_loss_mode,
+          zero_loss_shield: next.zero_loss_mode,
+          dca_enabled: next.dca_enabled,
+          dca_step_pct: next.dca_step_pct,
+          dca_max_buys: next.dca_max_buys,
+          auto_theme_by_time: next.auto_theme_by_time,
+        };
+
         try {
           const { error } = await supabase
             .from('settings')
-            .update({
-              bot_enabled: next.bot_enabled,
-              amount_per_trade: next.amount_per_trade,
-              take_profit_pct: next.take_profit_pct,
-              stop_loss_enabled: next.stop_loss_enabled,
-              stop_loss_pct: next.stop_loss_pct,
-              sell_only_in_profit: next.sell_only_in_profit,
-              max_open_trades: next.max_open_trades,
-              max_amount_per_pair: next.max_amount_per_pair,
-              daily_loss_limit: next.daily_loss_limit,
-              mode: next.mode,
-              enabled_pairs: next.enabled_pairs,
-              telegram_enabled: next.telegram_enabled,
-            })
+            .update(extendedPayload)
             .eq('id', next.id);
-          if (error) throw error;
+          if (error) {
+            // Automatic compatibility retry if Supabase table predates extended columns
+            if (error.code === 'PGRST204' || error.code === '42703') {
+              const { error: retryErr } = await supabase
+                .from('settings')
+                .update(corePayload)
+                .eq('id', next.id);
+              if (retryErr) throw retryErr;
+            } else {
+              throw error;
+            }
+          }
         } catch (err) {
           console.error('Failed to save settings:', err);
           setErrorMsg(err instanceof Error ? err.message : 'Failed to update settings');
         }
       } else {
-        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setTimeout(r, 120));
       }
       setSavingSettings(false);
     },
@@ -985,13 +1121,15 @@ export function useTradingTerminal() {
           (t) => t.pair === pair.symbol && t.status === 'OPEN'
         );
         if (existingOpen) {
-          if (settings.zero_loss_mode && existingOpen.profit_usdt < 0) {
+          const estimatedFees = existingOpen.invested_usdt * 0.002;
+          const netPnlAfterFees = existingOpen.profit_usdt - estimatedFees;
+          if (settings.zero_loss_mode && netPnlAfterFees <= 0) {
             audioSynth.playTradeChime(false);
             appendLog(activeWorkspace, {
               id: `LOG-${Date.now().toString().slice(-5)}`,
               level: 'WARNING',
               pair: pair.symbol,
-              message: `ZERO-LOSS SHIELD BLOCKED SELL: ${pair.symbol} currently $${existingOpen.profit_usdt.toFixed(
+              message: `ZERO-LOSS SHIELD BLOCKED SELL: ${pair.symbol} net after 0.2% fee is $${netPnlAfterFees.toFixed(
                 2
               )}.`,
               created_at: new Date().toISOString(),
@@ -1169,13 +1307,15 @@ export function useTradingTerminal() {
       const target = trades.find((t) => t.id === tradeId);
       if (!target || target.status !== 'OPEN') return;
 
-      if (settings.zero_loss_mode && target.profit_usdt < 0) {
+      const estimatedFees = target.invested_usdt * 0.002;
+      const netPnlAfterFees = target.profit_usdt - estimatedFees;
+      if (settings.zero_loss_mode && netPnlAfterFees <= 0) {
         audioSynth.playTradeChime(false);
         appendLog(activeWorkspace, {
           id: `LOG-${Date.now().toString().slice(-5)}`,
           level: 'WARNING',
           pair: target.pair,
-          message: `ZERO-LOSS SHIELD BLOCKED EXIT: ${target.pair} is currently $${target.profit_usdt.toFixed(
+          message: `ZERO-LOSS SHIELD BLOCKED EXIT: ${target.pair} net after 0.2% Binance fees is $${netPnlAfterFees.toFixed(
             2
           )}. Waiting for net profit.`,
           created_at: new Date().toISOString(),

@@ -1,7 +1,13 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Radio } from 'lucide-react';
 import { BDT_PER_USD, generateCandlesForPair, toHeikinAshi } from '../../data/demoData';
 import { audioSynth } from '../../lib/audioSynth';
+import {
+  attachCandleIndicators,
+  fetchBinanceKlines,
+  openBinanceStream,
+  timeframeToBinanceInterval,
+} from '../../lib/binanceMarket';
 import {
   CandlePoint,
   CandleStyle,
@@ -47,11 +53,104 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   const [timeframe, setTimeframe] = useState<ChartTimeframe>('15M');
   const [activeIndicators, setActiveIndicators] = useState<ChartIndicator[]>(['MA', 'EMA']);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [liveKlines, setLiveKlines] = useState<CandlePoint[] | null>(null);
+  const [klineWsLive, setKlineWsLive] = useState(false);
 
   const pair = useMemo(
     () => pairs.find((p) => p.symbol === selectedSymbol) ?? pairs[0],
     [pairs, selectedSymbol]
   );
+
+  const barCount = compact ? 32 : 44;
+  const latestPairRef = useRef(pair);
+  useEffect(() => {
+    latestPairRef.current = pair;
+  }, [pair]);
+
+  // Fetch initial Binance klines & subscribe to live @kline_<interval> WebSocket ticks
+  useEffect(() => {
+    let active = true;
+    const symbol = pair.symbol;
+    const interval = timeframeToBinanceInterval(timeframe);
+    setLiveKlines(null);
+    setKlineWsLive(false);
+
+    fetchBinanceKlines(symbol, timeframe, barCount)
+      .then((klines) => {
+        if (!active || !klines.length) return;
+        setLiveKlines(klines);
+        setKlineWsLive(true);
+      })
+      .catch(() => {
+        // Silent fallback to generated candles synced to live pair.price
+      });
+
+    const closeWs = openBinanceStream(
+      `${symbol.toLowerCase()}@kline_${interval}`,
+      (payload) => {
+        if (!active || !payload || typeof payload !== 'object') return;
+        const k = (payload as { k?: Record<string, unknown> }).k;
+        if (!k) return;
+        const openTime = Number(k.t);
+        const o = Number(k.o);
+        const h = Number(k.h);
+        const l = Number(k.l);
+        const c = Number(k.c);
+        const v = Math.round(Number(k.v));
+        if (!Number.isFinite(c) || c <= 0) return;
+
+        const barTime = new Date(openTime).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+        });
+
+        setKlineWsLive(true);
+        setLiveKlines((prev) => {
+          const base =
+            prev && prev.length > 0
+              ? prev
+              : generateCandlesForPair(latestPairRef.current, timeframe, barCount);
+          const last = base[base.length - 1];
+          let nextRaw: CandlePoint[];
+          if (last && last.time === barTime) {
+            nextRaw = [
+              ...base.slice(0, -1),
+              {
+                time: barTime,
+                open: o,
+                high: Math.max(h, last.high),
+                low: Math.min(l, last.low),
+                close: c,
+                volume: v,
+              },
+            ];
+          } else {
+            nextRaw = [
+              ...base.slice(-(barCount - 1)),
+              {
+                time: barTime,
+                open: o,
+                high: h,
+                low: l,
+                close: c,
+                volume: v,
+              },
+            ];
+          }
+          return attachCandleIndicators(nextRaw);
+        });
+      },
+      () => {
+        if (active) setKlineWsLive(true);
+      }
+    );
+
+    return () => {
+      active = false;
+      closeWs();
+    };
+  }, [pair.symbol, timeframe, barCount]);
 
   const pairTrades = useMemo(
     () => trades.filter((tr) => tr.pair === pair.symbol),
@@ -68,10 +167,22 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
     [pairTrades]
   );
 
-  const rawCandles = useMemo(
-    () => generateCandlesForPair(pair, timeframe, compact ? 32 : 44),
-    [pair, timeframe, compact]
-  );
+  const rawCandles = useMemo(() => {
+    const base =
+      liveKlines && liveKlines.length > 0
+        ? liveKlines
+        : generateCandlesForPair(pair, timeframe, barCount);
+    if (!base.length) return base;
+    const last = base[base.length - 1];
+    if (last.close === pair.price) return base;
+    const updatedLast: CandlePoint = {
+      ...last,
+      close: pair.price,
+      high: Math.max(last.high, pair.price),
+      low: Math.min(last.low, pair.price),
+    };
+    return attachCandleIndicators([...base.slice(0, -1), updatedLast]);
+  }, [liveKlines, pair, timeframe, barCount]);
 
   const displayCandles: CandlePoint[] = useMemo(() => {
     if (candleStyle === 'heikin_ashi') return toHeikinAshi(rawCandles);
@@ -311,9 +422,9 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
               <span className="rounded bg-slate-800/90 px-1.5 py-0.5 font-mono-tech text-[9px] font-semibold text-amber-300 uppercase">
                 Spot
               </span>
-              {binanceFeedLive && (
+              {(binanceFeedLive || klineWsLive) && (
                 <span className="inline-flex items-center gap-1 font-mono-tech text-[9px] text-emerald-400 uppercase">
-                  <Radio className="h-2.5 w-2.5" />
+                  <Radio className="h-2.5 w-2.5 animate-pulse" />
                   Binance Live
                 </span>
               )}

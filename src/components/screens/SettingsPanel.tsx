@@ -74,9 +74,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [copiedSql, setCopiedSql] = useState(false);
   const [showGuideSql, setShowGuideSql] = useState(false);
 
+  // Sync draft only when switching workspace/settings row or explicit settings update (ignore last_heartbeat ticks)
   useEffect(() => {
     setDraft(settings);
-  }, [settings]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.id, settings.mode, settings.updated_at, settings.zero_loss_mode, settings.bot_enabled]);
 
   useEffect(() => {
     setTgDraft(telegramConfig);
@@ -350,14 +352,20 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               </div>
               <SciFiSwitch
                 checked={draft.zero_loss_mode}
-                onChange={(v) =>
+                onChange={(v) => {
+                  audioSynth.playToggle(v);
                   setDraft((p) => ({
                     ...p,
                     zero_loss_mode: v,
                     sell_only_in_profit: v ? true : p.sell_only_in_profit,
                     stop_loss_enabled: v ? false : p.stop_loss_enabled,
-                  }))
-                }
+                  }));
+                  void onSave({
+                    zero_loss_mode: v,
+                    sell_only_in_profit: v,
+                    stop_loss_enabled: v ? false : draft.stop_loss_enabled,
+                  });
+                }}
                 label={t.zeroLossTitle}
                 accent="emerald"
               />

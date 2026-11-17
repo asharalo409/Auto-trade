@@ -1,5 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { audioSynth } from '../../lib/audioSynth';
+import { fetchBinanceDepth, openBinanceStream } from '../../lib/binanceMarket';
 import { PairMarketData } from '../../types/trading';
 import { InfoTip } from '../ui/InfoTip';
 import { NeonButton } from '../ui/MotionPrimitives';
@@ -15,6 +16,11 @@ interface BinanceOrderBookProps {
 
 type BookTab = 'BOOK' | 'DEPTH' | 'FLOW';
 
+interface BookRow {
+  px: number;
+  size: number;
+}
+
 export const BinanceOrderBook: React.FC<BinanceOrderBookProps> = ({
   t,
   pair,
@@ -25,16 +31,92 @@ export const BinanceOrderBook: React.FC<BinanceOrderBookProps> = ({
   const [tab, setTab] = useState<BookTab>('BOOK');
   const [lotAmount, setLotAmount] = useState<number>(Math.max(1, defaultLot));
   const [submitting, setSubmitting] = useState(false);
+  const [liveBook, setLiveBook] = useState<{
+    asks: BookRow[];
+    bids: BookRow[];
+    bidPct: number;
+    askPct: number;
+  } | null>(null);
 
+  const rowCount = compact ? 5 : 7;
   const decimals = pair.price > 50 ? 2 : pair.price > 5 ? 3 : 4;
   const qtyDecimals = pair.price > 500 ? 3 : pair.price > 10 ? 2 : 0;
+  const pendingBookRef = useRef<{ bids: [string, string][]; asks: [string, string][] } | null>(null);
 
-  // Synthesize crisp 7-level orderbook ladder seeded deterministically around live pair price
+  useEffect(() => {
+    let active = true;
+    const symbol = pair.symbol;
+    setLiveBook(null);
+    pendingBookRef.current = null;
+
+    const applyRawDepth = (rawBids: [string, string][], rawAsks: [string, string][]) => {
+      const parsedBids: BookRow[] = rawBids
+        .slice(0, rowCount)
+        .map(([p, q]) => ({
+          px: Number(p),
+          size: Number(Number(q).toFixed(qtyDecimals)),
+        }))
+        .filter((r) => Number.isFinite(r.px) && r.px > 0);
+
+      // Show asks sorted descending from top down to spread
+      const parsedAsks: BookRow[] = rawAsks
+        .slice(0, rowCount)
+        .map(([p, q]) => ({
+          px: Number(p),
+          size: Number(Number(q).toFixed(qtyDecimals)),
+        }))
+        .filter((r) => Number.isFinite(r.px) && r.px > 0)
+        .reverse();
+
+      if (!parsedBids.length || !parsedAsks.length) return;
+      const sumBid = parsedBids.reduce((s, r) => s + r.size * r.px, 0);
+      const sumAsk = parsedAsks.reduce((s, r) => s + r.size * r.px, 0);
+      const total = Math.max(0.01, sumBid + sumAsk);
+      const bidPct = Number(((sumBid / total) * 100).toFixed(2));
+      const askPct = Number((100 - bidPct).toFixed(2));
+      setLiveBook({ bids: parsedBids, asks: parsedAsks, bidPct, askPct });
+    };
+
+    fetchBinanceDepth(symbol, 10)
+      .then((snap) => {
+        if (!active || !snap.bids?.length || !snap.asks?.length) return;
+        applyRawDepth(snap.bids, snap.asks);
+      })
+      .catch(() => {
+        // Fallback to synthesized ladder
+      });
+
+    const closeWs = openBinanceStream(`${symbol.toLowerCase()}@depth10@100ms`, (payload) => {
+      if (!active || !payload || typeof payload !== 'object') return;
+      const d = payload as { bids?: [string, string][]; asks?: [string, string][] };
+      if (Array.isArray(d.bids) && Array.isArray(d.asks)) {
+        pendingBookRef.current = { bids: d.bids, asks: d.asks };
+      }
+    });
+
+    const flushTimer = window.setInterval(() => {
+      if (!active || document.hidden || !pendingBookRef.current) return;
+      const snap = pendingBookRef.current;
+      pendingBookRef.current = null;
+      applyRawDepth(snap.bids, snap.asks);
+    }, 250);
+
+    return () => {
+      active = false;
+      window.clearInterval(flushTimer);
+      closeWs();
+    };
+  }, [pair.symbol, rowCount, qtyDecimals]);
+
+  // Fallback ladder around live pair price when WS depth is unavailable
   const { asks, bids, bidPct, askPct } = useMemo(() => {
+    if (liveBook && liveBook.asks.length > 0 && liveBook.bids.length > 0) {
+      return liveBook;
+    }
     const step = pair.price * 0.00035;
     const seed = pair.symbol.split('').reduce((s, c) => s + c.charCodeAt(0), 0);
-    const askRows = Array.from({ length: compact ? 5 : 7 }, (_, i) => {
-      const idx = (compact ? 5 : 7) - i;
+    const askRows = Array.from({ length: rowCount }, (_, i) => {
+      const idx = rowCount - i;
       const px = pair.price + step * idx;
       const size = Number(
         ((0.4 + Math.abs(Math.sin(seed + idx * 1.7 + pair.price * 0.01)) * 4.2) *
@@ -43,7 +125,7 @@ export const BinanceOrderBook: React.FC<BinanceOrderBookProps> = ({
       return { px, size };
     });
 
-    const bidRows = Array.from({ length: compact ? 5 : 7 }, (_, i) => {
+    const bidRows = Array.from({ length: rowCount }, (_, i) => {
       const idx = i + 1;
       const px = Math.max(0.0001, pair.price - step * idx);
       const size = Number(
@@ -56,7 +138,7 @@ export const BinanceOrderBook: React.FC<BinanceOrderBookProps> = ({
     const bidP = Number(Math.max(20, Math.min(80, pair.inflowPct)).toFixed(2));
     const askP = Number((100 - bidP).toFixed(2));
     return { asks: askRows, bids: bidRows, bidPct: bidP, askPct: askP };
-  }, [pair.price, pair.symbol, pair.inflowPct, compact, qtyDecimals]);
+  }, [liveBook, pair.price, pair.symbol, pair.inflowPct, rowCount, qtyDecimals]);
 
   const maxOrderSize = useMemo(
     () => Math.max(1, ...asks.map((a) => a.size), ...bids.map((b) => b.size)),

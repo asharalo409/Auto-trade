@@ -37,6 +37,7 @@ create table if not exists public.settings (
   stop_loss_pct numeric default 1.5,
   sell_only_in_profit boolean default true,
   zero_loss_mode boolean default true,
+  zero_loss_shield boolean default true,
   dca_enabled boolean default true,
   dca_step_pct numeric default 1.5,
   dca_max_buys integer default 12,

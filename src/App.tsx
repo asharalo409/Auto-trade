@@ -175,31 +175,62 @@ export default function App() {
             </nav>
           )}
 
-          {/* Right Controls: Isolated VIRTUAL / LIVE Switcher + Language + Lock */}
+          {/* Right Controls: Isolated VIRTUAL / LIVE Switcher + Live Balance Pill + Language + Lock */}
           <div className="flex items-center gap-2 shrink-0">
             {terminal.isAuthenticated && (
-              <div className="flex items-center rounded-lg border border-slate-800 bg-[#080b12] p-0.5">
+              <div className="flex items-center gap-1.5">
+                <div className="flex items-center rounded-lg border border-slate-800 bg-[#080b12] p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => handleRequestWorkspaceSwitch('DEMO')}
+                    className={`min-h-[30px] cursor-pointer rounded px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase transition-all whitespace-nowrap ${
+                      terminal.activeWorkspace === 'DEMO'
+                        ? 'bg-cyan-500/25 text-cyan-200'
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                  >
+                    {t.modeDemo}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleRequestWorkspaceSwitch('LIVE')}
+                    className={`min-h-[30px] cursor-pointer rounded px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase transition-all whitespace-nowrap ${
+                      terminal.activeWorkspace === 'LIVE'
+                        ? 'bg-rose-500/30 text-rose-200 shadow-[0_0_12px_rgba(244,63,94,0.35)]'
+                        : 'text-slate-500 hover:text-rose-300'
+                    }`}
+                  >
+                    {t.modeLive}
+                  </button>
+                </div>
+
+                {/* Live / Virtual USDT Balance Pill */}
                 <button
                   type="button"
-                  onClick={() => handleRequestWorkspaceSwitch('DEMO')}
-                  className={`min-h-[30px] cursor-pointer rounded px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase transition-all whitespace-nowrap ${
-                    terminal.activeWorkspace === 'DEMO'
-                      ? 'bg-cyan-500/25 text-cyan-200'
-                      : 'text-slate-500 hover:text-slate-300'
-                  }`}
-                >
-                  {t.modeDemo}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleRequestWorkspaceSwitch('LIVE')}
-                  className={`min-h-[30px] cursor-pointer rounded px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase transition-all whitespace-nowrap ${
+                  onClick={() => handleTabChange('command')}
+                  title={
                     terminal.activeWorkspace === 'LIVE'
-                      ? 'bg-rose-500/30 text-rose-200 shadow-[0_0_12px_rgba(244,63,94,0.35)]'
-                      : 'text-slate-500 hover:text-rose-300'
+                      ? 'Live Spot USDT Balance'
+                      : 'Virtual Demo USDT Balance'
+                  }
+                  className={`flex min-h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono-tech text-[11px] font-bold tracking-tight transition-all whitespace-nowrap ${
+                    terminal.activeWorkspace === 'LIVE'
+                      ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)]'
+                      : 'border-cyan-500/50 bg-cyan-500/15 text-cyan-200 shadow-[0_0_10px_rgba(34,211,238,0.18)]'
                   }`}
                 >
-                  {t.modeLive}
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full animate-pulse ${
+                      terminal.activeWorkspace === 'LIVE' ? 'bg-emerald-400' : 'bg-cyan-400'
+                    }`}
+                  />
+                  <span>
+                    {terminal.activeWorkspace === 'LIVE' ? 'LIVE' : 'DEMO'}: $
+                    {terminal.stats.balance.toLocaleString('en-US', {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
+                  </span>
                 </button>
               </div>
             )}
