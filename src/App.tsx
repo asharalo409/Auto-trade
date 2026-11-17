@@ -375,6 +375,7 @@ export default function App() {
                   t={t}
                   settings={terminal.settings}
                   stats={terminal.stats}
+                  trades={terminal.trades}
                 />
               )}
 
