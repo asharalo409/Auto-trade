@@ -1,0 +1,241 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Barlow Condensed', 'Hind Siliguri', sans-serif;
+    --font-sans: 'Plus Jakarta Sans', 'Hind Siliguri', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  html,
+  body {
+    background-color: #05060a;
+    color: #e2e8f0;
+    font-family: var(--font-sans);
+    overflow-x: hidden;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-tech {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.terminal-grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(34, 211, 238, 0.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(34, 211, 238, 0.045) 1px, transparent 1px);
+  background-size: 40px 40px;
+  animation: grid-drift 28s linear infinite;
+}
+
+@keyframes grid-drift {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    transform: translate3d(40px, 40px, 0);
+  }
+}
+
+.scanline-overlay {
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0) 0px,
+    rgba(255, 255, 255, 0) 2px,
+    rgba(0, 0, 0, 0.24) 3px,
+    rgba(0, 0, 0, 0.24) 4px
+  );
+}
+
+@keyframes blob-float-a {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 0.22;
+  }
+  50% {
+    transform: translate3d(6vw, 4vh, 0) scale(1.12);
+    opacity: 0.34;
+  }
+}
+
+@keyframes blob-float-b {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1.05);
+    opacity: 0.18;
+  }
+  50% {
+    transform: translate3d(-6vw, -5vh, 0) scale(0.95);
+    opacity: 0.28;
+  }
+}
+
+.animate-blob-a {
+  animation: blob-float-a 16s ease-in-out infinite;
+}
+
+.animate-blob-b {
+  animation: blob-float-b 20s ease-in-out infinite;
+}
+
+@keyframes border-sweep {
+  0% {
+    transform: translateX(-120%);
+    opacity: 0;
+  }
+  20% {
+    opacity: 0.8;
+  }
+  80% {
+    opacity: 0.8;
+  }
+  100% {
+    transform: translateX(220%);
+    opacity: 0;
+  }
+}
+
+.panel-light-sweep {
+  position: relative;
+  overflow: hidden;
+}
+
+.panel-light-sweep::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 45%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.85), rgba(16, 185, 129, 0.85), transparent);
+  animation: border-sweep 6.5s ease-in-out infinite;
+  pointer-events: none;
+  z-index: 20;
+}
+
+@keyframes tp-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.animate-tp-shimmer {
+  animation: tp-shimmer 2.2s linear infinite;
+}
+
+@keyframes ticker-scroll {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+.animate-ticker {
+  display: flex;
+  width: max-content;
+  animation: ticker-scroll 42s linear infinite;
+}
+
+.animate-ticker:hover {
+  animation-play-state: paused;
+}
+
+@keyframes orbit-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-orbit-slow {
+  animation: orbit-spin 12s linear infinite;
+}
+
+.animate-orbit-fast {
+  animation: orbit-spin 4.5s linear infinite;
+}
+
+.animate-orbit-reverse {
+  animation: orbit-spin 9s linear infinite reverse;
+}
+
+@keyframes skeleton-glide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.skeleton-shimmer {
+  position: relative;
+  overflow: hidden;
+  background-color: rgba(15, 23, 42, 0.75);
+}
+
+.skeleton-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.12), transparent);
+  animation: skeleton-glide 1.6s ease-in-out infinite;
+}
+
+@keyframes tile-breathe {
+  0%, 100% {
+    opacity: 0.92;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.animate-tile-breathe {
+  animation: tile-breathe 3.5s ease-in-out infinite;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(5, 6, 10, 0.9);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(51, 65, 85, 0.7);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(34, 211, 238, 0.55);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-grid-bg,
+  .animate-blob-a,
+  .animate-blob-b,
+  .panel-light-sweep::before,
+  .animate-tp-shimmer,
+  .animate-ticker,
+  .animate-orbit-slow,
+  .animate-orbit-fast,
+  .animate-orbit-reverse,
+  .skeleton-shimmer::after,
+  .animate-tile-breathe {
+    animation: none !important;
+  }
+}
