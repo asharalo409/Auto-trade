@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { Pause, Play, Search, Terminal } from 'lucide-react';
+import { Check, Copy, Pause, Play, Search, Terminal } from 'lucide-react';
 import { LogEntry, LogLevel } from '../../types/trading';
 import { SkeletonBlock } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
@@ -48,7 +48,20 @@ export const LiveEngineFeed: React.FC<LiveEngineFeedProps> = ({ t, logs, loading
   const [levelFilter, setLevelFilter] = useState<'ALL' | LogLevel>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [autoScroll, setAutoScroll] = useState(true);
+  const [copiedIpKey, setCopiedIpKey] = useState<string | null>(null);
   const scrollBoxRef = useRef<HTMLDivElement>(null);
+
+  const handleCopyIp = async (logId: string, ip: string) => {
+    try {
+      await navigator.clipboard.writeText(ip);
+      setCopiedIpKey(logId);
+      window.setTimeout(() => {
+        setCopiedIpKey((prev) => (prev === logId ? null : prev));
+      }, 2000);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
 
   const filteredLogs = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -155,6 +168,9 @@ export const LiveEngineFeed: React.FC<LiveEngineFeedProps> = ({ t, logs, loading
                 minute: '2-digit',
                 second: '2-digit',
               });
+              const ipMatch = log.message.match(/\[SERVER PUBLIC IP\]\s*(\d{1,3}(?:\.\d{1,3}){3})/);
+              const matchedIp = ipMatch ? ipMatch[1] : null;
+              const isIpCopied = copiedIpKey === log.id;
               return (
                 <motion.div
                   key={log.id}
@@ -175,6 +191,20 @@ export const LiveEngineFeed: React.FC<LiveEngineFeedProps> = ({ t, logs, loading
                   <span className="min-w-0 flex-1 text-slate-300 break-words">
                     <TypewriterLine text={log.message} animate={isNewest} />
                   </span>
+                  {matchedIp && (
+                    <button
+                      type="button"
+                      onClick={() => handleCopyIp(log.id, matchedIp)}
+                      className={`inline-flex shrink-0 items-center gap-1 rounded border px-2 py-0.5 font-mono-tech text-[10px] transition-colors ${
+                        isIpCopied
+                          ? 'border-emerald-500/60 bg-emerald-500/20 text-emerald-300'
+                          : 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20'
+                      }`}
+                    >
+                      {isIpCopied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                      {isIpCopied ? 'Copied' : `Copy ${matchedIp}`}
+                    </button>
+                  )}
                 </motion.div>
               );
             })}

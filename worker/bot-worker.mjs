@@ -8,11 +8,11 @@ import http from 'node:http';
 import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
 
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
-const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || '';
-const IS_TESTNET = process.env.BINANCE_TESTNET === 'true';
+const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
+const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const BINANCE_API_KEY = (process.env.BINANCE_API_KEY || '').trim();
+const BINANCE_API_SECRET = (process.env.BINANCE_API_SECRET || '').trim();
+const IS_TESTNET = (process.env.BINANCE_TESTNET || '').trim() === 'true';
 
 const PUBLIC_BINANCE_ENDPOINTS = IS_TESTNET
   ? ['https://testnet.binance.vision']
@@ -32,8 +32,9 @@ const SIGNED_BINANCE_ENDPOINTS = IS_TESTNET
     ];
 
 const BINANCE_ROUND_TRIP_FEE_PCT = 0.2; // 0.1% Buy + 0.1% Sell Spot taker fees
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
+const IPV4_REGEX = /\b((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})\b/;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('[WORKER ERROR] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.');
@@ -81,8 +82,88 @@ async function sendTelegram(text) {
   }
 }
 
+function isMissingTableError(error) {
+  if (!error) return false;
+  const msg = String(error.message || '');
+  return (
+    error.code === '42P01' ||
+    error.code === 'PGRST205' ||
+    msg.includes('Could not find the table') ||
+    msg.includes('does not exist')
+  );
+}
+
+function isMissingPairColumnError(error) {
+  if (!error) return false;
+  const msg = String(error.message || '');
+  return (
+    error.code === '42703' ||
+    error.code === 'PGRST204' ||
+    msg.includes("'pair'") ||
+    msg.includes('column "pair"')
+  );
+}
+
+async function insertLogIntoTable(tableName, level, message, pair) {
+  const payload = pair ? { level, pair, message } : { level, message };
+  let { error } = await supabase.from(tableName).insert(payload);
+  if (error && pair && isMissingPairColumnError(error)) {
+    ({ error } = await supabase.from(tableName).insert({ level, message }));
+  }
+  if (error && !isMissingTableError(error)) {
+    console.warn(`[SUPABASE LOG WARNING] (${tableName}) ${error.message}`);
+  }
+}
+
 async function appendLog(level, message, pair = null) {
-  await supabase.from('logs').insert({ level, pair, message });
+  await Promise.allSettled([
+    insertLogIntoTable('engine_logs', level, message, pair),
+    insertLogIntoTable('logs', level, message, pair),
+  ]);
+}
+
+async function fetchServerPublicIp() {
+  try {
+    const res = await fetch('https://api.ipify.org?format=json', {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const match = String(data?.ip || '').trim().match(IPV4_REGEX);
+      if (match) return match[1];
+    }
+  } catch (err) {
+    console.warn('[IP LOOKUP WARNING] ipify.org failed:', err.message);
+  }
+
+  try {
+    const res = await fetch('https://ifconfig.me/ip', {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      const text = (await res.text()).trim();
+      const match = text.match(IPV4_REGEX);
+      if (match) return match[1];
+    }
+  } catch (err) {
+    console.warn('[IP LOOKUP WARNING] ifconfig.me failed:', err.message);
+  }
+
+  return null;
+}
+
+async function logServerPublicIp() {
+  const ip = await fetchServerPublicIp();
+  if (ip) {
+    const line = `[SERVER PUBLIC IP] ${ip}`;
+    console.log(line);
+    await appendLog('INFO', line);
+    return ip;
+  }
+  const warnLine = '[SERVER PUBLIC IP] Unavailable';
+  console.warn(warnLine);
+  await appendLog('WARNING', warnLine);
+  return null;
 }
 
 function signBinanceQuery(queryString) {
@@ -212,6 +293,8 @@ async function runCycle() {
         }
       } catch (balErr) {
         console.warn('[BALANCE SYNC WARNING]', balErr.message);
+        await appendLog('WARNING', `Balance sync failed: ${balErr.message}`);
+        await logServerPublicIp();
       }
     }
 
@@ -384,6 +467,11 @@ async function runCycle() {
   }
 }
 
-console.log('[AEGIS WORKER] Started (Endpoints: data-api.binance.vision + api1/2/3). Polling every 15s...');
-runCycle();
-setInterval(runCycle, 15_000);
+async function startWorker() {
+  console.log('[AEGIS WORKER] Started (Endpoints: data-api.binance.vision + api1/2/3). Polling every 15s...');
+  await logServerPublicIp();
+  await runCycle();
+  setInterval(runCycle, 15_000);
+}
+
+startWorker();

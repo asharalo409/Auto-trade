@@ -167,19 +167,46 @@ function normalizeTrade(row: Record<string, unknown>): Trade {
   };
 }
 
-function normalizeLog(row: Record<string, unknown>): LogEntry {
+function normalizeLog(row: Record<string, unknown>, sourcePrefix = 'log'): LogEntry {
   const lvl = String(row.level ?? 'INFO').toUpperCase();
   const level = (['INFO', 'WARNING', 'ERROR', 'TRADE'].includes(lvl)
     ? lvl
     : 'INFO') as LogLevel;
 
   return {
-    id: String(row.id ?? `${Date.now()}-${Math.random()}`),
+    id: `${sourcePrefix}-${String(row.id ?? `${Date.now()}-${Math.random()}`)}`,
     level,
     message: String(row.message ?? ''),
     pair: row.pair ? String(row.pair) : row.symbol ? String(row.symbol) : null,
     created_at: String(row.created_at ?? new Date().toISOString()),
   };
+}
+
+function isMissingSupabaseTableError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  const msg = String(error.message ?? '');
+  return (
+    error.code === '42P01' ||
+    error.code === 'PGRST205' ||
+    msg.includes('Could not find the table') ||
+    msg.includes('does not exist')
+  );
+}
+
+function mergeAndDedupeLogs(entries: LogEntry[]): LogEntry[] {
+  const sorted = [...entries].sort(
+    (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+  );
+  const deduped: LogEntry[] = [];
+  const seenKeys = new Set<string>();
+  for (const item of sorted) {
+    const bucket = Math.floor(new Date(item.created_at).getTime() / 2000);
+    const sig = `${item.level}|${item.pair ?? ''}|${item.message}|${bucket}`;
+    if (seenKeys.has(sig)) continue;
+    seenKeys.add(sig);
+    deduped.push(item);
+  }
+  return deduped.slice(-150);
 }
 
 export function useTradingTerminal() {
@@ -529,15 +556,21 @@ export function useTradingTerminal() {
     setDataLoading(true);
     setErrorMsg(null);
     try {
-      const [settingsRes, tradesRes, logsRes] = await Promise.all([
+      const [settingsRes, tradesRes, logsRes, engineLogsRes] = await Promise.all([
         supabase.from('settings').select('*').limit(1).maybeSingle(),
         supabase.from('trades').select('*').order('opened_at', { ascending: false }).limit(200),
         supabase.from('logs').select('*').order('created_at', { ascending: false }).limit(120),
+        supabase.from('engine_logs').select('*').order('created_at', { ascending: false }).limit(120),
       ]);
 
       if (settingsRes.error) throw settingsRes.error;
       if (tradesRes.error) throw tradesRes.error;
-      if (logsRes.error) throw logsRes.error;
+
+      const logsMissing = isMissingSupabaseTableError(logsRes.error);
+      const engineLogsMissing = isMissingSupabaseTableError(engineLogsRes.error);
+      if (logsRes.error && !logsMissing && engineLogsRes.error && !engineLogsMissing) {
+        throw logsRes.error;
+      }
 
       if (settingsRes.data) {
         const normalized = normalizeSettings(
@@ -558,10 +591,19 @@ export function useTradingTerminal() {
       if (tradesRes.data) {
         setLiveTrades((tradesRes.data as Record<string, unknown>[]).map(normalizeTrade));
       }
-      if (logsRes.data) {
-        setLiveLogs(
-          (logsRes.data as Record<string, unknown>[]).map(normalizeLog).reverse()
-        );
+
+      const combinedLogs: LogEntry[] = [
+        ...(logsRes.data
+          ? (logsRes.data as Record<string, unknown>[]).map((r) => normalizeLog(r, 'logs'))
+          : []),
+        ...(engineLogsRes.data
+          ? (engineLogsRes.data as Record<string, unknown>[]).map((r) =>
+              normalizeLog(r, 'engine_logs')
+            )
+          : []),
+      ];
+      if (combinedLogs.length > 0) {
+        setLiveLogs(mergeAndDedupeLogs(combinedLogs));
       }
     } catch (err) {
       console.error('Supabase fetch error:', err);
@@ -574,6 +616,16 @@ export function useTradingTerminal() {
   useEffect(() => {
     if (!supabase || isDemoMode || !isAuthenticated) return;
     fetchSupabaseData();
+
+    const handleRealtimeLog = (source: string) => (payload: { new?: unknown }) => {
+      if (payload.new && typeof payload.new === 'object') {
+        const entry = normalizeLog(payload.new as Record<string, unknown>, source);
+        setLiveLogs((prev) => {
+          const filtered = prev.filter((l) => l.id !== entry.id);
+          return mergeAndDedupeLogs([...filtered, entry]);
+        });
+      }
+    };
 
     const channel = supabase
       .channel('aegis-terminal-realtime')
@@ -607,12 +659,12 @@ export function useTradingTerminal() {
       .on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'logs' },
-        (payload) => {
-          if (payload.new) {
-            const entry = normalizeLog(payload.new as Record<string, unknown>);
-            setLiveLogs((prev) => [...prev.filter((l) => l.id !== entry.id).slice(-149), entry]);
-          }
-        }
+        handleRealtimeLog('logs')
+      )
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'engine_logs' },
+        handleRealtimeLog('engine_logs')
       )
       .subscribe();
 

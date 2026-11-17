@@ -72,7 +72,7 @@ create table if not exists public.trades (
   closed_at timestamptz
 );
 
--- 3. LOGS TABLE
+-- 3. LOGS & ENGINE_LOGS TABLES
 create table if not exists public.logs (
   id bigint primary key generated always as identity,
   level text default 'INFO',
@@ -81,15 +81,25 @@ create table if not exists public.logs (
   created_at timestamptz default now()
 );
 
+create table if not exists public.engine_logs (
+  id bigint primary key generated always as identity,
+  level text default 'INFO',
+  pair text,
+  message text not null,
+  created_at timestamptz default now()
+);
+
 -- 4. ENABLE REALTIME & ROW LEVEL SECURITY
-alter publication supabase_realtime add table public.settings, public.trades, public.logs;
+alter publication supabase_realtime add table public.settings, public.trades, public.logs, public.engine_logs;
 alter table public.settings enable row level security;
 alter table public.trades enable row level security;
 alter table public.logs enable row level security;
+alter table public.engine_logs enable row level security;
 
 create policy "Auth users full settings" on public.settings for all to authenticated using (true) with check (true);
 create policy "Auth users full trades" on public.trades for all to authenticated using (true) with check (true);
 create policy "Auth users full logs" on public.logs for all to authenticated using (true) with check (true);
+create policy "Auth users full engine_logs" on public.engine_logs for all to authenticated using (true) with check (true);
 
 insert into public.settings (bot_enabled, mode, zero_loss_mode, sell_only_in_profit)
 select false, 'LIVE', true, true
