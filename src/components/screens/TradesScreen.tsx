@@ -1,7 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { Layers, ShieldCheck, TrendingUp } from 'lucide-react';
+import { Check, Download, Layers, ShieldCheck, TrendingUp } from 'lucide-react';
 import { SUPPORTED_PAIRS } from '../../data/demoData';
+import { audioSynth } from '../../lib/audioSynth';
 import { Trade, TradeStatus } from '../../types/trading';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { NeonButton, SkeletonBlock } from '../ui/MotionPrimitives';
@@ -28,6 +29,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
   const [pairFilter, setPairFilter] = useState<string>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | TradeStatus>('ALL');
   const [dateFilter, setDateFilter] = useState<DateFilter>('ALL');
+  const [csvDone, setCsvDone] = useState(false);
 
   const openTrades = useMemo(
     () => trades.filter((tr) => tr.status === 'OPEN'),
@@ -49,6 +51,69 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
       return true;
     });
   }, [trades, pairFilter, statusFilter, dateFilter]);
+
+  const handleDownloadCsv = () => {
+    if (filteredHistory.length === 0) return;
+    audioSynth.playClick();
+
+    const escapeCell = (val: string | number | null | undefined): string => {
+      const str = val === null || val === undefined ? '' : String(val);
+      if (/[",\n\r]/.test(str)) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const headers = [
+      'Trade ID',
+      'Symbol',
+      'Side',
+      'Status',
+      'Quantity',
+      'Entry Price (USDT)',
+      'Exit / Current Price (USDT)',
+      'Invested (USDT)',
+      'Profit / Loss (USDT)',
+      'Profit / Loss (%)',
+      'Opened At (UTC)',
+      'Closed At (UTC)',
+    ];
+
+    const rows = filteredHistory.map((tr) => [
+      tr.id,
+      tr.pair,
+      tr.side,
+      tr.status,
+      tr.quantity,
+      tr.entry_price,
+      tr.exit_price ?? tr.current_price,
+      tr.invested_usdt.toFixed(2),
+      tr.profit_usdt.toFixed(2),
+      tr.profit_pct.toFixed(2),
+      new Date(tr.opened_at).toISOString(),
+      tr.closed_at ? new Date(tr.closed_at).toISOString() : '',
+    ]);
+
+    const csvContent =
+      '\uFEFF' +
+      [headers, ...rows]
+        .map((row) => row.map((cell) => escapeCell(cell)).join(','))
+        .join('\r\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `aegis-trades-tax-report-${dateStamp}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    setCsvDone(true);
+    window.setTimeout(() => setCsvDone(false), 2200);
+  };
 
   if (loading) {
     return (
@@ -92,7 +157,8 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                 4,
                 Math.min(100, ((trade.current_price - trade.entry_price) / tpRange) * 100)
               );
-              const blockedByZeroLoss = zeroLossMode && trade.profit_usdt < 0;
+              const blockedByZeroLoss =
+                zeroLossMode && trade.profit_usdt - trade.invested_usdt * 0.002 <= 0;
 
               return (
                 <motion.div
@@ -200,9 +266,20 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
         accent="cyan"
         title={t.tradeHistoryTitle}
         rightSlot={
-          <span className="font-mono-tech text-xs text-slate-400">
-            {filteredHistory.length} RECORDS
-          </span>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <span className="font-mono-tech text-xs text-slate-400">
+              {filteredHistory.length} RECORDS
+            </span>
+            <NeonButton
+              variant={csvDone ? 'emerald' : 'cyan'}
+              disabled={filteredHistory.length === 0}
+              onClick={handleDownloadCsv}
+              className="min-h-[34px] px-3 py-1 text-[11px]"
+            >
+              {csvDone ? <Check className="h-3.5 w-3.5" /> : <Download className="h-3.5 w-3.5" />}
+              {csvDone ? t.csvExported : t.downloadCsv}
+            </NeonButton>
+          </div>
         }
       >
         <div className="mb-3 flex flex-wrap items-center gap-2">

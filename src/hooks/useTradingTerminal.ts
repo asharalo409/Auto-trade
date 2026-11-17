@@ -39,6 +39,14 @@ const STORAGE_PREFS_KEY = 'aegis_quant_prefs_v2';
 const STORAGE_TG_KEY = 'aegis_quant_telegram_v1';
 const STORAGE_BN_KEY = 'aegis_quant_binance_v1';
 
+let idSequence = 0;
+function createUniqueId(prefix: string, suffix?: string): string {
+  idSequence += 1;
+  const ts = Date.now().toString(36).toUpperCase();
+  const seq = idSequence.toString(36).toUpperCase();
+  return suffix ? `${prefix}-${ts}-${seq}-${suffix}` : `${prefix}-${ts}-${seq}`;
+}
+
 interface StoredPrefs {
   sound_enabled?: boolean;
   theme?: ThemeId;
@@ -249,9 +257,17 @@ export function useTradingTerminal() {
 
   const logCycleRef = useRef(0);
   const marketPairsRef = useRef<PairMarketData[]>(marketPairs);
+  const demoTradesRef = useRef<Trade[]>(demoTrades);
+  const liveTradesRef = useRef<Trade[]>(liveTrades);
   useEffect(() => {
     marketPairsRef.current = marketPairs;
   }, [marketPairs]);
+  useEffect(() => {
+    demoTradesRef.current = demoTrades;
+  }, [demoTrades]);
+  useEffect(() => {
+    liveTradesRef.current = liveTrades;
+  }, [liveTrades]);
 
   const settings = activeWorkspace === 'DEMO' ? demoSettings : liveSettings;
   const trades = activeWorkspace === 'DEMO' ? demoTrades : liveTrades;
@@ -301,10 +317,11 @@ export function useTradingTerminal() {
   }, [binanceConfig]);
 
   const appendLog = useCallback((workspace: TradingMode, entry: LogEntry) => {
+    const updater = (prev: LogEntry[]) => [...prev.filter((l) => l.id !== entry.id).slice(-99), entry];
     if (workspace === 'DEMO') {
-      setDemoLogs((prev) => [...prev.slice(-99), entry]);
+      setDemoLogs(updater);
     } else {
-      setLiveLogs((prev) => [...prev.slice(-99), entry]);
+      setLiveLogs(updater);
     }
   }, []);
 
@@ -593,7 +610,7 @@ export function useTradingTerminal() {
         (payload) => {
           if (payload.new) {
             const entry = normalizeLog(payload.new as Record<string, unknown>);
-            setLiveLogs((prev) => [...prev.slice(-149), entry]);
+            setLiveLogs((prev) => [...prev.filter((l) => l.id !== entry.id).slice(-149), entry]);
           }
         }
       )
@@ -718,116 +735,122 @@ export function useTradingTerminal() {
         const ws: TradingMode = activeWorkspace;
         const activeCfg = ws === 'DEMO' ? demoSettings : liveSettings;
         if (activeCfg.bot_enabled && (ws === 'DEMO' || isDemoMode)) {
+          const currentTrades = ws === 'DEMO' ? demoTradesRef.current : liveTradesRef.current;
           const setTargetTrades = ws === 'DEMO' ? setDemoTrades : setLiveTrades;
-          setTargetTrades((prevTrades) => {
-            let nextTrades = [...prevTrades];
-            let mutated = false;
-            const nowIso = new Date().toISOString();
+          let nextTrades = [...currentTrades];
+          let mutated = false;
+          const nowIso = new Date().toISOString();
+          const pendingLogs: LogEntry[] = [];
+          const pendingTg: string[] = [];
+          let soundWin: boolean | null = null;
 
-            for (const pair of marketPairsRef.current) {
-              if (!activeCfg.enabled_pairs.includes(pair.symbol)) continue;
-              const pairOpen = nextTrades.filter(
-                (t) => t.pair === pair.symbol && t.status === 'OPEN'
-              );
+          for (const pair of marketPairsRef.current) {
+            if (!activeCfg.enabled_pairs.includes(pair.symbol)) continue;
+            const pairOpen = nextTrades.filter(
+              (t) => t.pair === pair.symbol && t.status === 'OPEN'
+            );
 
-              if (pairOpen.length > 0) {
-                const totalInvested = pairOpen.reduce((s, t) => s + t.invested_usdt, 0);
-                const totalPnl = pairOpen.reduce((s, t) => s + t.profit_usdt, 0);
-                const aggPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
-                const feeCostUsdt = totalInvested * 0.002; // 0.2% Binance round-trip fee
-                const netPnlAfterFees = totalPnl - feeCostUsdt;
-                const requiredTpPct = activeCfg.zero_loss_mode
-                  ? activeCfg.take_profit_pct + 0.2
-                  : activeCfg.take_profit_pct;
+            if (pairOpen.length > 0) {
+              const totalInvested = pairOpen.reduce((s, t) => s + t.invested_usdt, 0);
+              const totalPnl = pairOpen.reduce((s, t) => s + t.profit_usdt, 0);
+              const aggPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+              const feeCostUsdt = totalInvested * 0.002; // 0.2% Binance round-trip fee
+              const netPnlAfterFees = totalPnl - feeCostUsdt;
+              const requiredTpPct = activeCfg.zero_loss_mode
+                ? activeCfg.take_profit_pct + 0.2
+                : activeCfg.take_profit_pct;
 
-                // 1) Batch Sell-All when combined stack covers fees + Take Profit (strict Zero-Loss Shield)
-                const takeProfitHit =
-                  aggPct >= requiredTpPct && (!activeCfg.zero_loss_mode || netPnlAfterFees > 0);
-                const stopLossHit =
-                  !activeCfg.zero_loss_mode &&
-                  activeCfg.stop_loss_enabled &&
-                  aggPct <= -Math.abs(activeCfg.stop_loss_pct);
+              // 1) Batch Sell-All when combined stack covers fees + Take Profit (strict Zero-Loss Shield)
+              const takeProfitHit =
+                aggPct >= requiredTpPct && (!activeCfg.zero_loss_mode || netPnlAfterFees > 0);
+              const stopLossHit =
+                !activeCfg.zero_loss_mode &&
+                activeCfg.stop_loss_enabled &&
+                aggPct <= -Math.abs(activeCfg.stop_loss_pct);
 
-                if (takeProfitHit || stopLossHit) {
-                  const openIds = new Set(pairOpen.map((t) => t.id));
-                  nextTrades = nextTrades.map((t) =>
-                    openIds.has(t.id)
-                      ? { ...t, status: 'CLOSED', exit_price: pair.price, closed_at: nowIso }
-                      : t
-                  );
+              if (takeProfitHit || stopLossHit) {
+                const openIds = new Set(pairOpen.map((t) => t.id));
+                nextTrades = nextTrades.map((t) =>
+                  openIds.has(t.id)
+                    ? { ...t, status: 'CLOSED', exit_price: pair.price, closed_at: nowIso }
+                    : t
+                );
+                mutated = true;
+                soundWin = netPnlAfterFees >= 0;
+                const exitTag = takeProfitHit ? 'BATCH SELL ALL' : 'STOP-LOSS EXIT';
+                pendingLogs.push({
+                  id: createUniqueId('LOG', pair.base),
+                  level: 'TRADE',
+                  pair: pair.symbol,
+                  message: `${exitTag} (${pairOpen.length} orders) @ $${pair.price} | Net Profit ${
+                    netPnlAfterFees >= 0 ? '+' : ''
+                  }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`,
+                  created_at: nowIso,
+                });
+                pendingTg.push(
+                  `${exitTag} ${pair.symbol} (${pairOpen.length} trades) @ $${pair.price} | Net $${netPnlAfterFees.toFixed(
+                    2
+                  )}`
+                );
+                continue;
+              }
+
+              // 2) Auto Re-Buy on Dip (DCA stacking — never sit idle on one stuck trade)
+              if (activeCfg.dca_enabled && pairOpen.length < activeCfg.dca_max_buys) {
+                const lowestEntry = Math.min(...pairOpen.map((t) => t.entry_price));
+                const dropFromLowestPct = ((lowestEntry - pair.price) / lowestEntry) * 100;
+                const lot = Math.max(1, activeCfg.amount_per_trade);
+
+                if (
+                  dropFromLowestPct >= activeCfg.dca_step_pct &&
+                  totalInvested + lot <= activeCfg.max_amount_per_pair
+                ) {
+                  const qty = Number((lot / pair.price).toFixed(pair.price > 100 ? 5 : 2));
+                  const dcaOrder: Trade = {
+                    id: createUniqueId('DCA', pair.base),
+                    pair: pair.symbol,
+                    side: 'BUY',
+                    status: 'OPEN',
+                    entry_price: pair.price,
+                    current_price: pair.price,
+                    quantity: qty,
+                    invested_usdt: lot,
+                    profit_usdt: 0,
+                    profit_pct: 0,
+                    take_profit_price: Number(
+                      (pair.price * (1 + activeCfg.take_profit_pct / 100)).toFixed(4)
+                    ),
+                    stop_loss_price: Number(
+                      (pair.price * (1 - activeCfg.stop_loss_pct / 100)).toFixed(4)
+                    ),
+                    opened_at: nowIso,
+                  };
+                  nextTrades = [dcaOrder, ...nextTrades];
                   mutated = true;
-                  audioSynth.playTradeChime(netPnlAfterFees >= 0);
-                  const exitTag = takeProfitHit ? 'BATCH SELL ALL' : 'STOP-LOSS EXIT';
-                  appendLog(ws, {
-                    id: `LOG-${Date.now().toString().slice(-5)}-${pair.base}`,
+                  soundWin = true;
+                  pendingLogs.push({
+                    id: createUniqueId('LOG', `${pair.base}-D`),
                     level: 'TRADE',
                     pair: pair.symbol,
-                    message: `${exitTag} (${pairOpen.length} orders) @ $${pair.price} | Net Profit ${
-                      netPnlAfterFees >= 0 ? '+' : ''
-                    }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`,
+                    message: `DCA RE-BUY #${pairOpen.length + 1} @ $${pair.price} (-${dropFromLowestPct.toFixed(
+                      2
+                    )}% dip) | Lot $${lot} USDT`,
                     created_at: nowIso,
                   });
-                  void notifyTelegramIfConfigured(
-                    `${exitTag} ${pair.symbol} (${pairOpen.length} trades) @ $${pair.price} | Net $${netPnlAfterFees.toFixed(
-                      2
-                    )}`,
-                    ws
+                  pendingTg.push(
+                    `DCA RE-BUY #${pairOpen.length + 1} ${pair.symbol} @ $${pair.price} (-${dropFromLowestPct.toFixed(2)}% dip)`
                   );
-                  continue;
-                }
-
-                // 2) Auto Re-Buy on Dip (DCA stacking — never sit idle on one stuck trade)
-                if (activeCfg.dca_enabled && pairOpen.length < activeCfg.dca_max_buys) {
-                  const lowestEntry = Math.min(...pairOpen.map((t) => t.entry_price));
-                  const dropFromLowestPct = ((lowestEntry - pair.price) / lowestEntry) * 100;
-                  const lot = Math.max(1, activeCfg.amount_per_trade);
-
-                  if (
-                    dropFromLowestPct >= activeCfg.dca_step_pct &&
-                    totalInvested + lot <= activeCfg.max_amount_per_pair
-                  ) {
-                    const qty = Number((lot / pair.price).toFixed(pair.price > 100 ? 5 : 2));
-                    const dcaOrder: Trade = {
-                      id: `DCA-${Date.now().toString().slice(-4)}-${pair.base}`,
-                      pair: pair.symbol,
-                      side: 'BUY',
-                      status: 'OPEN',
-                      entry_price: pair.price,
-                      current_price: pair.price,
-                      quantity: qty,
-                      invested_usdt: lot,
-                      profit_usdt: 0,
-                      profit_pct: 0,
-                      take_profit_price: Number(
-                        (pair.price * (1 + activeCfg.take_profit_pct / 100)).toFixed(4)
-                      ),
-                      stop_loss_price: Number(
-                        (pair.price * (1 - activeCfg.stop_loss_pct / 100)).toFixed(4)
-                      ),
-                      opened_at: nowIso,
-                    };
-                    nextTrades = [dcaOrder, ...nextTrades];
-                    mutated = true;
-                    audioSynth.playTradeChime(true);
-                    appendLog(ws, {
-                      id: `LOG-${Date.now().toString().slice(-5)}-D`,
-                      level: 'TRADE',
-                      pair: pair.symbol,
-                      message: `DCA RE-BUY #${pairOpen.length + 1} @ $${pair.price} (-${dropFromLowestPct.toFixed(
-                        2
-                      )}% dip) | Lot $${lot} USDT`,
-                      created_at: nowIso,
-                    });
-                    void notifyTelegramIfConfigured(
-                      `DCA RE-BUY #${pairOpen.length + 1} ${pair.symbol} @ $${pair.price} (-${dropFromLowestPct.toFixed(2)}% dip)`,
-                      ws
-                    );
-                  }
                 }
               }
             }
-            return mutated ? nextTrades : prevTrades;
-          });
+          }
+
+          if (mutated) {
+            setTargetTrades(nextTrades);
+            if (soundWin !== null) audioSynth.playTradeChime(soundWin);
+            pendingLogs.forEach((entry) => appendLog(ws, entry));
+            pendingTg.forEach((msg) => void notifyTelegramIfConfigured(msg, ws));
+          }
         }
       }
 
@@ -866,7 +889,7 @@ export function useTradingTerminal() {
           ];
           const pick = templates[Math.floor(Math.random() * templates.length)];
           appendLog(ws, {
-            id: `LOG-${Date.now().toString().slice(-5)}`,
+            id: createUniqueId('LOG'),
             level: pick.level,
             pair: pick.pair,
             message: pick.msg,
@@ -1126,7 +1149,7 @@ export function useTradingTerminal() {
           if (settings.zero_loss_mode && netPnlAfterFees <= 0) {
             audioSynth.playTradeChime(false);
             appendLog(activeWorkspace, {
-              id: `LOG-${Date.now().toString().slice(-5)}`,
+              id: createUniqueId('LOG'),
               level: 'WARNING',
               pair: pair.symbol,
               message: `ZERO-LOSS SHIELD BLOCKED SELL: ${pair.symbol} net after 0.2% fee is $${netPnlAfterFees.toFixed(
@@ -1147,7 +1170,7 @@ export function useTradingTerminal() {
           else setLiveTrades(updater);
           audioSynth.playTradeChime(existingOpen.profit_usdt >= 0);
           appendLog(activeWorkspace, {
-            id: `LOG-${Date.now().toString().slice(-5)}`,
+            id: createUniqueId('LOG'),
             level: 'TRADE',
             pair: pair.symbol,
             message: `QUICK SELL CLOSED ${pair.symbol} @ $${pair.price} | PnL ${
@@ -1167,7 +1190,7 @@ export function useTradingTerminal() {
 
       const qty = Number((lot / pair.price).toFixed(pair.price > 100 ? 5 : 2));
       const newTrade: Trade = {
-        id: `ORD-${Date.now().toString().slice(-4)}`,
+        id: createUniqueId('ORD', pair.base),
         pair: pair.symbol,
         side,
         status: 'OPEN',
@@ -1194,7 +1217,7 @@ export function useTradingTerminal() {
 
       audioSynth.playTradeChime(true);
       appendLog(activeWorkspace, {
-        id: `LOG-${Date.now().toString().slice(-5)}`,
+        id: createUniqueId('LOG'),
         level: 'TRADE',
         pair: pair.symbol,
         message: `QUICK ${side} ${qty} ${pair.base} ($${lot} USDT) @ $${pair.price}`,
@@ -1223,7 +1246,7 @@ export function useTradingTerminal() {
     await updateSettings({ bot_enabled: nextEnabled });
 
     appendLog(activeWorkspace, {
-      id: `LOG-${Date.now().toString().slice(-5)}`,
+      id: createUniqueId('LOG'),
       level: nextEnabled ? 'INFO' : 'WARNING',
       pair: null,
       message: nextEnabled
@@ -1240,7 +1263,7 @@ export function useTradingTerminal() {
       const lot = Math.max(1, settings.amount_per_trade);
       const qty = Number((lot / pair.price).toFixed(pair.price > 100 ? 5 : 2));
       const newTrade: Trade = {
-        id: `LIVE-${Date.now().toString().slice(-4)}`,
+        id: createUniqueId('LIVE', pair.base),
         pair: pair.symbol,
         side: 'BUY',
         status: 'OPEN',
@@ -1256,7 +1279,7 @@ export function useTradingTerminal() {
       };
       setLiveTrades([newTrade]);
       appendLog('LIVE', {
-        id: `LOG-${Date.now().toString().slice(-4)}`,
+        id: createUniqueId('LOG'),
         level: 'TRADE',
         pair: pair.symbol,
         message: `LIVE ORDER ARMED: BUY ${qty} ${pair.base} ($${lot} USDT) @ $${pair.price}`,
@@ -1292,7 +1315,7 @@ export function useTradingTerminal() {
         : [...settings.enabled_pairs, symbol];
       await updateSettings({ enabled_pairs: nextPairs });
       appendLog(activeWorkspace, {
-        id: `LOG-${Date.now().toString().slice(-5)}`,
+        id: createUniqueId('LOG'),
         level: 'INFO',
         pair: symbol,
         message: `${symbol} ${exists ? 'removed from' : 'added to'} active trading matrix.`,
@@ -1312,7 +1335,7 @@ export function useTradingTerminal() {
       if (settings.zero_loss_mode && netPnlAfterFees <= 0) {
         audioSynth.playTradeChime(false);
         appendLog(activeWorkspace, {
-          id: `LOG-${Date.now().toString().slice(-5)}`,
+          id: createUniqueId('LOG'),
           level: 'WARNING',
           pair: target.pair,
           message: `ZERO-LOSS SHIELD BLOCKED EXIT: ${target.pair} net after 0.2% Binance fees is $${netPnlAfterFees.toFixed(
@@ -1362,7 +1385,7 @@ export function useTradingTerminal() {
       }
 
       appendLog(activeWorkspace, {
-        id: `LOG-${Date.now().toString().slice(-5)}`,
+        id: createUniqueId('LOG'),
         level: 'TRADE',
         pair: target.pair,
         message: `CLOSED ${target.pair} @ $${target.current_price} | PnL ${
@@ -1394,7 +1417,7 @@ export function useTradingTerminal() {
       setDemoSettings((prev) => ({ ...prev, balance_usdt: amount }));
       setDemoTrades(INITIAL_DEMO_TRADES);
       appendLog('DEMO', {
-        id: `LOG-${Date.now().toString().slice(-5)}`,
+        id: createUniqueId('LOG'),
         level: 'INFO',
         pair: null,
         message: `Virtual Demo balance reset to $${amount.toLocaleString('en-US')}.00 USDT.`,
@@ -1412,7 +1435,7 @@ export function useTradingTerminal() {
         `<b>[AEGIS QUANT TERMINAL]</b> Connection verified (${activeWorkspace} workspace). All trade & engine updates will stream here.`
       );
       appendLog(activeWorkspace, {
-        id: `LOG-${Date.now().toString().slice(-5)}`,
+        id: createUniqueId('LOG'),
         level: res.ok ? 'INFO' : 'WARNING',
         pair: null,
         message: res.ok
@@ -1432,7 +1455,7 @@ export function useTradingTerminal() {
       const nextCfg = { ...cfg, verified: validFormat };
       setBinanceConfig(nextCfg);
       appendLog('LIVE', {
-        id: `LOG-${Date.now().toString().slice(-5)}`,
+        id: createUniqueId('LOG'),
         level: validFormat ? 'INFO' : 'ERROR',
         pair: null,
         message: validFormat
