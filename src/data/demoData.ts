@@ -48,6 +48,9 @@ create table if not exists public.settings (
   mode text default 'LIVE',
   enabled_pairs jsonb default '["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT"]'::jsonb,
   telegram_enabled boolean default false,
+  binance_api_key text,
+  binance_api_secret text,
+  use_testnet boolean default false,
   balance_usdt numeric default 0,
   last_heartbeat timestamptz default now(),
   updated_at timestamptz default now()

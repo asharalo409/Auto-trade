@@ -7,6 +7,7 @@ import { CandlestickChart } from '../charts/CandlestickChart';
 import { SciFiSwitch } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
 import { BinanceOrderBook } from '../widgets/BinanceOrderBook';
+import { MarketSentimentWidget } from '../widgets/MarketSentimentWidget';
 
 interface MarketHeatmapProps {
   t: Record<string, string>;
@@ -66,6 +67,7 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
 
   return (
     <div className="space-y-4">
+      <MarketSentimentWidget t={t} />
       <TerminalPanel
         accent="cyan"
         title={t.marketHeatmapTitle}

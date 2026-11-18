@@ -38,6 +38,7 @@ import {
 const STORAGE_PREFS_KEY = 'aegis_quant_prefs_v2';
 const STORAGE_TG_KEY = 'aegis_quant_telegram_v1';
 const STORAGE_BN_KEY = 'aegis_quant_binance_v1';
+const STORAGE_WORKSPACE_KEY = 'aegis_active_workspace_v1';
 
 let idSequence = 0;
 function createUniqueId(prefix: string, suffix?: string): string {
@@ -233,7 +234,14 @@ export function useTradingTerminal() {
   const [dataLoading, setDataLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const [activeWorkspace, setActiveWorkspace] = useState<TradingMode>('DEMO');
+  const [activeWorkspace, setActiveWorkspace] = useState<TradingMode>(() => {
+    if (typeof window === 'undefined') return 'DEMO';
+    try {
+      return (window.localStorage.getItem(STORAGE_WORKSPACE_KEY) as TradingMode) || 'DEMO';
+    } catch {
+      return 'DEMO';
+    }
+  });
 
   const [demoSettings, setDemoSettings] = useState<BotSettings>(() => {
     const zLoss = initialPrefs.zero_loss_mode ?? INITIAL_DEMO_SETTINGS.zero_loss_mode;
@@ -1098,7 +1106,11 @@ export function useTradingTerminal() {
   const switchWorkspace = useCallback((mode: TradingMode) => {
     audioSynth.playToggle(mode === 'LIVE');
     setActiveWorkspace(mode);
-  }, []);
+    saveJson(STORAGE_WORKSPACE_KEY, mode);
+    if (supabase && !isDemoMode) {
+      supabase.from('settings').update({ mode }).eq('id', settings.id).then(() => {});
+    }
+  }, [isDemoMode, settings.id]);
 
   const updateSettings = useCallback(
     async (patch: Partial<BotSettings>) => {
@@ -1534,29 +1546,74 @@ export function useTradingTerminal() {
 
   const verifyBinanceCredentials = useCallback(
     async (cfg: BinanceConfig) => {
-      const validFormat =
-        cfg.api_key.trim().length >= 16 && cfg.api_secret.trim().length >= 16;
-      const nextCfg = { ...cfg, verified: validFormat };
-      setBinanceConfig(nextCfg);
-      appendLog('LIVE', {
-        id: createUniqueId('LOG'),
-        level: validFormat ? 'INFO' : 'ERROR',
-        pair: null,
-        message: validFormat
-          ? `Binance Spot API key (${cfg.api_key.slice(0, 6)}•••) verified for ${
-              cfg.use_testnet ? 'TESTNET' : 'MAINNET'
-            }.`
-          : 'Binance verification failed: API Key and Secret must be at least 16 characters.',
-        created_at: new Date().toISOString(),
-      });
-      return {
-        ok: validFormat,
-        detail: validFormat
-          ? 'API credentials format validated & armed'
-          : 'Invalid key or secret length',
-      };
+      try {
+        const res = await fetch('/api/binance/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            apiKey: cfg.api_key,
+            apiSecret: cfg.api_secret,
+            useTestnet: cfg.use_testnet,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error(data.detail || 'Binance verification failed');
+        }
+
+        const balance = Number(data.balance ?? 0);
+        const nextCfg = { ...cfg, verified: true };
+        setBinanceConfig(nextCfg);
+        setLiveSettings((prev) => ({
+          ...prev,
+          balance_usdt: balance,
+          binance_api_key: cfg.api_key.trim(),
+          binance_api_secret: cfg.api_secret.trim(),
+          use_testnet: cfg.use_testnet,
+        }));
+
+        if (supabase && !isDemoMode) {
+          await supabase
+            .from('settings')
+            .update({
+              balance_usdt: balance,
+              binance_api_key: cfg.api_key.trim(),
+              binance_api_secret: cfg.api_secret.trim(),
+              use_testnet: cfg.use_testnet,
+            })
+            .eq('id', settings.id);
+        }
+
+        appendLog('LIVE', {
+          id: createUniqueId('LOG'),
+          level: 'INFO',
+          pair: null,
+          message: `Binance Spot API verified! Live Balance: $${balance.toFixed(2)} USDT (${
+            cfg.use_testnet ? 'TESTNET' : 'MAINNET'
+          }).`,
+          created_at: new Date().toISOString(),
+        });
+
+        return {
+          ok: true,
+          detail: data.detail || `Connected! Live Spot Balance: $${balance.toFixed(2)} USDT`,
+        };
+      } catch (err: any) {
+        const msg = err.message || 'Verification network error';
+        appendLog('LIVE', {
+          id: createUniqueId('LOG'),
+          level: 'ERROR',
+          pair: null,
+          message: `Binance verification failed: ${msg}`,
+          created_at: new Date().toISOString(),
+        });
+        return {
+          ok: false,
+          detail: msg,
+        };
+      }
     },
-    [appendLog]
+    [appendLog, isDemoMode, settings.id]
   );
 
   const signIn = useCallback(async (email: string, password: string) => {

@@ -10,26 +10,9 @@ import 'dotenv/config';
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-const BINANCE_API_KEY = (process.env.BINANCE_API_KEY || '').trim();
-const BINANCE_API_SECRET = (process.env.BINANCE_API_SECRET || '').trim();
-const IS_TESTNET = (process.env.BINANCE_TESTNET || '').trim() === 'true';
-
-const PUBLIC_BINANCE_ENDPOINTS = IS_TESTNET
-  ? ['https://testnet.binance.vision']
-  : [
-      'https://data-api.binance.vision',
-      'https://api1.binance.com',
-      'https://api2.binance.com',
-      'https://api3.binance.com',
-    ];
-
-const SIGNED_BINANCE_ENDPOINTS = IS_TESTNET
-  ? ['https://testnet.binance.vision']
-  : [
-      'https://api1.binance.com',
-      'https://api2.binance.com',
-      'https://api3.binance.com',
-    ];
+const ENV_BINANCE_KEY = (process.env.BINANCE_API_KEY || '').trim();
+const ENV_BINANCE_SECRET = (process.env.BINANCE_API_SECRET || '').trim();
+const ENV_TESTNET = (process.env.BINANCE_TESTNET || '').trim() === 'true';
 
 const BINANCE_ROUND_TRIP_FEE_PCT = 0.2; // 0.1% Buy + 0.1% Sell Spot taker fees
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
@@ -45,7 +28,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-// Optional HTTP Healthcheck Server so Render Free Web Service stays healthy
+// Optional HTTP Healthcheck Server
 const PORT = Number(process.env.PORT || 0);
 if (PORT > 0) {
   http
@@ -166,21 +149,29 @@ async function logServerPublicIp() {
   return null;
 }
 
-function signBinanceQuery(queryString) {
+function signBinanceQuery(queryString, apiSecret) {
   return crypto
-    .createHmac('sha256', BINANCE_API_SECRET)
+    .createHmac('sha256', apiSecret)
     .update(queryString)
     .digest('hex');
 }
 
-async function fetchPublicWithFallback(pathAndQuery) {
+async function fetchPublicWithFallback(pathAndQuery, useTestnet) {
+  const endpoints = useTestnet
+    ? ['https://testnet.binance.vision']
+    : [
+        'https://data-api.binance.vision',
+        'https://api1.binance.com',
+        'https://api2.binance.com',
+        'https://api3.binance.com',
+      ];
+
   let lastErr = null;
-  for (const base of PUBLIC_BINANCE_ENDPOINTS) {
+  for (const base of endpoints) {
     try {
       const res = await fetch(`${base}${pathAndQuery}`);
       if (res.status === 418 || res.status === 429 || res.status >= 500) {
         lastErr = new Error(`Binance public HTTP ${res.status} (${base})`);
-        console.warn(`[BINANCE RETRY] ${lastErr.message}`);
         continue;
       }
       if (!res.ok) {
@@ -195,30 +186,33 @@ async function fetchPublicWithFallback(pathAndQuery) {
   throw lastErr || new Error('All public Binance market endpoints failed');
 }
 
-async function signedBinanceRequest(method, path, extraParams = {}) {
-  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+async function signedBinanceRequest(method, path, apiKey, apiSecret, useTestnet, extraParams = {}) {
+  if (!apiKey || !apiSecret) {
     throw new Error('Binance API credentials missing');
   }
 
+  const endpoints = useTestnet
+    ? ['https://testnet.binance.vision']
+    : ['https://api1.binance.com', 'https://api2.binance.com', 'https://api3.binance.com'];
+
   let lastErr = null;
-  for (const base of SIGNED_BINANCE_ENDPOINTS) {
+  for (const base of endpoints) {
     try {
       const params = new URLSearchParams({
         ...extraParams,
-        recvWindow: '10000',
+        recvWindow: '15000',
         timestamp: String(Date.now()),
       });
-      const sig = signBinanceQuery(params.toString());
+      const sig = signBinanceQuery(params.toString(), apiSecret);
       params.set('signature', sig);
 
       const res = await fetch(`${base}${path}?${params.toString()}`, {
         method,
-        headers: { 'X-MBX-APIKEY': BINANCE_API_KEY },
+        headers: { 'X-MBX-APIKEY': apiKey },
       });
 
       if (res.status === 418 || res.status === 429 || res.status >= 500) {
         lastErr = new Error(`Binance signed HTTP ${res.status} (${base})`);
-        console.warn(`[BINANCE SIGNED RETRY] ${lastErr.message}`);
         continue;
       }
 
@@ -229,7 +223,6 @@ async function signedBinanceRequest(method, path, extraParams = {}) {
       return data;
     } catch (err) {
       lastErr = err;
-      // Only continue fallback loop on transient / rate-limit errors, rethrow API validation errors
       const msg = String(err.message || '');
       if (!msg.includes('HTTP 418') && !msg.includes('HTTP 429') && !msg.includes('HTTP 5')) {
         throw err;
@@ -239,10 +232,10 @@ async function signedBinanceRequest(method, path, extraParams = {}) {
   throw lastErr || new Error('All Binance signed endpoints failed');
 }
 
-async function fetchBinancePrices(symbols) {
+async function fetchBinancePrices(symbols, useTestnet) {
   if (!symbols || symbols.length === 0) return {};
   const param = encodeURIComponent(JSON.stringify(symbols));
-  const rows = await fetchPublicWithFallback(`/api/v3/ticker/price?symbols=${param}`);
+  const rows = await fetchPublicWithFallback(`/api/v3/ticker/price?symbols=${param}`, useTestnet);
   const map = {};
   for (const row of rows) {
     map[row.symbol] = Number(row.price);
@@ -250,16 +243,16 @@ async function fetchBinancePrices(symbols) {
   return map;
 }
 
-async function fetchBinanceSpotUsdtBalance() {
-  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) return null;
-  const account = await signedBinanceRequest('GET', '/api/v3/account');
+async function fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet) {
+  if (!apiKey || !apiSecret) return null;
+  const account = await signedBinanceRequest('GET', '/api/v3/account', apiKey, apiSecret, useTestnet);
   if (!account || !Array.isArray(account.balances)) return null;
   const usdt = account.balances.find((b) => b.asset === 'USDT');
   if (!usdt) return 0;
   return Number((Number(usdt.free || 0) + Number(usdt.locked || 0)).toFixed(2));
 }
 
-async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity) {
+async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity, apiKey, apiSecret, useTestnet) {
   const params = {
     symbol,
     side,
@@ -270,8 +263,10 @@ async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity) {
   } else {
     params.quantity = Number(quantity).toFixed(5);
   }
-  return signedBinanceRequest('POST', '/api/v3/order', params);
+  return signedBinanceRequest('POST', '/api/v3/order', apiKey, apiSecret, useTestnet, params);
 }
+
+let lastLoggedBalance = null;
 
 async function runCycle() {
   try {
@@ -283,18 +278,27 @@ async function runCycle() {
 
     if (setErr || !settings) return;
 
-    // 1. Sync Real Binance Spot USDT Balance (if API credentials provided) + Heartbeat
+    // Resolve credentials from env or Supabase settings table
+    const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
+    const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
+    const useTestnet = ENV_TESTNET || Boolean(settings.use_testnet);
+
+    // 1. ALWAYS sync Real Binance Spot USDT Balance in every 15s loop (regardless of bot_enabled ON/OFF)
     const heartbeatPatch = { last_heartbeat: new Date().toISOString() };
-    if (BINANCE_API_KEY && BINANCE_API_SECRET) {
+    if (apiKey && apiSecret) {
       try {
-        const spotUsdt = await fetchBinanceSpotUsdtBalance();
+        const spotUsdt = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet);
         if (spotUsdt !== null && Number.isFinite(spotUsdt)) {
           heartbeatPatch.balance_usdt = spotUsdt;
+          if (lastLoggedBalance !== spotUsdt) {
+            lastLoggedBalance = spotUsdt;
+            const logMsg = `[BALANCE SYNC] Live Spot USDT: $${spotUsdt.toFixed(2)}`;
+            console.log(logMsg);
+            await appendLog('INFO', logMsg);
+          }
         }
       } catch (balErr) {
         console.warn('[BALANCE SYNC WARNING]', balErr.message);
-        await appendLog('WARNING', `Balance sync failed: ${balErr.message}`);
-        await logServerPublicIp();
       }
     }
 
@@ -304,7 +308,7 @@ async function runCycle() {
       .eq('id', settings.id);
 
     if (!settings.bot_enabled) {
-      return; // Standby until operator switches Bot ON
+      return; // Standby / OFF: Sync balance & heartbeat only, never place orders!
     }
 
     const enabledPairs = Array.isArray(settings.enabled_pairs)
@@ -320,7 +324,7 @@ async function runCycle() {
     const symbolsToFetch = Array.from(
       new Set([...enabledPairs, ...activeTrades.map((t) => t.pair)])
     );
-    const prices = await fetchBinancePrices(symbolsToFetch);
+    const prices = await fetchBinancePrices(symbolsToFetch, useTestnet);
 
     // 2. Refresh open trades PnL
     for (const tr of activeTrades) {
@@ -346,7 +350,6 @@ async function runCycle() {
     const dcaEnabled = settings.dca_enabled !== false;
     const dcaStepPct = Math.max(0.2, Number(settings.dca_step_pct || 1.5));
     const dcaMaxBuys = Math.max(1, Number(settings.dca_max_buys || 12));
-    // Zero-Loss Shield: checks zero_loss_shield -> zero_loss_mode -> sell_only_in_profit
     const zeroLoss = Boolean(
       settings.zero_loss_shield ?? settings.zero_loss_mode ?? settings.sell_only_in_profit ?? true
     );
@@ -378,8 +381,8 @@ async function runCycle() {
 
         if (takeProfitTriggered || stopLossTriggered) {
           for (const tr of pairOpen) {
-            if (BINANCE_API_KEY && BINANCE_API_SECRET) {
-              await placeBinanceMarketOrder(symbol, 'SELL', 0, tr.quantity);
+            if (apiKey && apiSecret) {
+              await placeBinanceMarketOrder(symbol, 'SELL', 0, tr.quantity, apiKey, apiSecret, useTestnet);
             }
             await supabase
               .from('trades')
@@ -405,8 +408,8 @@ async function runCycle() {
           const dropPct = ((lowestEntry - livePx) / lowestEntry) * 100;
           if (dropPct >= dcaStepPct && totalInvested + lot <= maxPerPair) {
             let filledQty = Number((lot / livePx).toFixed(5));
-            if (BINANCE_API_KEY && BINANCE_API_SECRET) {
-              const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0);
+            if (apiKey && apiSecret) {
+              const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0, apiKey, apiSecret, useTestnet);
               if (order.executedQty) filledQty = Number(order.executedQty);
             }
             const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
@@ -432,10 +435,9 @@ async function runCycle() {
           }
         }
       } else if (activeTrades.length < maxOpenTrades) {
-        // Initial Spot entry on enabled pair when capacity permits
         let filledQty = Number((lot / livePx).toFixed(5));
-        if (BINANCE_API_KEY && BINANCE_API_SECRET) {
-          const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0);
+        if (apiKey && apiSecret) {
+          const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0, apiKey, apiSecret, useTestnet);
           if (order.executedQty) filledQty = Number(order.executedQty);
         }
         const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
@@ -468,7 +470,7 @@ async function runCycle() {
 }
 
 async function startWorker() {
-  console.log('[AEGIS WORKER] Started (Endpoints: data-api.binance.vision + api1/2/3). Polling every 15s...');
+  console.log('[AEGIS WORKER] Started (Continuous Balance Sync + Trading Engine). Polling every 15s...');
   await logServerPublicIp();
   await runCycle();
   setInterval(runCycle, 15_000);
