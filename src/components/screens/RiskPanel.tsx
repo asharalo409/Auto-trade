@@ -1,6 +1,8 @@
 import React, { useMemo } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import {
+  Area,
+  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
@@ -359,6 +361,93 @@ export const RiskPanel: React.FC<RiskPanelProps> = ({ t, settings, stats, trades
                 ))}
               </Bar>
             </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </TerminalPanel>
+
+      {/* Cumulative Profit & Loss History Area Chart */}
+      <TerminalPanel
+        accent={net30d >= 0 ? 'cyan' : 'crimson'}
+        title={t.cumPnlChartTitle}
+        subtitle={t.cumPnlChartSub}
+        rightSlot={
+          <span
+            className={`font-mono-tech text-xs font-bold ${
+              net30d >= 0 ? 'text-cyan-300' : 'text-rose-400'
+            }`}
+          >
+            Trajectory: {net30d >= 0 ? '+' : ''}${net30d.toFixed(2)} USDT
+          </span>
+        }
+      >
+        <div className="h-64 w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart
+              data={dailySeries}
+              margin={{ top: 12, right: 12, left: 0, bottom: 0 }}
+            >
+              <defs>
+                <linearGradient id="cumPnlGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#22d3ee" stopOpacity={0.42} />
+                  <stop offset="65%" stopColor="#10b981" stopOpacity={0.12} />
+                  <stop offset="100%" stopColor="#05060a" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid
+                stroke="rgba(51,65,85,0.28)"
+                strokeDasharray="3 3"
+                vertical={false}
+              />
+              <XAxis
+                dataKey="label"
+                stroke="#94a3b8"
+                fontSize={10}
+                tickLine={false}
+                axisLine={false}
+                minTickGap={18}
+                fontFamily="JetBrains Mono"
+              />
+              <YAxis
+                stroke="#64748b"
+                fontSize={10}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(v) => `${Number(v) < 0 ? '-' : ''}$${Math.abs(Number(v))}`}
+                fontFamily="JetBrains Mono"
+              />
+              <ReferenceLine y={0} stroke="rgba(148,163,184,0.45)" strokeDasharray="3 3" />
+              <Tooltip
+                content={({ active, payload }) => {
+                  if (!active || !payload?.length) return null;
+                  const pt = payload[0].payload as DailyPnlPoint;
+                  const pos = pt.cumPnl >= 0;
+                  return (
+                    <div className="rounded-lg border border-cyan-500/40 bg-[#090d16]/95 px-3 py-2 font-mono-tech text-[11px] shadow-xl">
+                      <div className="font-bold text-slate-200">{pt.fullDate}</div>
+                      <div
+                        className={`mt-1 text-xs font-bold ${
+                          pos ? 'text-cyan-300' : 'text-rose-400'
+                        }`}
+                      >
+                        Cumulative PnL: {pos ? '+' : ''}${pt.cumPnl.toFixed(2)} USDT
+                      </div>
+                      <div className="mt-0.5 text-slate-400">
+                        Daily Realized: {pt.realizedPnl >= 0 ? '+' : ''}${pt.realizedPnl.toFixed(2)}
+                      </div>
+                    </div>
+                  );
+                }}
+              />
+              <Area
+                type="monotone"
+                dataKey="cumPnl"
+                stroke="#22d3ee"
+                strokeWidth={2.4}
+                fill="url(#cumPnlGrad)"
+                isAnimationActive={!reducedMotion}
+                animationDuration={900}
+              />
+            </AreaChart>
           </ResponsiveContainer>
         </div>
       </TerminalPanel>

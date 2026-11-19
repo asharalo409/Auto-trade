@@ -435,32 +435,46 @@ async function runCycle() {
           }
         }
       } else if (activeTrades.length < maxOpenTrades) {
-        let filledQty = Number((lot / livePx).toFixed(5));
-        if (apiKey && apiSecret) {
-          const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0, apiKey, apiSecret, useTestnet);
-          if (order.executedQty) filledQty = Number(order.executedQty);
+        // Real-Time Market Data Analysis (Volume Spike & Momentum check)
+        let ticker24h = null;
+        try {
+          ticker24h = await fetchPublicWithFallback(`/api/v3/ticker/24hr?symbol=${symbol}`, useTestnet);
+        } catch {}
+
+        const priceChangePercent = ticker24h ? Number(ticker24h.priceChangePercent || 0) : 0;
+        const quoteVolume = ticker24h ? Number(ticker24h.quoteVolume || 0) : 100000;
+        
+        const hasHealthyVolume = quoteVolume > 200000; // > $200k volume
+        const favorableMomentum = priceChangePercent > -5.0; // Avoid catastrophic freefall
+
+        if (hasHealthyVolume && favorableMomentum) {
+          let filledQty = Number((lot / livePx).toFixed(5));
+          if (apiKey && apiSecret) {
+            const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0, apiKey, apiSecret, useTestnet);
+            if (order.executedQty) filledQty = Number(order.executedQty);
+          }
+          const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
+          await supabase.from('trades').insert({
+            id,
+            pair: symbol,
+            side: 'BUY',
+            status: 'OPEN',
+            entry_price: livePx,
+            current_price: livePx,
+            quantity: filledQty,
+            invested_usdt: lot,
+            profit_usdt: 0,
+            profit_pct: 0,
+            take_profit_price: Number(
+              (livePx * (1 + (tpPct + (zeroLoss ? BINANCE_ROUND_TRIP_FEE_PCT : 0)) / 100)).toFixed(4)
+            ),
+            opened_at: new Date().toISOString(),
+          });
+          activeTrades.push({ pair: symbol });
+          const detailedMsg = `🚀 <b>AEGIS LIVE ENTRY BUY</b>\nPair: <b>${symbol}</b>\nPrice: $${livePx}\nInvested: $${lot} USDT\n24h Change: ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%\nVolume: $${Math.round(quoteVolume).toLocaleString()}\nMode: ${zeroLoss ? 'Zero-Loss Shield ON' : 'Standard'}`;
+          await appendLog('TRADE', detailedMsg, symbol);
+          if (settings.telegram_enabled) await sendTelegram(detailedMsg);
         }
-        const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
-        await supabase.from('trades').insert({
-          id,
-          pair: symbol,
-          side: 'BUY',
-          status: 'OPEN',
-          entry_price: livePx,
-          current_price: livePx,
-          quantity: filledQty,
-          invested_usdt: lot,
-          profit_usdt: 0,
-          profit_pct: 0,
-          take_profit_price: Number(
-            (livePx * (1 + (tpPct + (zeroLoss ? BINANCE_ROUND_TRIP_FEE_PCT : 0)) / 100)).toFixed(4)
-          ),
-          opened_at: new Date().toISOString(),
-        });
-        activeTrades.push({ pair: symbol });
-        const msg = `ENTRY BUY ${symbol} @ $${livePx} | $${lot} USDT (${zeroLoss ? 'Zero-Loss Shield ON' : 'Standard'})`;
-        await appendLog('TRADE', msg, symbol);
-        if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`);
       }
     }
   } catch (err) {
