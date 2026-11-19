@@ -160,6 +160,7 @@ export const INITIAL_TELEGRAM_CONFIG: TelegramConfig = {
   notify_trades: true,
   notify_tp_sl: true,
   notify_status: true,
+  notify_balance: true,
 };
 
 export const INITIAL_BINANCE_CONFIG: BinanceConfig = {

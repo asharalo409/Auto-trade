@@ -24,11 +24,20 @@ import { TradesScreen } from './components/screens/TradesScreen';
 import { BootSequence } from './components/ui/BootSequence';
 import { NeonButton } from './components/ui/MotionPrimitives';
 import { TickerBar } from './components/ui/TickerBar';
+import { BDT_PER_USD } from './data/demoData';
 import { useTradingTerminal } from './hooks/useTradingTerminal';
 import { translations } from './i18n/translations';
 import { audioSynth } from './lib/audioSynth';
 import { TERMINAL_THEMES } from './lib/themes';
-import { Language, TabId, TradingMode } from './types/trading';
+import { BackgroundPresetId, Language, TabId, TradingMode } from './types/trading';
+
+const STORAGE_BG_PREDATOR_KEY = 'aegis_bg_predator_v1';
+
+const PREDATOR_BG_SRC: Record<Exclude<BackgroundPresetId, 'none'>, string> = {
+  tiger: '/src/assets/images/predator_tiger_red_eyes_1795118033481.jpg',
+  lion: '/src/assets/images/predator_lion_red_eyes_1795118034764.jpg',
+  eagle: '/src/assets/images/predator_eagle_red_eyes_1795118034989.jpg',
+};
 
 export default function App() {
   const reducedMotion = useReducedMotion();
@@ -36,6 +45,27 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('command');
   const [bootComplete, setBootComplete] = useState(false);
   const [pendingLiveConfirm, setPendingLiveConfirm] = useState(false);
+  const [bgPredator, setBgPredator] = useState<BackgroundPresetId>(() => {
+    if (typeof window === 'undefined') return 'tiger';
+    try {
+      const saved = window.localStorage.getItem(STORAGE_BG_PREDATOR_KEY);
+      if (saved === 'tiger' || saved === 'lion' || saved === 'eagle' || saved === 'none') {
+        return saved;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return 'tiger';
+  });
+
+  const handleChangeBgPredator = useCallback((bg: BackgroundPresetId) => {
+    setBgPredator(bg);
+    try {
+      window.localStorage.setItem(STORAGE_BG_PREDATOR_KEY, bg);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
 
   const terminal = useTradingTerminal();
   const t = translations[lang];
@@ -85,10 +115,27 @@ export default function App() {
       className="relative flex min-h-screen flex-col text-slate-100 transition-colors duration-500"
       style={{ backgroundColor: activeTheme.bgCanvas }}
     >
-      {/* Ambient Animated Background Layers (Theme-synced, GPU compositor-only) */}
+      {/* Ambient Animated Background Layers + Predator Red-Eye Backdrop */}
       <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
+        {bgPredator !== 'none' && (
+          <>
+            <img
+              src={PREDATOR_BG_SRC[bgPredator]}
+              alt=""
+              aria-hidden="true"
+              referrerPolicy="no-referrer"
+              className="absolute inset-0 h-full w-full object-cover object-center opacity-45 select-none transition-opacity duration-500"
+            />
+            <div
+              aria-hidden="true"
+              className="absolute inset-0 bg-gradient-to-b from-[#040509]/70 via-[#040509]/45 to-[#040509]/85"
+            />
+          </>
+        )}
         <div
-          className="terminal-grid-bg absolute -inset-10 opacity-75"
+          className={`terminal-grid-bg absolute -inset-10 ${
+            bgPredator === 'none' ? 'opacity-75' : 'opacity-40'
+          }`}
           style={{
             backgroundImage: `linear-gradient(to right, ${activeTheme.gridRgba} 1px, transparent 1px), linear-gradient(to bottom, ${activeTheme.gridRgba} 1px, transparent 1px)`,
           }}
@@ -204,32 +251,66 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* Live / Virtual USDT Balance Pill */}
+                {/* Live / Virtual Real Money Balance Pill (USD + BDT) */}
                 <button
                   type="button"
-                  onClick={() => handleTabChange('command')}
+                  onClick={() =>
+                    handleTabChange(
+                      terminal.activeWorkspace === 'LIVE' && !terminal.hasBinanceKeys
+                        ? 'settings'
+                        : 'command'
+                    )
+                  }
                   title={
                     terminal.activeWorkspace === 'LIVE'
-                      ? 'Live Spot USDT Balance'
-                      : 'Virtual Demo USDT Balance'
+                      ? !terminal.hasBinanceKeys
+                        ? 'Binance API Keys Not Linked ($0.00)'
+                        : terminal.binanceAccount?.errorDetail
+                          ? `Binance Sync Error: ${terminal.binanceAccount.errorDetail}`
+                          : terminal.syncingBalance
+                            ? 'Syncing Live Binance Balance...'
+                            : 'Live Binance Portfolio Balance (USD & BDT)'
+                      : 'Virtual Demo USDT Balance (USD & BDT)'
                   }
                   className={`flex min-h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono-tech text-[11px] font-bold tracking-tight transition-all whitespace-nowrap ${
                     terminal.activeWorkspace === 'LIVE'
-                      ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)]'
+                      ? terminal.binanceAccount?.errorDetail
+                        ? 'border-rose-500/60 bg-rose-500/15 text-rose-200'
+                        : !terminal.hasBinanceKeys
+                          ? 'border-amber-500/60 bg-amber-500/15 text-amber-200'
+                          : 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)]'
                       : 'border-cyan-500/50 bg-cyan-500/15 text-cyan-200 shadow-[0_0_10px_rgba(34,211,238,0.18)]'
                   }`}
                 >
                   <span
                     className={`h-1.5 w-1.5 rounded-full animate-pulse ${
-                      terminal.activeWorkspace === 'LIVE' ? 'bg-emerald-400' : 'bg-cyan-400'
+                      terminal.activeWorkspace === 'LIVE'
+                        ? terminal.binanceAccount?.errorDetail
+                          ? 'bg-rose-400'
+                          : !terminal.hasBinanceKeys
+                            ? 'bg-amber-400'
+                            : 'bg-emerald-400'
+                        : 'bg-cyan-400'
                     }`}
                   />
                   <span>
-                    {terminal.activeWorkspace === 'LIVE' ? 'LIVE' : 'DEMO'}: $
-                    {terminal.stats.balance.toLocaleString('en-US', {
-                      minimumFractionDigits: 2,
-                      maximumFractionDigits: 2,
-                    })}
+                    {terminal.activeWorkspace === 'LIVE' ? 'LIVE' : 'DEMO'}:{' '}
+                    {terminal.activeWorkspace === 'LIVE' && terminal.syncingBalance
+                      ? 'SYNCING...'
+                      : `$${terminal.stats.balance.toLocaleString('en-US', {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}`}
+                    {terminal.activeWorkspace === 'LIVE' && !terminal.hasBinanceKeys && (
+                      <span className="ml-1 text-[10px] text-amber-300">(NO KEYS)</span>
+                    )}
+                    {terminal.activeWorkspace === 'LIVE' && terminal.binanceAccount?.errorDetail && (
+                      <span className="ml-1 text-[10px] text-rose-300">(API ERR)</span>
+                    )}
+                    <span className="hidden sm:inline text-emerald-200/90">
+                      {' '}
+                      · ৳{Math.round(terminal.stats.balance * BDT_PER_USD).toLocaleString('en-US')}
+                    </span>
                   </span>
                 </button>
               </div>
@@ -321,8 +402,16 @@ export default function App() {
                   marketPairs={terminal.marketPairs}
                   smartAlerts={terminal.smartAlerts}
                   binanceFeedLive={terminal.binanceFeedLive}
+                  hasBinanceKeys={terminal.hasBinanceKeys}
+                  hasTelegramKeys={terminal.hasTelegramKeys}
+                  binanceAccount={terminal.binanceAccount}
+                  syncingBalance={terminal.syncingBalance}
+                  alertEnabledPairs={terminal.alertEnabledPairs}
                   getEquitySeries={terminal.getEquitySeries}
                   onToggleBot={terminal.toggleBot}
+                  onToggleTelegram={(enabled) =>
+                    terminal.updateSettings({ telegram_enabled: enabled })
+                  }
                   onChangeCoreVisual={(mode) =>
                     terminal.updateSettings({ core_visual: mode })
                   }
@@ -331,6 +420,8 @@ export default function App() {
                   }
                   onQuickTrade={terminal.placeQuickTrade}
                   onResetVirtual={() => terminal.resetVirtualBalance(10000)}
+                  onRefreshBalance={terminal.refreshBinanceBalance}
+                  onSendSignalTelegram={terminal.sendSignalToTelegram}
                   onNavigateTab={(tab) => handleTabChange(tab)}
                 />
               )}
@@ -340,6 +431,7 @@ export default function App() {
                   t={t}
                   pairs={terminal.marketPairs}
                   enabledPairs={terminal.settings.enabled_pairs}
+                  alertEnabledPairs={terminal.alertEnabledPairs}
                   openTrades={terminal.trades}
                   candleStyle={terminal.settings.candle_style}
                   binanceFeedLive={terminal.binanceFeedLive}
@@ -348,6 +440,7 @@ export default function App() {
                     terminal.updateSettings({ candle_style: style })
                   }
                   onTogglePair={terminal.togglePair}
+                  onTogglePairAlert={terminal.togglePairAlert}
                   onQuickTrade={terminal.placeQuickTrade}
                 />
               )}
@@ -387,10 +480,15 @@ export default function App() {
                   saving={terminal.savingSettings}
                   telegramConfig={terminal.telegramConfig}
                   binanceConfig={terminal.binanceConfig}
+                  binanceAccount={terminal.binanceAccount}
+                  syncingBalance={terminal.syncingBalance}
+                  bgPredator={bgPredator}
+                  onChangeBgPredator={handleChangeBgPredator}
                   onSave={terminal.updateSettings}
                   onRequestWorkspaceSwitch={handleRequestWorkspaceSwitch}
                   onSaveTelegram={terminal.setTelegramConfig}
                   onTestTelegram={terminal.testTelegramConnection}
+                  onSendBalanceTelegram={terminal.sendTelegramBalanceSnapshot}
                   onSaveBinance={terminal.setBinanceConfig}
                   onVerifyBinance={terminal.verifyBinanceCredentials}
                 />

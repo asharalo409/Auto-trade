@@ -46,7 +46,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       initial={reducedMotion ? false : { opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.35, delay, ease: [0.16, 1, 0.3, 1] }}
-      className={`relative rounded-xl border bg-[#090d16]/90 ${ACCENT_STYLES[accent]} ${
+      className={`relative rounded-xl border bg-[#090d16]/78 backdrop-blur-[3px] ${ACCENT_STYLES[accent]} ${
         sweep && !reducedMotion ? 'panel-light-sweep' : ''
       } ${className}`}
     >

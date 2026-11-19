@@ -1,13 +1,17 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import {
   Activity,
   Bell,
   BellOff,
   BellRing,
+  Calculator,
+  CheckCircle2,
   Power,
   Radio,
+  RefreshCw,
   RotateCcw,
+  Send,
   ShieldAlert,
   ShieldCheck,
   TrendingUp,
@@ -22,7 +26,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { SUPPORTED_PAIRS } from '../../data/demoData';
+import { BDT_PER_USD, SUPPORTED_PAIRS } from '../../data/demoData';
 import { audioSynth } from '../../lib/audioSynth';
 import {
   DesktopNotificationPermission,
@@ -32,6 +36,7 @@ import {
 } from '../../lib/desktopNotifications';
 import { TERMINAL_THEMES } from '../../lib/themes';
 import {
+  BinanceAccountSummary,
   BotSettings,
   BotStatus,
   CandleStyle,
@@ -49,7 +54,7 @@ import { CandlestickChart } from '../charts/CandlestickChart';
 import { QuantumCore3D } from '../three/QuantumCore3D';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { InfoTip } from '../ui/InfoTip';
-import { NeonButton, SkeletonBlock } from '../ui/MotionPrimitives';
+import { NeonButton, SciFiSwitch, SkeletonBlock } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
 import { BinanceOrderBook } from '../widgets/BinanceOrderBook';
 import { MarketSentimentWidget } from '../widgets/MarketSentimentWidget';
@@ -77,12 +82,24 @@ interface CommandCenterProps {
   marketPairs: PairMarketData[];
   smartAlerts: SmartAlert[];
   binanceFeedLive: boolean;
+  hasBinanceKeys: boolean;
+  hasTelegramKeys: boolean;
+  binanceAccount: BinanceAccountSummary | null;
+  syncingBalance: boolean;
+  alertEnabledPairs: string[];
   getEquitySeries: (tf: EquityTimeframe) => EquityPoint[];
   onToggleBot: () => Promise<void>;
+  onToggleTelegram: (enabled: boolean) => Promise<void>;
   onChangeCoreVisual: (mode: CoreVisualMode) => Promise<void>;
   onChangeCandleStyle: (style: CandleStyle) => Promise<void>;
   onQuickTrade: (pairSymbol: string, side: 'BUY' | 'SELL', amountUsdt: number) => Promise<void>;
   onResetVirtual: () => void;
+  onRefreshBalance: () => Promise<unknown>;
+  onSendSignalTelegram: (
+    title: string,
+    detail: string,
+    options?: { force?: boolean }
+  ) => Promise<{ ok: boolean; detail: string }>;
   onNavigateTab: (tab: 'trades' | 'feed' | 'market' | 'settings') => void;
 }
 
@@ -98,6 +115,7 @@ interface LiveSignalNotice {
   detail: string;
   time: string;
   desktopDelivered: boolean;
+  telegramStatus?: string;
 }
 
 export const CommandCenter: React.FC<CommandCenterProps> = ({
@@ -113,18 +131,103 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   marketPairs,
   smartAlerts,
   binanceFeedLive,
+  hasBinanceKeys,
+  hasTelegramKeys,
+  binanceAccount,
+  syncingBalance,
+  alertEnabledPairs,
   getEquitySeries,
   onToggleBot,
+  onToggleTelegram,
   onChangeCoreVisual,
   onChangeCandleStyle,
   onQuickTrade,
   onResetVirtual,
+  onRefreshBalance,
+  onSendSignalTelegram,
   onNavigateTab,
 }) => {
   const reducedMotion = useReducedMotion();
   const [timeframe, setTimeframe] = useState<EquityTimeframe>('1D');
   const [chartPair, setChartPair] = useState<string>('BTCUSDT');
   const [toggling, setToggling] = useState(false);
+
+  // Profit/Loss Calculator Overlay State
+  const [calcOpen, setCalcOpen] = useState(false);
+  const [calcPair, setCalcPair] = useState<string>('BTCUSDT');
+  const [calcSide, setCalcSide] = useState<'LONG' | 'SHORT'>('LONG');
+  const [calcEntry, setCalcEntry] = useState<string>('91420.5');
+  const [calcExit, setCalcExit] = useState<string>('93614.5');
+  const [calcSize, setCalcSize] = useState<string>('100');
+  const [calcFeePct, setCalcFeePct] = useState<string>('0.2');
+
+  const calcLivePair = useMemo(
+    () => marketPairs.find((p) => p.symbol === calcPair) ?? marketPairs[0],
+    [marketPairs, calcPair]
+  );
+
+  const calcResult = useMemo(() => {
+    const entry = parseFloat(calcEntry);
+    const exit = parseFloat(calcExit);
+    const size = parseFloat(calcSize);
+    const feePct = parseFloat(calcFeePct);
+    const valid =
+      Number.isFinite(entry) &&
+      entry > 0 &&
+      Number.isFinite(exit) &&
+      exit > 0 &&
+      Number.isFinite(size) &&
+      size > 0;
+    if (!valid) {
+      return {
+        valid: false,
+        qty: 0,
+        grossPnl: 0,
+        grossPct: 0,
+        fees: 0,
+        netPnl: 0,
+        netPct: 0,
+        breakEven: 0,
+        bdtNet: 0,
+      };
+    }
+    const safeFee = Number.isFinite(feePct) && feePct >= 0 ? feePct : 0;
+    const qty = size / entry;
+    const rawDiff = calcSide === 'LONG' ? exit - entry : entry - exit;
+    const grossPnl = rawDiff * qty;
+    const grossPct = (rawDiff / entry) * 100;
+    const fees = size * (safeFee / 100);
+    const netPnl = grossPnl - fees;
+    const netPct = (netPnl / size) * 100;
+    const breakEven =
+      calcSide === 'LONG'
+        ? entry * (1 + safeFee / 100)
+        : entry * Math.max(0.0001, 1 - safeFee / 100);
+    return {
+      valid: true,
+      qty,
+      grossPnl,
+      grossPct,
+      fees,
+      netPnl,
+      netPct,
+      breakEven,
+      bdtNet: netPnl * BDT_PER_USD,
+    };
+  }, [calcEntry, calcExit, calcSize, calcFeePct, calcSide]);
+
+  const handleOpenCalculator = () => {
+    audioSynth.playClick();
+    const pair = marketPairs.find((p) => p.symbol === chartPair) ?? marketPairs[0];
+    if (pair) {
+      setCalcPair(pair.symbol);
+      const dec = pair.price > 10 ? 2 : 5;
+      setCalcEntry(pair.price.toFixed(dec));
+      setCalcExit((pair.price * (1 + settings.take_profit_pct / 100)).toFixed(dec));
+      setCalcSize(String(Math.max(1, settings.amount_per_trade)));
+    }
+    setCalcOpen(true);
+  };
 
   const [desktopAlertsEnabled, setDesktopAlertsEnabled] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true;
@@ -254,6 +357,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     let mutated = false;
     const nextAlerts = customAlerts.map((alert) => {
       if (!alert.active) return alert;
+      if (!alertEnabledPairs.includes(alert.pair)) return alert;
       const pairData = marketPairs.find((p) => p.symbol === alert.pair);
       if (!pairData) return alert;
       const crossed =
@@ -262,14 +366,19 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           : pairData.price <= alert.targetPrice;
       if (crossed) {
         mutated = true;
+        const alertTitle = `🎯 Price Alert Triggered: ${alert.pair}`;
+        const alertDetail = `Price @ $${pairData.price.toLocaleString()} crossed ${alert.condition} $${alert.targetPrice.toLocaleString()}`;
         dispatchTradeSignalNotification({
           pair: alert.pair,
           signal: alert.condition === 'ABOVE' ? 'BUY' : 'SELL',
           price: pairData.price,
-          title: `🎯 Price Alert Triggered: ${alert.pair}`,
-          detail: `Price @ $${pairData.price.toLocaleString()} crossed ${alert.condition} $${alert.targetPrice.toLocaleString()}`,
+          title: alertTitle,
+          detail: alertDetail,
           bypassCooldown: true,
         });
+        if (settings.telegram_enabled) {
+          void onSendSignalTelegram(alertTitle, alertDetail);
+        }
         return { ...alert, active: false };
       }
       return alert;
@@ -281,7 +390,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         window.localStorage.setItem('aegis_custom_price_alerts_v1', JSON.stringify(nextAlerts));
       } catch {}
     }
-  }, [marketPairs, customAlerts, dispatchTradeSignalNotification]);
+  }, [marketPairs, customAlerts, alertEnabledPairs, settings.telegram_enabled, onSendSignalTelegram, dispatchTradeSignalNotification]);
 
   // Auto-clear in-app signal toast banner after 12 seconds
   useEffect(() => {
@@ -302,20 +411,30 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     const prevMap = prevSignalsRef.current;
     for (const pair of marketPairs) {
       const prevSig = prevMap.get(pair.symbol);
-      if (prevSig && prevSig !== pair.signal && (pair.signal === 'BUY' || pair.signal === 'SELL')) {
+      if (
+        prevSig &&
+        prevSig !== pair.signal &&
+        (pair.signal === 'BUY' || pair.signal === 'SELL') &&
+        alertEnabledPairs.includes(pair.symbol)
+      ) {
+        const sigTitle = `${pair.signal === 'BUY' ? '▲ BUY' : '▼ SELL'} Trade Signal: ${pair.symbol}`;
+        const sigDetail = `@ $${pair.price.toLocaleString('en-US', { maximumFractionDigits: 5 })} · RSI ${pair.rsi14.toFixed(1)} · 24h ${pair.change24h >= 0 ? '+' : ''}${pair.change24h.toFixed(2)}%`;
         if (desktopAlertsEnabled) {
           dispatchTradeSignalNotification({
             pair: pair.symbol,
             signal: pair.signal,
             price: pair.price,
-            title: `${pair.signal === 'BUY' ? '▲ BUY' : '▼ SELL'} Trade Signal: ${pair.symbol}`,
-            detail: `@ $${pair.price.toLocaleString('en-US', { maximumFractionDigits: 5 })} · RSI ${pair.rsi14.toFixed(1)} · 24h ${pair.change24h >= 0 ? '+' : ''}${pair.change24h.toFixed(2)}%`,
+            title: sigTitle,
+            detail: sigDetail,
           });
+        }
+        if (settings.telegram_enabled) {
+          void onSendSignalTelegram(sigTitle, sigDetail);
         }
       }
       prevMap.set(pair.symbol, pair.signal);
     }
-  }, [marketPairs, desktopAlertsEnabled, dispatchTradeSignalNotification]);
+  }, [marketPairs, alertEnabledPairs, desktopAlertsEnabled, settings.telegram_enabled, onSendSignalTelegram, dispatchTradeSignalNotification]);
 
   // Watch real-time Smart Tracker signal alerts
   useEffect(() => {
@@ -427,8 +546,15 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     });
 
     audioSynth.playTradeChime(sig === 'BUY');
+    const noticeId = `test-${Date.now()}`;
+    const initialTgStatus = !settings.telegram_enabled
+      ? 'Telegram OFF (switch above)'
+      : !hasTelegramKeys
+        ? 'Telegram: Keys not set'
+        : 'Sending to Telegram...';
+
     setActiveSignalNotice({
-      id: `test-${Date.now()}`,
+      id: noticeId,
       pair: activePair.symbol,
       signal: sig,
       price: activePair.price,
@@ -440,7 +566,20 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         second: '2-digit',
       }),
       desktopDelivered,
+      telegramStatus: initialTgStatus,
     });
+
+    if (settings.telegram_enabled && hasTelegramKeys) {
+      const tgRes = await onSendSignalTelegram(title, detail);
+      setActiveSignalNotice((prev) =>
+        prev && prev.id === noticeId
+          ? {
+              ...prev,
+              telegramStatus: tgRes.ok ? 'Telegram ✓' : `TG Error: ${tgRes.detail}`,
+            }
+          : prev
+      );
+    }
   };
 
   const handlePowerClick = async () => {
@@ -580,7 +719,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     <div className="space-y-4">
       {/* Workspace Banner (Virtual vs Live Isolated Pages) */}
       <div
-        className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-2.5 ${
+        className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-2.5 backdrop-blur-sm ${
           workspace === 'LIVE'
             ? 'border-rose-500/45 bg-rose-500/10'
             : 'border-cyan-500/30 bg-cyan-500/8'
@@ -597,16 +736,81 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 {t.zeroLossBadge}
               </span>
             )}
+            {workspace === 'LIVE' && hasBinanceKeys && (
+              <span className="inline-flex items-center gap-1 rounded border border-emerald-500/45 bg-emerald-500/15 px-1.5 py-0.5 font-mono-tech text-[10px] font-semibold text-emerald-300">
+                <CheckCircle2 className="h-3 w-3" />
+                {t.binanceKeysConnectedBadge}
+              </span>
+            )}
           </div>
-          <p className="mt-0.5 text-xs text-slate-400">
+          <p className="mt-0.5 text-xs text-slate-300">
             {workspace === 'LIVE' ? t.liveBannerSub : t.virtualBannerSub}
+            {' · '}
+            <strong className="font-mono-tech text-emerald-300">
+              ${stats.balance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD
+              {' '}
+              (৳{Math.round(stats.balance * BDT_PER_USD).toLocaleString('en-US')})
+            </strong>
           </p>
+          {workspace === 'LIVE' && binanceAccount?.connected && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 font-mono-tech text-[10px]">
+              {stats.balance === 0 ? (
+                <span className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-amber-200">
+                  {t.liveBalanceEmptyZero}
+                </span>
+              ) : (
+                <>
+                  {binanceAccount.walletBreakdown?.map((w) => (
+                    <span
+                      key={w.walletName}
+                      className="rounded border border-cyan-500/35 bg-cyan-500/10 px-2 py-0.5 text-cyan-200"
+                    >
+                      {w.walletName}: ${w.balanceUsd.toFixed(2)}
+                    </span>
+                  ))}
+                  {binanceAccount.assets.slice(0, 5).map((a) => (
+                    <span
+                      key={a.asset}
+                      className="rounded border border-emerald-500/30 bg-[#05070d]/85 px-2 py-0.5 text-emerald-200"
+                    >
+                      {a.asset}: {a.total} (${a.usdValue.toFixed(2)})
+                    </span>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
+
+          {workspace === 'LIVE' && !binanceAccount?.connected && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono-tech text-[11px]">
+              {syncingBalance ? (
+                <span className="text-cyan-300">{t.liveBalanceSyncing}</span>
+              ) : !hasBinanceKeys ? (
+                <span className="text-amber-300">{t.liveBalanceNotLinked}</span>
+              ) : binanceAccount?.errorDetail ? (
+                <span className="rounded border border-rose-500/45 bg-rose-500/12 px-2 py-0.5 text-rose-200">
+                  {t.liveBalanceSyncFailed}: {binanceAccount.errorDetail}
+                  {binanceAccount.serverIp ? ` (Server IP: ${binanceAccount.serverIp})` : ''}
+                </span>
+              ) : null}
+            </div>
+          )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 shrink-0">
+        <div className="flex max-w-full flex-wrap items-center gap-2">
           <span className="font-mono-tech text-[11px] text-slate-300">
             LOT: <strong className="text-emerald-300">${settings.amount_per_trade}</strong>
           </span>
+
+          <button
+            type="button"
+            onClick={handleOpenCalculator}
+            className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-amber-400/50 bg-amber-500/12 px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-amber-200 transition-colors hover:bg-amber-500/22"
+          >
+            <Calculator className="h-3.5 w-3.5" />
+            <span>{t.pnlCalcBtn}</span>
+          </button>
+
           {workspace === 'DEMO' ? (
             <button
               type="button"
@@ -617,93 +821,169 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               {t.resetVirtualBtn}
             </button>
           ) : (
-            <button
-              type="button"
-              onClick={() => onNavigateTab('settings')}
-              className="min-h-[34px] cursor-pointer rounded-lg border border-rose-400/50 bg-rose-500/15 px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-rose-200 transition-colors hover:bg-rose-500/25"
-            >
-              API & Keys →
-            </button>
+            <>
+              {hasBinanceKeys && (
+                <button
+                  type="button"
+                  disabled={syncingBalance}
+                  onClick={() => {
+                    audioSynth.playClick();
+                    void onRefreshBalance();
+                  }}
+                  className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-emerald-400/50 bg-emerald-500/15 px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25 disabled:opacity-60"
+                >
+                  <RefreshCw className={`h-3 w-3 ${syncingBalance ? 'animate-spin' : ''}`} />
+                  <span>{t.refreshBalanceBtn}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => onNavigateTab('settings')}
+                className="min-h-[34px] cursor-pointer rounded-lg border border-rose-400/50 bg-rose-500/15 px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-rose-200 transition-colors hover:bg-rose-500/25"
+              >
+                API & Keys →
+              </button>
+            </>
           )}
         </div>
       </div>
 
-      {/* Real-Time Desktop Trade Signal Notification Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800/90 bg-[#070a12]/90 px-4 py-2.5">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <div
-            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
-              notifPermission === 'denied'
-                ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                : desktopAlertsEnabled && notifPermission === 'granted'
-                  ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
-                  : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
-            }`}
-          >
-            {desktopAlertsEnabled && notifPermission !== 'denied' ? (
-              <BellRing className="h-4 w-4" />
-            ) : (
-              <BellOff className="h-4 w-4" />
-            )}
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5 font-display text-xs font-bold tracking-wider text-slate-100 uppercase">
-              <span>{t.desktopAlertsTitle}</span>
-              <InfoTip text={t.helpDesktopAlerts} label={t.desktopAlertsTitle} />
+      {/* Real-Time Desktop & Telegram Trade Signal Notification Controls */}
+      <div className="space-y-2.5 rounded-xl border border-slate-800/90 bg-[#070a12]/90 px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <div
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+                notifPermission === 'denied'
+                  ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                  : desktopAlertsEnabled && notifPermission === 'granted'
+                    ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
+                    : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+              }`}
+            >
+              {desktopAlertsEnabled && notifPermission !== 'denied' ? (
+                <BellRing className="h-4 w-4" />
+              ) : (
+                <BellOff className="h-4 w-4" />
+              )}
             </div>
-            <p className="truncate font-mono-tech text-[11px] text-slate-400">
-              {notifPermission === 'unsupported'
-                ? t.desktopAlertsUnsupported
-                : notifPermission === 'denied'
-                  ? t.desktopAlertsBlockedHint
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-display text-xs font-bold tracking-wider text-slate-100 uppercase">
+                <span>{t.desktopAlertsTitle}</span>
+                <InfoTip text={t.helpDesktopAlerts} label={t.desktopAlertsTitle} />
+              </div>
+              <p className="truncate font-mono-tech text-[11px] text-slate-400">
+                {notifPermission === 'unsupported'
+                  ? t.desktopAlertsUnsupported
+                  : notifPermission === 'denied'
+                    ? t.desktopAlertsBlockedHint
+                    : notifPermission === 'default'
+                      ? t.desktopAlertsGrantHint
+                      : t.desktopAlertsReadyHint}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={notifPermission === 'unsupported'}
+              onClick={handleToggleDesktopAlerts}
+              className={`flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-1 font-mono-tech text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                notifPermission === 'denied'
+                  ? 'border-rose-500/45 bg-rose-500/10 text-rose-300'
                   : notifPermission === 'default'
-                    ? t.desktopAlertsGrantHint
-                    : t.desktopAlertsReadyHint}
-            </p>
+                    ? 'border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
+                    : desktopAlertsEnabled
+                      ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                      : 'border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {desktopAlertsEnabled && notifPermission === 'granted' ? (
+                <Bell className="h-3.5 w-3.5" />
+              ) : (
+                <BellOff className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {notifPermission === 'unsupported'
+                  ? t.desktopAlertsUnsupported
+                  : notifPermission === 'denied'
+                    ? t.desktopAlertsBlocked
+                    : notifPermission === 'default'
+                      ? t.desktopAlertsEnableBtn
+                      : desktopAlertsEnabled
+                        ? t.desktopAlertsOn
+                        : t.desktopAlertsOff}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleTestSignalAlert}
+              className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-cyan-500/45 bg-cyan-500/12 px-3 py-1 font-mono-tech text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/22"
+            >
+              <BellRing className="h-3.5 w-3.5" />
+              <span>{t.desktopAlertsTestBtn}</span>
+            </button>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 shrink-0">
-          <button
-            type="button"
-            disabled={notifPermission === 'unsupported'}
-            onClick={handleToggleDesktopAlerts}
-            className={`flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-1 font-mono-tech text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-              notifPermission === 'denied'
-                ? 'border-rose-500/45 bg-rose-500/10 text-rose-300'
-                : notifPermission === 'default'
-                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
-                  : desktopAlertsEnabled
-                    ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
-                    : 'border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            {desktopAlertsEnabled && notifPermission === 'granted' ? (
-              <Bell className="h-3.5 w-3.5" />
-            ) : (
-              <BellOff className="h-3.5 w-3.5" />
-            )}
-            <span>
-              {notifPermission === 'unsupported'
-                ? t.desktopAlertsUnsupported
-                : notifPermission === 'denied'
-                  ? t.desktopAlertsBlocked
-                  : notifPermission === 'default'
-                    ? t.desktopAlertsEnableBtn
-                    : desktopAlertsEnabled
-                      ? t.desktopAlertsOn
-                      : t.desktopAlertsOff}
-            </span>
-          </button>
+        {/* Dedicated Telegram Signal Notifications Switch (persisted in user settings) */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/80 pt-2.5">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <div
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+                !hasTelegramKeys
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                  : settings.telegram_enabled
+                    ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-300'
+                    : 'border-slate-700 bg-slate-900/60 text-slate-500'
+              }`}
+            >
+              <Send className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-display text-xs font-bold tracking-wider text-slate-100 uppercase">
+                <span>{t.telegramSignalsTitle}</span>
+                <InfoTip text={t.helpTelegramSignals} label={t.telegramSignalsTitle} />
+              </div>
+              <p className="truncate font-mono-tech text-[11px] text-slate-400">
+                {!hasTelegramKeys
+                  ? t.telegramSignalsMissingKeys
+                  : settings.telegram_enabled
+                    ? t.telegramSignalsReadyHint
+                    : t.telegramSignalsOffHint}
+              </p>
+            </div>
+          </div>
 
-          <button
-            type="button"
-            onClick={handleTestSignalAlert}
-            className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-cyan-500/45 bg-cyan-500/12 px-3 py-1 font-mono-tech text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/22"
-          >
-            <BellRing className="h-3.5 w-3.5" />
-            <span>{t.desktopAlertsTestBtn}</span>
-          </button>
+          <div className="flex items-center gap-2.5 shrink-0">
+            {!hasTelegramKeys && (
+              <button
+                type="button"
+                onClick={() => onNavigateTab('settings')}
+                className="min-h-[30px] cursor-pointer rounded-lg border border-amber-400/50 bg-amber-500/12 px-2.5 py-1 font-mono-tech text-[10px] font-semibold text-amber-200 hover:bg-amber-500/22"
+              >
+                {t.configureKeysBtn}
+              </button>
+            )}
+            <span
+              className={`font-mono-tech text-[11px] font-bold ${
+                settings.telegram_enabled ? 'text-cyan-300' : 'text-slate-500'
+              }`}
+            >
+              {settings.telegram_enabled ? t.telegramSignalsOn : t.telegramSignalsOff}
+            </span>
+            <SciFiSwitch
+              checked={settings.telegram_enabled}
+              onChange={(v) => {
+                audioSynth.playToggle(v);
+                void onToggleTelegram(v);
+              }}
+              label={t.telegramSignalsTitle}
+              accent="cyan"
+            />
+          </div>
         </div>
       </div>
 
@@ -747,6 +1027,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                   <span className="font-mono-tech text-[10px] font-normal text-slate-400">
                     {activeSignalNotice.time} ·{' '}
                     {activeSignalNotice.desktopDelivered ? 'Desktop + Terminal' : 'Terminal Alert'}
+                    {activeSignalNotice.telegramStatus ? ` · ${activeSignalNotice.telegramStatus}` : ''}
                   </span>
                 </div>
                 <p className="truncate font-mono-tech text-[11px] text-slate-200">
@@ -767,8 +1048,20 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
       </AnimatePresence>
 
       {workspace === 'LIVE' && !settings.bot_enabled && (
-        <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-2.5 font-mono-tech text-xs text-amber-200">
-          {t.liveIdleNotice}
+        <div
+          className={`rounded-xl border px-4 py-2.5 font-mono-tech text-xs ${
+            hasBinanceKeys
+              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+              : 'border-amber-500/35 bg-amber-500/10 text-amber-200'
+          }`}
+        >
+          <div>{hasBinanceKeys ? t.liveKeysReadyNotice : t.liveKeysMissingNotice}</div>
+          {hasBinanceKeys && binanceAccount?.errorDetail && (
+            <div className="mt-1 text-[11px] text-amber-300">
+              Binance API Status: {binanceAccount.errorDetail}
+              {binanceAccount.serverIp ? ` · Server IP: ${binanceAccount.serverIp}` : ''}
+            </div>
+          )}
         </div>
       )}
 
@@ -1023,6 +1316,11 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                   showSign={kpi.showSign}
                 />
               </div>
+              {idx === 0 && (
+                <div className="font-mono-tech text-[10px] font-semibold text-emerald-300/90">
+                  ≈ ৳{Math.round(kpi.value * BDT_PER_USD).toLocaleString('en-US')} BDT
+                </div>
+              )}
             </div>
           </TerminalPanel>
         ))}
@@ -1301,6 +1599,281 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           <span>{t.botStatusHintOffline}</span>
         </div>
       )}
+
+      {/* Profit / Loss Calculator Overlay */}
+      <AnimatePresence>
+        {calcOpen && (
+          <motion.div
+            initial={reducedMotion ? false : { opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={reducedMotion ? undefined : { opacity: 0 }}
+            onClick={() => setCalcOpen(false)}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4 py-6 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={reducedMotion ? false : { scale: 0.94, opacity: 0, y: 12 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={reducedMotion ? undefined : { scale: 0.94, opacity: 0, y: 8 }}
+              transition={{ duration: 0.2 }}
+              onClick={(e) => e.stopPropagation()}
+              className="relative w-full max-w-lg rounded-2xl border border-cyan-500/45 bg-[#070b14]/95 p-5 shadow-[0_0_60px_rgba(34,211,238,0.28)] sm:p-6"
+            >
+              <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-amber-400/45 bg-amber-500/15 text-amber-300">
+                    <Calculator className="h-4.5 w-4.5" />
+                  </div>
+                  <div>
+                    <h3 className="font-display text-lg font-bold tracking-wider text-white uppercase">
+                      {t.pnlCalcTitle}
+                    </h3>
+                    <p className="font-mono-tech text-[11px] text-slate-400">{t.pnlCalcSub}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Close calculator"
+                  onClick={() => setCalcOpen(false)}
+                  className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition-colors hover:border-rose-400/60 hover:text-white"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-3.5 font-mono-tech text-xs">
+                {/* Pair & Side */}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div>
+                    <label className="mb-1 block text-[10px] text-slate-400 uppercase">
+                      {t.pnlCalcPair}
+                    </label>
+                    <select
+                      value={calcPair}
+                      onChange={(e) => {
+                        const sym = e.target.value;
+                        setCalcPair(sym);
+                        const found = marketPairs.find((p) => p.symbol === sym);
+                        if (found) {
+                          const dec = found.price > 10 ? 2 : 5;
+                          setCalcEntry(found.price.toFixed(dec));
+                          setCalcExit(
+                            (found.price * (1 + settings.take_profit_pct / 100)).toFixed(dec)
+                          );
+                        }
+                      }}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#05070d] px-3 text-slate-100 focus:border-cyan-400 focus:outline-none"
+                    >
+                      {SUPPORTED_PAIRS.map((sym) => (
+                        <option key={sym} value={sym}>
+                          {sym}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[10px] text-slate-400 uppercase">
+                      {t.pnlCalcSide}
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5 rounded-lg border border-slate-800 bg-[#05070d] p-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          audioSynth.playClick();
+                          setCalcSide('LONG');
+                        }}
+                        className={`min-h-[30px] cursor-pointer rounded font-bold transition-colors ${
+                          calcSide === 'LONG'
+                            ? 'bg-emerald-500/25 text-emerald-300'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {t.pnlCalcLong}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          audioSynth.playClick();
+                          setCalcSide('SHORT');
+                        }}
+                        className={`min-h-[30px] cursor-pointer rounded font-bold transition-colors ${
+                          calcSide === 'SHORT'
+                            ? 'bg-rose-500/25 text-rose-300'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {t.pnlCalcShort}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Entry, Exit, Size, Fee */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <div className="mb-1 flex items-center justify-between text-[10px] text-slate-400">
+                      <span className="uppercase">{t.pnlCalcEntry}</span>
+                      {calcLivePair && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            audioSynth.playClick();
+                            const dec = calcLivePair.price > 10 ? 2 : 5;
+                            setCalcEntry(calcLivePair.price.toFixed(dec));
+                          }}
+                          className="cursor-pointer text-cyan-300 hover:underline"
+                        >
+                          {t.pnlCalcUseLive} (${calcLivePair.price})
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      type="number"
+                      step="any"
+                      min="0"
+                      value={calcEntry}
+                      onChange={(e) => setCalcEntry(e.target.value)}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#05070d] px-3 text-slate-100 focus:border-cyan-400 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[10px] text-slate-400 uppercase">
+                      {t.pnlCalcExit}
+                    </label>
+                    <input
+                      type="number"
+                      step="any"
+                      min="0"
+                      value={calcExit}
+                      onChange={(e) => setCalcExit(e.target.value)}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#05070d] px-3 text-slate-100 focus:border-cyan-400 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[10px] text-slate-400 uppercase">
+                      {t.pnlCalcSize}
+                    </label>
+                    <input
+                      type="number"
+                      step="any"
+                      min="1"
+                      value={calcSize}
+                      onChange={(e) => setCalcSize(e.target.value)}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#05070d] px-3 text-slate-100 focus:border-cyan-400 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[10px] text-slate-400 uppercase">
+                      {t.pnlCalcFee}
+                    </label>
+                    <input
+                      type="number"
+                      step="0.05"
+                      min="0"
+                      value={calcFeePct}
+                      onChange={(e) => setCalcFeePct(e.target.value)}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#05070d] px-3 text-slate-100 focus:border-cyan-400 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                {/* Quick % Target Chips */}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {[-2, 1, 2.4, 5, 10].map((pct) => (
+                    <button
+                      key={pct}
+                      type="button"
+                      onClick={() => {
+                        audioSynth.playClick();
+                        const entryNum = parseFloat(calcEntry);
+                        if (!Number.isFinite(entryNum) || entryNum <= 0) return;
+                        const factor = calcSide === 'LONG' ? 1 + pct / 100 : 1 - pct / 100;
+                        const dec = entryNum > 10 ? 2 : 5;
+                        setCalcExit((entryNum * factor).toFixed(dec));
+                      }}
+                      className={`cursor-pointer rounded border px-2.5 py-1 text-[10px] font-semibold transition-colors ${
+                        pct >= 0
+                          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
+                          : 'border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20'
+                      }`}
+                    >
+                      {pct >= 0 ? `+${pct}%` : `${pct}%`}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Estimated Returns Output Box */}
+                <div className="rounded-xl border border-slate-800 bg-[#04060c] p-4">
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    <div>
+                      <div className="text-[10px] text-slate-500 uppercase">{t.pnlCalcQty}</div>
+                      <div className="mt-0.5 font-bold text-slate-200">
+                        {calcResult.valid ? calcResult.qty.toFixed(5) : '—'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-slate-500 uppercase">{t.pnlCalcGross}</div>
+                      <div
+                        className={`mt-0.5 font-bold ${
+                          calcResult.grossPnl >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                        }`}
+                      >
+                        {calcResult.valid
+                          ? `${calcResult.grossPnl >= 0 ? '+' : ''}$${calcResult.grossPnl.toFixed(2)}`
+                          : '—'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-slate-500 uppercase">{t.pnlCalcFees}</div>
+                      <div className="mt-0.5 font-bold text-amber-300">
+                        {calcResult.valid ? `-$${calcResult.fees.toFixed(2)}` : '—'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-slate-500 uppercase">
+                        {t.pnlCalcBreakEven}
+                      </div>
+                      <div className="mt-0.5 font-bold text-cyan-300">
+                        {calcResult.valid
+                          ? `$${calcResult.breakEven.toFixed(calcResult.breakEven > 10 ? 2 : 5)}`
+                          : '—'}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-baseline justify-between gap-2 border-t border-slate-800/80 pt-3">
+                    <span className="text-[11px] font-bold tracking-wider text-slate-300 uppercase">
+                      {t.pnlCalcNet}
+                    </span>
+                    <div className="text-right">
+                      <span
+                        className={`text-xl font-bold ${
+                          calcResult.netPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                        }`}
+                      >
+                        {calcResult.valid
+                          ? `${calcResult.netPnl >= 0 ? '+' : ''}$${calcResult.netPnl.toFixed(2)} (${
+                              calcResult.netPct >= 0 ? '+' : ''
+                            }${calcResult.netPct.toFixed(2)}%)`
+                          : '—'}
+                      </span>
+                      {calcResult.valid && (
+                        <div className="text-[11px] text-slate-400">
+                          ≈ {calcResult.bdtNet >= 0 ? '+' : ''}৳
+                          {Math.round(calcResult.bdtNet).toLocaleString('en-US')} BDT
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };

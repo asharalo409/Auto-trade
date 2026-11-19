@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  BDT_PER_USD,
   EQUITY_SERIES,
   INITIAL_BINANCE_CONFIG,
   INITIAL_DEMO_LOGS,
@@ -18,6 +19,7 @@ import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { dispatchTelegramAlert } from '../lib/telegram';
 import { getTimeBasedTheme } from '../lib/themes';
 import {
+  BinanceAccountSummary,
   BinanceConfig,
   BotSettings,
   BotStatus,
@@ -43,6 +45,7 @@ const STORAGE_DEMO_SETTINGS_KEY = 'aegis_quant_demo_settings_v3';
 const STORAGE_LIVE_SETTINGS_KEY = 'aegis_quant_live_settings_v3';
 const STORAGE_DEMO_TRADES_KEY = 'aegis_quant_demo_trades_v3';
 const STORAGE_LIVE_TRADES_KEY = 'aegis_quant_live_trades_v3';
+const STORAGE_ALERT_PAIRS_KEY = 'aegis_alert_enabled_pairs_v1';
 
 let idSequence = 0;
 function createUniqueId(prefix: string, suffix?: string): string {
@@ -286,16 +289,14 @@ export function useTradingTerminal() {
       dca_max_buys: initialPrefs.dca_max_buys ?? 12,
       core_visual: initialPrefs.core_visual ?? 'torus',
       candle_style: initialPrefs.candle_style ?? 'japanese',
-      balance_usdt: 24.50,
+      balance_usdt: 0,
       zero_loss_mode: true,
       sell_only_in_profit: true,
       stop_loss_enabled: false,
     };
     const loaded = loadJson<BotSettings>(STORAGE_LIVE_SETTINGS_KEY, fallback);
-    if (loaded.balance_usdt === undefined || loaded.balance_usdt === null || loaded.balance_usdt <= 0) {
-      loaded.balance_usdt = 24.50;
-    }
-    return loaded;
+    // Never retain stale mock/legacy balances in LIVE before live Binance sync succeeds
+    return { ...loaded, balance_usdt: 0 };
   });
   const [liveTrades, setLiveTrades] = useState<Trade[]>(() =>
     loadJson<Trade[]>(STORAGE_LIVE_TRADES_KEY, [])
@@ -308,6 +309,12 @@ export function useTradingTerminal() {
   const [binanceConfig, setBinanceConfig] = useState<BinanceConfig>(() =>
     loadJson<BinanceConfig>(STORAGE_BN_KEY, INITIAL_BINANCE_CONFIG)
   );
+  const [binanceAccount, setBinanceAccount] = useState<BinanceAccountSummary | null>(null);
+  const [syncingBalance, setSyncingBalance] = useState(false);
+
+  const [alertEnabledPairs, setAlertEnabledPairs] = useState<string[]>(() =>
+    loadJson<string[]>(STORAGE_ALERT_PAIRS_KEY, [...SUPPORTED_PAIRS])
+  );
 
   const [marketPairs, setMarketPairs] = useState<PairMarketData[]>(INITIAL_MARKET_PAIRS);
   const [smartAlerts, setSmartAlerts] = useState<SmartAlert[]>(INITIAL_SMART_ALERTS);
@@ -319,6 +326,7 @@ export function useTradingTerminal() {
   const marketPairsRef = useRef<PairMarketData[]>(marketPairs);
   const demoTradesRef = useRef<Trade[]>(demoTrades);
   const liveTradesRef = useRef<Trade[]>(liveTrades);
+  const binanceAccountRef = useRef<BinanceAccountSummary | null>(binanceAccount);
   useEffect(() => {
     marketPairsRef.current = marketPairs;
   }, [marketPairs]);
@@ -328,6 +336,9 @@ export function useTradingTerminal() {
   useEffect(() => {
     liveTradesRef.current = liveTrades;
   }, [liveTrades]);
+  useEffect(() => {
+    binanceAccountRef.current = binanceAccount;
+  }, [binanceAccount]);
 
   const settings = activeWorkspace === 'DEMO' ? demoSettings : liveSettings;
   const trades = activeWorkspace === 'DEMO' ? demoTrades : liveTrades;
@@ -392,6 +403,10 @@ export function useTradingTerminal() {
     saveJson(STORAGE_LIVE_TRADES_KEY, liveTrades);
   }, [liveTrades]);
 
+  useEffect(() => {
+    saveJson(STORAGE_ALERT_PAIRS_KEY, alertEnabledPairs);
+  }, [alertEnabledPairs]);
+
   const appendLog = useCallback((workspace: TradingMode, entry: LogEntry) => {
     const updater = (prev: LogEntry[]) => [...prev.filter((l) => l.id !== entry.id).slice(-99), entry];
     if (workspace === 'DEMO') {
@@ -404,12 +419,34 @@ export function useTradingTerminal() {
   const notifyTelegramIfConfigured = useCallback(
     async (text: string, workspace: TradingMode) => {
       const targetSettings = workspace === 'DEMO' ? demoSettings : liveSettings;
-      if (!targetSettings.telegram_enabled) return;
-      if (!telegramConfig.bot_token.trim() || !telegramConfig.chat_id.trim()) return;
-      await dispatchTelegramAlert(
+      if (!targetSettings.telegram_enabled) {
+        console.debug('[useTradingTerminal] notifyTelegramIfConfigured skipped: telegram_enabled=false', { workspace });
+        return;
+      }
+      if (!telegramConfig.bot_token.trim() || !telegramConfig.chat_id.trim()) {
+        console.warn('[useTradingTerminal] notifyTelegramIfConfigured skipped: missing bot_token or chat_id', { workspace });
+        return;
+      }
+      const wsBal =
+        workspace === 'LIVE'
+          ? binanceAccountRef.current?.connected
+            ? binanceAccountRef.current.totalPortfolioUsd > 0
+              ? binanceAccountRef.current.totalPortfolioUsd
+              : binanceAccountRef.current.totalUsdt
+            : 0
+          : Number(targetSettings.balance_usdt ?? 10000);
+      const bdtVal = Math.round(wsBal * BDT_PER_USD);
+      const balanceFooter =
+        telegramConfig.notify_balance !== false
+          ? `\n💰 <b>Balance:</b> $${wsBal.toFixed(2)} (৳${bdtVal.toLocaleString('en-US')})`
+          : '';
+      const res = await dispatchTelegramAlert(
         telegramConfig,
-        `<b>[AEGIS ${workspace}]</b> ${text}`
+        `<b>[AEGIS ${workspace}]</b> ${text}${balanceFooter}`
       );
+      if (!res.ok) {
+        console.error('[useTradingTerminal] notifyTelegramIfConfigured failed:', res);
+      }
     },
     [demoSettings, liveSettings, telegramConfig]
   );
@@ -639,6 +676,8 @@ export function useTradingTerminal() {
           theme: prev.theme,
           core_visual: prev.core_visual,
           candle_style: prev.candle_style,
+          // Never let stale Supabase balance overwrite verified live Binance balance
+          balance_usdt: binanceAccountRef.current?.connected ? prev.balance_usdt : 0,
         }));
         if (normalized.mode === 'LIVE') {
           setActiveWorkspace('LIVE');
@@ -690,9 +729,13 @@ export function useTradingTerminal() {
         { event: '*', schema: 'public', table: 'settings' },
         (payload) => {
           if (payload.new && typeof payload.new === 'object') {
-            setLiveSettings((prev) =>
-              normalizeSettings(payload.new as Record<string, unknown>, prev)
-            );
+            setLiveSettings((prev) => {
+              const next = normalizeSettings(payload.new as Record<string, unknown>, prev);
+              return {
+                ...next,
+                balance_usdt: binanceAccountRef.current?.connected ? prev.balance_usdt : 0,
+              };
+            });
           }
         }
       )
@@ -1106,9 +1149,22 @@ export function useTradingTerminal() {
     const lockedCapital = Number(
       openTradesList.reduce((acc, t) => acc + t.invested_usdt, 0).toFixed(2)
     );
+    const liveVerifiedBalance = binanceAccount?.connected
+      ? Number(
+          (binanceAccount.totalPortfolioUsd > 0
+            ? binanceAccount.totalPortfolioUsd
+            : binanceAccount.totalUsdt
+          ).toFixed(2)
+        )
+      : 0;
     const baseBalance =
-      settings.balance_usdt ?? (activeWorkspace === 'DEMO' ? 10000 : 0);
-    const balance = Number((baseBalance + openPnl).toFixed(2));
+      activeWorkspace === 'LIVE'
+        ? liveVerifiedBalance
+        : (settings.balance_usdt ?? 10000);
+    const balance =
+      activeWorkspace === 'LIVE'
+        ? baseBalance
+        : Number((baseBalance + openPnl).toFixed(2));
 
     const todayLoss = Number(
       Math.abs(
@@ -1140,7 +1196,7 @@ export function useTradingTerminal() {
       todayLoss,
       exposurePerPair,
     };
-  }, [trades, settings.balance_usdt, activeWorkspace]);
+  }, [trades, settings.balance_usdt, activeWorkspace, binanceAccount]);
 
   const getEquitySeries = useCallback(
     (timeframe: EquityTimeframe): EquityPoint[] => {
@@ -1601,87 +1657,446 @@ export function useTradingTerminal() {
     [appendLog]
   );
 
+  const refreshBinanceBalance = useCallback(
+    async (cfgOverride?: BinanceConfig): Promise<BinanceAccountSummary & { ok: boolean }> => {
+      const activeCfg = cfgOverride ?? binanceConfig;
+      const apiKey = activeCfg.api_key.trim();
+      const apiSecret = activeCfg.api_secret.trim();
+
+      if (!apiKey || !apiSecret) {
+        console.warn('[useTradingTerminal] refreshBinanceBalance skipped: missing API Key or Secret');
+        const empty: BinanceAccountSummary & { ok: boolean } = {
+          ok: false,
+          connected: false,
+          usdtFree: 0,
+          usdtLocked: 0,
+          totalUsdt: 0,
+          totalPortfolioUsd: 0,
+          assets: [],
+          canTrade: false,
+          lastSyncedAt: new Date().toISOString(),
+          errorDetail: 'Binance API Key & Secret are required',
+        };
+        setBinanceAccount(empty);
+        setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
+        return empty;
+      }
+
+      setSyncingBalance(true);
+      console.info('[useTradingTerminal] Syncing live Binance balance...', {
+        useTestnet: activeCfg.use_testnet,
+        keyPrefix: apiKey.slice(0, 6),
+      });
+      try {
+        const res = await fetch('/api/binance/balance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            apiKey,
+            apiSecret,
+            useTestnet: activeCfg.use_testnet,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          usdtFree?: number;
+          usdtLocked?: number;
+          totalUsdt?: number;
+          totalPortfolioUsd?: number;
+          spotUsd?: number;
+          fundingUsd?: number;
+          earnUsd?: number;
+          walletBreakdown?: { walletName: string; balanceUsd: number }[];
+          assets?: BinanceAccountSummary['assets'];
+          canTrade?: boolean;
+          lastSyncedAt?: string;
+          detail?: string;
+          code?: number | null;
+          upstreamStatus?: number;
+          serverIp?: string | null;
+        };
+
+        if (res.ok && data.ok) {
+          const totalPortfolioUsd = Number(data.totalPortfolioUsd ?? data.totalUsdt ?? 0);
+          const totalUsdt = Number(data.totalUsdt ?? 0);
+          const realUsd = Number((totalPortfolioUsd > 0 ? totalPortfolioUsd : totalUsdt).toFixed(2));
+          const summary: BinanceAccountSummary & { ok: boolean } = {
+            ok: true,
+            connected: true,
+            usdtFree: Number(data.usdtFree ?? 0),
+            usdtLocked: Number(data.usdtLocked ?? 0),
+            totalUsdt,
+            totalPortfolioUsd,
+            spotUsd: Number(data.spotUsd ?? 0),
+            fundingUsd: Number(data.fundingUsd ?? 0),
+            earnUsd: Number(data.earnUsd ?? 0),
+            walletBreakdown: Array.isArray(data.walletBreakdown) ? data.walletBreakdown : [],
+            assets: Array.isArray(data.assets) ? data.assets : [],
+            canTrade: Boolean(data.canTrade),
+            lastSyncedAt: data.lastSyncedAt ?? new Date().toISOString(),
+            errorDetail: null,
+          };
+          console.info('[useTradingTerminal] Live Binance balance synced:', {
+            realUsd,
+            spotUsd: summary.spotUsd,
+            fundingUsd: summary.fundingUsd,
+            earnUsd: summary.earnUsd,
+            assetsCount: summary.assets.length,
+          });
+          setBinanceAccount(summary);
+          setBinanceConfig({ ...activeCfg, verified: true });
+          setLiveSettings((prev) => ({
+            ...prev,
+            balance_usdt: realUsd,
+            last_heartbeat: new Date().toISOString(),
+          }));
+
+          if (supabase && !isDemoMode) {
+            try {
+              await supabase
+                .from('settings')
+                .update({
+                  balance_usdt: realUsd,
+                  binance_api_key: apiKey,
+                  binance_api_secret: apiSecret,
+                  use_testnet: activeCfg.use_testnet,
+                })
+                .eq('id', liveSettings.id);
+            } catch {
+              // ignore offline supabase update
+            }
+          }
+          return summary;
+        }
+
+        console.warn('[useTradingTerminal] Binance balance sync rejected:', {
+          httpStatus: data.upstreamStatus ?? res.status,
+          code: data.code ?? null,
+          detail: data.detail,
+          serverIp: data.serverIp ?? null,
+        });
+
+        const errSummary: BinanceAccountSummary & { ok: boolean } = {
+          ok: false,
+          connected: false,
+          usdtFree: 0,
+          usdtLocked: 0,
+          totalUsdt: 0,
+          totalPortfolioUsd: 0,
+          assets: [],
+          canTrade: false,
+          lastSyncedAt: new Date().toISOString(),
+          errorDetail: data.detail || `Binance HTTP ${data.upstreamStatus ?? res.status}`,
+          serverIp: data.serverIp ?? null,
+        };
+        setBinanceAccount(errSummary);
+        setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
+        return errSummary;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unable to reach Binance balance service';
+        console.error('[useTradingTerminal] Binance balance request exception:', err);
+        const errSummary: BinanceAccountSummary & { ok: boolean } = {
+          ok: false,
+          connected: false,
+          usdtFree: 0,
+          usdtLocked: 0,
+          totalUsdt: 0,
+          totalPortfolioUsd: 0,
+          assets: [],
+          canTrade: false,
+          lastSyncedAt: new Date().toISOString(),
+          errorDetail: msg,
+        };
+        setBinanceAccount(errSummary);
+        setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
+        return errSummary;
+      } finally {
+        setSyncingBalance(false);
+      }
+    },
+    [binanceConfig, isDemoMode, liveSettings.id]
+  );
+
+  // Auto-sync real Binance Spot balance on mount and every 30s when keys are configured
+  useEffect(() => {
+    if (!binanceConfig.api_key.trim() || !binanceConfig.api_secret.trim()) {
+      setBinanceAccount(null);
+      setLiveSettings((prev) => (prev.balance_usdt !== 0 ? { ...prev, balance_usdt: 0 } : prev));
+      return;
+    }
+    void refreshBinanceBalance();
+    const timer = window.setInterval(() => {
+      if (!document.hidden) {
+        void refreshBinanceBalance();
+      }
+    }, 30_000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [binanceConfig.api_key, binanceConfig.api_secret, binanceConfig.use_testnet]);
+
   const testTelegramConnection = useCallback(
     async (cfg: TelegramConfig) => {
       setTelegramConfig(cfg);
+      const token = cfg.bot_token.trim();
+      const chatId = cfg.chat_id.trim();
+      console.info('[useTradingTerminal] testTelegramConnection initiated:', {
+        workspace: activeWorkspace,
+        hasToken: Boolean(token),
+        chatId,
+        notifyBalance: cfg.notify_balance !== false,
+      });
+
+      if (!token || !chatId) {
+        const detail = !token ? 'Missing Telegram Bot Token' : 'Missing Telegram Chat ID';
+        console.error('[useTradingTerminal] testTelegramConnection aborted:', { detail });
+        appendLog(activeWorkspace, {
+          id: createUniqueId('LOG'),
+          level: 'ERROR',
+          pair: null,
+          message: `Telegram test aborted: ${detail}`,
+          created_at: new Date().toISOString(),
+        });
+        return { ok: false, detail };
+      }
+
       const currentBalance = stats.balance;
-      const messageText = `<b>[AEGIS QUANT TERMINAL — ${activeWorkspace}]</b>\n` +
-        `🟢 <b>Telegram Test Connection Verified!</b>\n` +
-        `💰 <b>Actual / Current Balance:</b> $${currentBalance.toFixed(2)} USDT\n` +
+      const bdtBalance = Math.round(currentBalance * BDT_PER_USD);
+      const messageText =
+        `<b>[AEGIS QUANT TERMINAL — ${activeWorkspace}]</b>\n` +
+        `🟢 <b>Telegram Test Notification Verified!</b>\n` +
+        `💰 <b>Current Balance (${activeWorkspace}):</b> $${currentBalance.toFixed(2)} USD (৳${bdtBalance.toLocaleString('en-US')} BDT)\n` +
         `📊 <b>Active Positions:</b> ${stats.openTradesCount}\n` +
         `⚡ <b>Bot Status:</b> ${botStatus}\n` +
-        `🔑 <b>API Status:</b> Armed & Connected`;
+        `🔑 <b>Binance Keys:</b> ${binanceConfig.api_key.trim() ? 'Linked ✓' : 'Not Set'}`;
 
-      console.log('[Telegram Test] Dispatching payload to Bot API:', { chatId: cfg.chat_id, tokenMasked: cfg.bot_token ? cfg.bot_token.slice(0, 6) + '...' : 'none' });
       const res = await dispatchTelegramAlert(cfg, messageText);
-      console.error('[Telegram API Response Payload]', { ok: res.ok, detail: res.detail, timestamp: new Date().toISOString() });
+      if (res.ok) {
+        console.info('[useTradingTerminal] testTelegramConnection succeeded:', res);
+      } else {
+        console.error('[useTradingTerminal] testTelegramConnection failed:', res);
+      }
 
       appendLog(activeWorkspace, {
         id: createUniqueId('LOG'),
         level: res.ok ? 'INFO' : 'ERROR',
         pair: null,
         message: res.ok
-          ? `Telegram test alert delivered successfully! Balance: $${currentBalance.toFixed(2)} USDT`
+          ? `Telegram test alert delivered! Balance: $${currentBalance.toFixed(2)} (৳${bdtBalance.toLocaleString('en-US')})`
           : `Telegram test failed: ${res.detail}`,
         created_at: new Date().toISOString(),
       });
       return res;
     },
-    [activeWorkspace, appendLog, stats.balance, stats.openTradesCount, botStatus]
+    [activeWorkspace, appendLog, binanceConfig.api_key, botStatus, stats.balance, stats.openTradesCount]
   );
 
-  const verifyBinanceCredentials = useCallback(
-    async (cfg: BinanceConfig) => {
-      const validFormat =
-        cfg.api_key.trim().length >= 16 && cfg.api_secret.trim().length >= 16;
-      const nextCfg = { ...cfg, verified: validFormat };
-      setBinanceConfig(nextCfg);
+  const sendTelegramBalanceSnapshot = useCallback(
+    async (cfgOverride?: TelegramConfig, bnCfgOverride?: BinanceConfig) => {
+      const activeTg = cfgOverride ?? telegramConfig;
+      const activeBn = bnCfgOverride ?? binanceConfig;
+      setTelegramConfig(activeTg);
+      if (bnCfgOverride) {
+        setBinanceConfig(bnCfgOverride);
+      }
 
-      const mockLiveBalance = 24.50; // Live spot USDT balance initialized on key verification
-      setLiveSettings((prev) => ({
-        ...prev,
-        balance_usdt: mockLiveBalance,
-        binance_api_key: cfg.api_key.trim(),
-        binance_api_secret: cfg.api_secret.trim(),
-        use_testnet: cfg.use_testnet,
-      }));
+      console.info('[useTradingTerminal] sendTelegramBalanceSnapshot initiated:', {
+        workspace: activeWorkspace,
+        hasTgToken: Boolean(activeTg.bot_token.trim()),
+        chatId: activeTg.chat_id.trim(),
+        hasBinanceKeys: Boolean(activeBn.api_key.trim() && activeBn.api_secret.trim()),
+      });
 
-      if (supabase && !isDemoMode && validFormat) {
-        try {
-          await supabase
-            .from('settings')
-            .update({
-              balance_usdt: mockLiveBalance,
-              binance_api_key: cfg.api_key.trim(),
-              binance_api_secret: cfg.api_secret.trim(),
-              use_testnet: cfg.use_testnet,
-            })
-            .eq('id', settings.id);
-        } catch {
-          // ignore offline update error
+      let liveUsd = stats.balance;
+      let usdtFree = binanceAccount?.usdtFree ?? 0;
+      let spotUsd = binanceAccount?.spotUsd ?? 0;
+      let fundingUsd = binanceAccount?.fundingUsd ?? 0;
+      let earnUsd = binanceAccount?.earnUsd ?? 0;
+      let assetsLines = '';
+      let syncNote = '';
+
+      if (activeBn.api_key.trim() && activeBn.api_secret.trim()) {
+        const synced = await refreshBinanceBalance(activeBn);
+        if (synced.ok) {
+          liveUsd = synced.totalPortfolioUsd > 0 ? synced.totalPortfolioUsd : synced.totalUsdt;
+          usdtFree = synced.usdtFree;
+          spotUsd = synced.spotUsd ?? 0;
+          fundingUsd = synced.fundingUsd ?? 0;
+          earnUsd = synced.earnUsd ?? 0;
+          if (synced.assets.length > 0) {
+            assetsLines =
+              '\n🪙 <b>Binance Holdings:</b>\n' +
+              synced.assets
+                .slice(0, 6)
+                .map((a) => `• ${a.asset}: ${a.total} ($${a.usdValue.toFixed(2)})`)
+                .join('\n');
+          }
+          syncNote = `\n🏦 <b>Wallets:</b> Spot $${spotUsd.toFixed(2)} · Funding $${fundingUsd.toFixed(2)} · Earn $${earnUsd.toFixed(2)}`;
+        } else {
+          syncNote = `\n⚠️ <b>Binance Sync Note:</b> ${synced.errorDetail || 'Unable to sync'}`;
         }
       }
 
-      appendLog('LIVE', {
+      const bdtTotal = Math.round(liveUsd * BDT_PER_USD);
+      const payloadText =
+        `<b>[AEGIS REAL MONEY SNAPSHOT — ${activeWorkspace}]</b>\n` +
+        `💵 <b>Total Real Balance:</b> $${liveUsd.toFixed(2)} USD\n` +
+        `🇧🇩 <b>Bangladeshi Taka:</b> ৳${bdtTotal.toLocaleString('en-US')} BDT\n` +
+        `🟢 <b>Available USDT:</b> $${usdtFree.toFixed(2)} USDT\n` +
+        `📈 <b>Today Profit:</b> ${stats.todayProfit >= 0 ? '+' : ''}$${stats.todayProfit.toFixed(2)}\n` +
+        `📊 <b>Open Trades:</b> ${stats.openTradesCount} · <b>Bot:</b> ${botStatus}` +
+        syncNote +
+        assetsLines;
+
+      const res = await dispatchTelegramAlert(activeTg, payloadText);
+      if (res.ok) {
+        console.info('[useTradingTerminal] sendTelegramBalanceSnapshot succeeded:', res);
+      } else {
+        console.error('[useTradingTerminal] sendTelegramBalanceSnapshot failed:', res);
+      }
+
+      appendLog(activeWorkspace, {
         id: createUniqueId('LOG'),
-        level: validFormat ? 'INFO' : 'ERROR',
+        level: res.ok ? 'INFO' : 'ERROR',
         pair: null,
-        message: validFormat
-          ? `Binance Spot API credentials verified and armed for ${
-              cfg.use_testnet ? 'TESTNET' : 'MAINNET'
-            }. Live Spot Balance: $${mockLiveBalance.toFixed(2)} USDT.`
-          : 'Binance verification failed: API Key and Secret must be at least 16 characters.',
+        message: res.ok
+          ? `Sent Real Balance Snapshot to Telegram ($${liveUsd.toFixed(2)} / ৳${bdtTotal.toLocaleString('en-US')})`
+          : `Telegram balance snapshot failed: ${res.detail}`,
         created_at: new Date().toISOString(),
       });
+      return res;
+    },
+    [
+      activeWorkspace,
+      appendLog,
+      binanceAccount?.earnUsd,
+      binanceAccount?.fundingUsd,
+      binanceAccount?.spotUsd,
+      binanceAccount?.usdtFree,
+      binanceConfig,
+      botStatus,
+      refreshBinanceBalance,
+      stats.balance,
+      stats.openTradesCount,
+      stats.todayProfit,
+      telegramConfig,
+    ]
+  );
 
+  const sendSignalToTelegram = useCallback(
+    async (title: string, detail: string, options?: { force?: boolean }) => {
+      const token = telegramConfig.bot_token.trim();
+      const chatId = telegramConfig.chat_id.trim();
+      console.info('[useTradingTerminal] sendSignalToTelegram invoked:', {
+        workspace: activeWorkspace,
+        telegramEnabled: settings.telegram_enabled,
+        force: Boolean(options?.force),
+        hasToken: Boolean(token),
+        chatId,
+        title,
+      });
+
+      if (!settings.telegram_enabled && !options?.force) {
+        console.warn('[useTradingTerminal] sendSignalToTelegram skipped: telegram_enabled is false in settings');
+        return { ok: false, detail: 'Telegram signal switch is OFF' };
+      }
+
+      if (!token || !chatId) {
+        console.error('[useTradingTerminal] sendSignalToTelegram failed: missing credentials', {
+          hasToken: Boolean(token),
+          hasChatId: Boolean(chatId),
+        });
+        return { ok: false, detail: 'Missing Telegram Bot Token or Chat ID' };
+      }
+
+      const bdtVal = Math.round(stats.balance * BDT_PER_USD);
+      const balanceLine =
+        telegramConfig.notify_balance !== false
+          ? `\n💰 <b>Balance:</b> $${stats.balance.toFixed(2)} (৳${bdtVal.toLocaleString('en-US')})`
+          : '';
+      const payloadText = `<b>[AEGIS SIGNAL — ${activeWorkspace}]</b>\n${title}\n${detail}${balanceLine}`;
+
+      const res = await dispatchTelegramAlert(telegramConfig, payloadText);
+      if (res.ok) {
+        console.info('[useTradingTerminal] sendSignalToTelegram succeeded:', res);
+      } else {
+        console.error('[useTradingTerminal] sendSignalToTelegram delivery error:', res);
+        appendLog(activeWorkspace, {
+          id: createUniqueId('LOG'),
+          level: 'ERROR',
+          pair: null,
+          message: `Telegram signal delivery failed: ${res.detail}`,
+          created_at: new Date().toISOString(),
+        });
+      }
+      return res;
+    },
+    [activeWorkspace, appendLog, settings.telegram_enabled, stats.balance, telegramConfig]
+  );
+
+  const togglePairAlert = useCallback((symbol: string) => {
+    setAlertEnabledPairs((prev) => {
+      const exists = prev.includes(symbol);
+      audioSynth.playToggle(!exists);
+      return exists ? prev.filter((s) => s !== symbol) : [...prev, symbol];
+    });
+  }, []);
+
+  const verifyBinanceCredentials = useCallback(
+    async (cfg: BinanceConfig) => {
+      const trimmedCfg: BinanceConfig = {
+        ...cfg,
+        api_key: cfg.api_key.trim(),
+        api_secret: cfg.api_secret.trim(),
+      };
+      if (trimmedCfg.api_key.length < 16 || trimmedCfg.api_secret.length < 16) {
+        setBinanceConfig({ ...trimmedCfg, verified: false });
+        appendLog('LIVE', {
+          id: createUniqueId('LOG'),
+          level: 'ERROR',
+          pair: null,
+          message: 'Binance verification failed: API Key and Secret must be at least 16 characters.',
+          created_at: new Date().toISOString(),
+        });
+        return {
+          ok: false,
+          detail: 'Invalid key or secret length (min 16 chars)',
+        };
+      }
+
+      setBinanceConfig(trimmedCfg);
+      const result = await refreshBinanceBalance(trimmedCfg);
+      if (result.ok) {
+        const realUsd = result.totalPortfolioUsd > 0 ? result.totalPortfolioUsd : result.totalUsdt;
+        const bdtVal = Math.round(realUsd * BDT_PER_USD);
+        appendLog('LIVE', {
+          id: createUniqueId('LOG'),
+          level: 'INFO',
+          pair: null,
+          message: `Binance API verified (${
+            trimmedCfg.use_testnet ? 'TESTNET' : 'MAINNET'
+          })! Real Balance: $${realUsd.toFixed(2)} USD (৳${bdtVal.toLocaleString('en-US')} BDT) · Free USDT: $${result.usdtFree.toFixed(2)}`,
+          created_at: new Date().toISOString(),
+        });
+        return {
+          ok: true,
+          detail: `Connected ✓ Real Balance: $${realUsd.toFixed(2)} (৳${bdtVal.toLocaleString('en-US')}) · USDT Free: $${result.usdtFree.toFixed(2)}`,
+        };
+      }
+
+      const ipNote = result.serverIp ? ` (Server IP: ${result.serverIp})` : '';
+      appendLog('LIVE', {
+        id: createUniqueId('LOG'),
+        level: 'ERROR',
+        pair: null,
+        message: `Binance balance fetch error: ${result.errorDetail}${ipNote}`,
+        created_at: new Date().toISOString(),
+      });
       return {
-        ok: validFormat,
-        detail: validFormat
-          ? `Connected! Live Spot Balance: $${mockLiveBalance.toFixed(2)} USDT`
-          : 'Invalid key or secret length (min 16 chars)',
+        ok: false,
+        detail: `${result.errorDetail || 'Verification failed'}${ipNote}`,
       };
     },
-    [appendLog, isDemoMode, settings.id]
+    [appendLog, refreshBinanceBalance]
   );
 
   const signIn = useCallback(async (email: string, password: string) => {
@@ -1741,6 +2156,14 @@ export function useTradingTerminal() {
     setUserEmail('demo-operator@aegis.local');
   }, []);
 
+  const hasBinanceKeys = Boolean(
+    binanceConfig.api_key.trim().length >= 16 && binanceConfig.api_secret.trim().length >= 16
+  );
+
+  const hasTelegramKeys = Boolean(
+    telegramConfig.bot_token.trim().length >= 10 && telegramConfig.chat_id.trim().length > 0
+  );
+
   return {
     isSupabaseConfigured,
     isDemoMode,
@@ -1763,8 +2186,15 @@ export function useTradingTerminal() {
     savingSettings,
     telegramConfig,
     setTelegramConfig,
+    hasTelegramKeys,
     binanceConfig,
     setBinanceConfig,
+    binanceAccount,
+    syncingBalance,
+    hasBinanceKeys,
+    alertEnabledPairs,
+    togglePairAlert,
+    refreshBinanceBalance,
     getEquitySeries,
     toggleBot,
     updateSettings,
@@ -1773,6 +2203,8 @@ export function useTradingTerminal() {
     placeQuickTrade,
     resetVirtualBalance,
     testTelegramConnection,
+    sendTelegramBalanceSnapshot,
+    sendSignalToTelegram,
     verifyBinanceCredentials,
     signIn,
     signUp,

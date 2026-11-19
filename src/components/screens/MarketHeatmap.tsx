@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
-import { ArrowDownRight, ArrowUpRight, X } from 'lucide-react';
+import { ArrowDownRight, ArrowUpRight, Bell, BellOff, X } from 'lucide-react';
 import { audioSynth } from '../../lib/audioSynth';
 import { CandleStyle, PairMarketData, Trade } from '../../types/trading';
 import { CandlestickChart } from '../charts/CandlestickChart';
@@ -13,12 +13,14 @@ interface MarketHeatmapProps {
   t: Record<string, string>;
   pairs: PairMarketData[];
   enabledPairs: string[];
+  alertEnabledPairs: string[];
   openTrades: Trade[];
   candleStyle: CandleStyle;
   binanceFeedLive?: boolean;
   defaultLot?: number;
   onChangeCandleStyle: (style: CandleStyle) => void;
   onTogglePair: (symbol: string) => Promise<void>;
+  onTogglePairAlert: (symbol: string) => void;
   onQuickTrade: (pairSymbol: string, side: 'BUY' | 'SELL', amountUsdt: number) => Promise<void>;
 }
 
@@ -26,12 +28,14 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
   t,
   pairs,
   enabledPairs,
+  alertEnabledPairs,
   openTrades,
   candleStyle,
   binanceFeedLive = false,
   defaultLot = 10,
   onChangeCandleStyle,
   onTogglePair,
+  onTogglePairAlert,
   onQuickTrade,
 }) => {
   const reducedMotion = useReducedMotion();
@@ -73,9 +77,15 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
         title={t.marketHeatmapTitle}
         subtitle={t.marketHeatmapSub}
         rightSlot={
-          <span className="font-mono-tech text-xs text-cyan-300">
-            {enabledPairs.length}/10 ACTIVE
-          </span>
+          <div className="flex items-center gap-3 font-mono-tech text-xs">
+            <span className="flex items-center gap-1 text-amber-300">
+              <Bell className="h-3.5 w-3.5" />
+              {t.heatmapAlertsActive || 'ALERTS'}: {alertEnabledPairs.length}/{pairs.length}
+            </span>
+            <span className="text-cyan-300">
+              {enabledPairs.length}/{pairs.length} ACTIVE
+            </span>
+          </div>
         }
       >
         <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 md:grid-cols-5">
@@ -83,19 +93,28 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
             const isPos = pair.change24h >= 0;
             const isSelected = pair.symbol === selectedPair?.symbol;
             const isEnabled = enabledPairs.includes(pair.symbol);
+            const isAlertOn = alertEnabledPairs.includes(pair.symbol);
             const hasOpen = openTrades.some((tr) => tr.pair === pair.symbol && tr.status === 'OPEN');
             const lastClosedForPair = openTrades.find(
               (tr) => tr.pair === pair.symbol && tr.status === 'CLOSED'
             );
 
             return (
-              <motion.button
+              <motion.div
                 key={pair.symbol}
-                type="button"
+                role="button"
+                tabIndex={0}
                 onMouseEnter={() => audioSynth.playHover()}
                 onClick={() => {
                   audioSynth.playClick();
                   setSelectedSymbol(pair.symbol);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    audioSynth.playClick();
+                    setSelectedSymbol(pair.symbol);
+                  }
                 }}
                 initial={reducedMotion ? false : { opacity: 0, scale: 0.96 }}
                 animate={{ opacity: 1, scale: 1 }}
@@ -103,7 +122,7 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                 whileHover={reducedMotion ? undefined : { y: -3, scale: 1.02 }}
                 whileTap={reducedMotion ? undefined : { scale: 0.98 }}
                 style={getTileStyle(pair.change24h, isSelected)}
-                className={`relative flex min-h-[108px] cursor-pointer flex-col justify-between rounded-xl border p-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-cyan-400 ${
+                className={`relative flex min-h-[124px] cursor-pointer flex-col justify-between rounded-xl border p-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-cyan-400 ${
                   !reducedMotion ? 'animate-tile-breathe' : ''
                 }`}
               >
@@ -149,6 +168,47 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                       <span className="text-[10px] font-semibold text-amber-300">POS</span>
                     )}
                   </div>
+
+                  {/* Individual Price Alert Toggle Switch */}
+                  <div
+                    className="mt-2 flex items-center justify-between gap-1.5 border-t border-white/10 pt-1.5"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <span className="flex items-center gap-1 font-mono-tech text-[9px] text-slate-300">
+                      {isAlertOn ? (
+                        <Bell className="h-3 w-3 text-amber-300" />
+                      ) : (
+                        <BellOff className="h-3 w-3 text-slate-500" />
+                      )}
+                      <span className={isAlertOn ? 'text-amber-200' : 'text-slate-500'}>
+                        {isAlertOn ? 'ALERT' : 'MUTED'}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={isAlertOn}
+                      aria-label={`${pair.symbol} ${isAlertOn ? t.alertToggleOn || 'Price Alert ON' : t.alertToggleOff || 'Price Alert OFF'}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onTogglePairAlert(pair.symbol);
+                      }}
+                      className={`relative inline-flex h-4 w-8 shrink-0 cursor-pointer items-center rounded-full border transition-colors ${
+                        isAlertOn
+                          ? 'border-amber-400/70 bg-amber-500/30'
+                          : 'border-slate-700 bg-slate-900/80'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-2.5 w-2.5 rounded-full transition-transform ${
+                          isAlertOn
+                            ? 'translate-x-4 bg-amber-300 shadow-[0_0_6px_rgba(251,191,36,0.9)]'
+                            : 'translate-x-0.5 bg-slate-500'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
                   {lastClosedForPair && (
                     <div className="mt-1.5 flex items-center justify-between gap-1.5 border-t border-white/10 pt-1 font-mono-tech text-[9px]">
                       <svg viewBox="0 0 42 12" className="h-2.5 w-9 shrink-0 overflow-visible">
@@ -189,7 +249,7 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                     </div>
                   )}
                 </div>
-              </motion.button>
+              </motion.div>
             );
           })}
         </div>

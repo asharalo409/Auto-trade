@@ -4,8 +4,10 @@ import {
   Clock,
   Copy,
   Database,
+  DollarSign,
   Eye,
   EyeOff,
+  Image as ImageIcon,
   KeyRound,
   Layers,
   Moon,
@@ -17,10 +19,12 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import { SUPABASE_SQL_SCHEMA, SUPPORTED_PAIRS } from '../../data/demoData';
+import { BDT_PER_USD, SUPABASE_SQL_SCHEMA, SUPPORTED_PAIRS } from '../../data/demoData';
 import { audioSynth } from '../../lib/audioSynth';
 import { getTimeBasedTheme, TERMINAL_THEMES } from '../../lib/themes';
 import {
+  BackgroundPresetId,
+  BinanceAccountSummary,
   BinanceConfig,
   BotSettings,
   CoreVisualMode,
@@ -39,10 +43,18 @@ interface SettingsPanelProps {
   saving: boolean;
   telegramConfig: TelegramConfig;
   binanceConfig: BinanceConfig;
+  binanceAccount: BinanceAccountSummary | null;
+  syncingBalance: boolean;
+  bgPredator: BackgroundPresetId;
+  onChangeBgPredator: (bg: BackgroundPresetId) => void;
   onSave: (patch: Partial<BotSettings>) => Promise<void>;
   onRequestWorkspaceSwitch: (mode: TradingMode) => void;
   onSaveTelegram: (cfg: TelegramConfig) => void;
   onTestTelegram: (cfg: TelegramConfig) => Promise<{ ok: boolean; detail: string }>;
+  onSendBalanceTelegram: (
+    cfg: TelegramConfig,
+    bnCfg?: BinanceConfig
+  ) => Promise<{ ok: boolean; detail: string }>;
   onSaveBinance: (cfg: BinanceConfig) => void;
   onVerifyBinance: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
 }
@@ -56,10 +68,15 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   saving,
   telegramConfig,
   binanceConfig,
+  binanceAccount,
+  syncingBalance,
+  bgPredator,
+  onChangeBgPredator,
   onSave,
   onRequestWorkspaceSwitch,
   onSaveTelegram,
   onTestTelegram,
+  onSendBalanceTelegram,
   onSaveBinance,
   onVerifyBinance,
 }) => {
@@ -68,9 +85,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [bnDraft, setBnDraft] = useState<BinanceConfig>(binanceConfig);
   const [showSecrets, setShowSecrets] = useState(false);
   const [savedToast, setSavedToast] = useState(false);
+  const [keysSavedToast, setKeysSavedToast] = useState(false);
   const [tgFeedback, setTgFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [bnFeedback, setBnFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [testingTg, setTestingTg] = useState(false);
+  const [sendingBalTg, setSendingBalTg] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
   const [showGuideSql, setShowGuideSql] = useState(false);
 
@@ -129,12 +148,44 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const handleTestTg = async () => {
     setTestingTg(true);
     setTgFeedback(null);
+    onSaveTelegram(tgDraft);
     const res = await onTestTelegram(tgDraft);
     setTestingTg(false);
     setTgFeedback({ ok: res.ok, text: res.detail });
   };
 
+  const handleSendBalTg = async () => {
+    setSendingBalTg(true);
+    setTgFeedback(null);
+    onSaveTelegram(tgDraft);
+    onSaveBinance(bnDraft);
+    const res = await onSendBalanceTelegram(tgDraft, bnDraft);
+    setSendingBalTg(false);
+    setTgFeedback({ ok: res.ok, text: res.detail });
+  };
+
+  const handleSendBalFromBinancePanel = async () => {
+    audioSynth.playClick();
+    setSendingBalTg(true);
+    setBnFeedback(null);
+    onSaveTelegram(tgDraft);
+    onSaveBinance(bnDraft);
+    const res = await onSendBalanceTelegram(tgDraft, bnDraft);
+    setSendingBalTg(false);
+    setBnFeedback({ ok: res.ok, text: res.detail });
+  };
+
+  const handleSaveGatewayKeys = async () => {
+    audioSynth.playClick();
+    onSaveTelegram(tgDraft);
+    onSaveBinance(bnDraft);
+    await onSave({ telegram_enabled: draft.telegram_enabled });
+    setKeysSavedToast(true);
+    window.setTimeout(() => setKeysSavedToast(false), 2200);
+  };
+
   const handleVerifyBn = async () => {
+    onSaveBinance(bnDraft);
     const res = await onVerifyBinance(bnDraft);
     setBnFeedback({ ok: res.ok, text: res.detail });
   };
@@ -188,32 +239,47 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
           {/* Global Sound + Auto Day/Night Theme */}
           <div className="space-y-3 lg:col-span-4">
-            <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-800/80 bg-[#05070d] p-3.5">
-              <div className="flex items-start gap-2.5">
-                {draft.sound_enabled ? (
-                  <Volume2 className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
-                ) : (
-                  <VolumeX className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
-                )}
-                <div>
-                  <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-slate-100 uppercase">
-                    <span>{t.soundToggleTitle}</span>
-                    <InfoTip text={t.helpSound} label={t.soundToggleTitle} />
+            <div className="rounded-xl border border-slate-800/80 bg-[#05070d] p-3.5 space-y-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  {draft.sound_enabled ? (
+                    <Volume2 className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
+                  ) : (
+                    <VolumeX className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
+                  )}
+                  <div>
+                    <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-slate-100 uppercase">
+                      <span>{t.soundToggleTitle}</span>
+                      <InfoTip text={t.helpSound} label={t.soundToggleTitle} />
+                    </div>
+                    <p className="mt-0.5 text-[11px] text-slate-400">{t.soundToggleHint}</p>
                   </div>
-                  <p className="mt-0.5 text-[11px] text-slate-400">{t.soundToggleHint}</p>
                 </div>
+                <SciFiSwitch
+                  checked={draft.sound_enabled}
+                  onChange={(v) => {
+                    audioSynth.setEnabled(v);
+                    if (v) audioSynth.playToggle(true);
+                    setDraft((p) => ({ ...p, sound_enabled: v }));
+                    onSave({ sound_enabled: v });
+                  }}
+                  label={t.soundToggleTitle}
+                  accent="cyan"
+                />
               </div>
-              <SciFiSwitch
-                checked={draft.sound_enabled}
-                onChange={(v) => {
-                  audioSynth.setEnabled(v);
-                  if (v) audioSynth.playToggle(true);
-                  setDraft((p) => ({ ...p, sound_enabled: v }));
-                  onSave({ sound_enabled: v });
-                }}
-                label={t.soundToggleTitle}
-                accent="cyan"
-              />
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => {
+                    audioSynth.setEnabled(true);
+                    audioSynth.playTradeChime(true);
+                    audioSynth.setEnabled(draft.sound_enabled);
+                  }}
+                  className="cursor-pointer rounded border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1 font-mono-tech text-[10px] font-semibold text-cyan-200 hover:bg-cyan-500/20"
+                >
+                  ♪ {t.testSoundBtn}
+                </button>
+              </div>
             </div>
 
             {/* Auto Day/Night Time-Based High-Contrast Theme Switch */}
@@ -330,6 +396,75 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 </button>
               ))}
             </div>
+          </div>
+        </div>
+
+        {/* Predator Red-Eye Background Selector */}
+        <div className="mt-4 rounded-xl border border-rose-500/30 bg-[#05070d]/85 p-4">
+          <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-rose-300 uppercase">
+              <ImageIcon className="h-4 w-4 text-rose-400" />
+              <span>{t.bgPredatorTitle}</span>
+            </div>
+            <span className="font-mono-tech text-[11px] text-slate-400">{t.bgPredatorHint}</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+            {(
+              [
+                {
+                  id: 'tiger' as BackgroundPresetId,
+                  label: t.bgTiger,
+                  thumb: '/src/assets/images/predator_tiger_red_eyes_1795118033481.jpg',
+                },
+                {
+                  id: 'lion' as BackgroundPresetId,
+                  label: t.bgLion,
+                  thumb: '/src/assets/images/predator_lion_red_eyes_1795118034764.jpg',
+                },
+                {
+                  id: 'eagle' as BackgroundPresetId,
+                  label: t.bgEagle,
+                  thumb: '/src/assets/images/predator_eagle_red_eyes_1795118034989.jpg',
+                },
+                {
+                  id: 'none' as BackgroundPresetId,
+                  label: t.bgNone,
+                  thumb: null,
+                },
+              ]
+            ).map((bg) => {
+              const active = bgPredator === bg.id;
+              return (
+                <button
+                  key={bg.id}
+                  type="button"
+                  onClick={() => {
+                    audioSynth.playClick();
+                    onChangeBgPredator(bg.id);
+                  }}
+                  className={`group relative flex min-h-[68px] cursor-pointer items-end overflow-hidden rounded-lg border p-2 text-left transition-all ${
+                    active
+                      ? 'border-rose-400 shadow-[0_0_16px_rgba(244,63,94,0.4)]'
+                      : 'border-slate-800 hover:border-slate-600'
+                  }`}
+                >
+                  {bg.thumb ? (
+                    <img
+                      src={bg.thumb}
+                      alt={bg.label}
+                      referrerPolicy="no-referrer"
+                      className="absolute inset-0 h-full w-full object-cover opacity-70 transition-transform duration-300 group-hover:scale-105"
+                    />
+                  ) : (
+                    <div className="absolute inset-0 bg-[#05060a]" />
+                  )}
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent" />
+                  <span className="relative z-10 font-mono-tech text-[10px] font-bold text-slate-100">
+                    {bg.label}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
       </TerminalPanel>
@@ -687,19 +822,30 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         accent="amber"
         title={t.binanceSectionTitle}
         rightSlot={
-          <button
-            type="button"
-            onClick={() => setShowSecrets((v) => !v)}
-            className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded border border-slate-700 px-2.5 py-1 font-mono-tech text-[11px] text-slate-300 hover:border-cyan-400/60"
-          >
-            {showSecrets ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-            <span>{showSecrets ? 'HIDE' : 'SHOW'}</span>
-          </button>
+          <div className="flex items-center gap-2">
+            <NeonButton
+              type="button"
+              variant={keysSavedToast ? 'emerald' : 'cyan'}
+              onClick={handleSaveGatewayKeys}
+              className="min-h-[34px] px-2.5 py-1 text-[11px]"
+            >
+              {keysSavedToast ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
+              <span>{keysSavedToast ? t.keysSavedMsg : t.saveKeysBtn}</span>
+            </NeonButton>
+            <button
+              type="button"
+              onClick={() => setShowSecrets((v) => !v)}
+              className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded border border-slate-700 px-2.5 py-1 font-mono-tech text-[11px] text-slate-300 hover:border-cyan-400/60"
+            >
+              {showSecrets ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              <span>{showSecrets ? 'HIDE' : 'SHOW'}</span>
+            </button>
+          </div>
         }
       >
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
           {/* Telegram Bot Integration */}
-          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d] p-4">
+          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d]/90 p-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-cyan-300">
                 <Send className="h-4 w-4" />
@@ -708,7 +854,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               </div>
               <SciFiSwitch
                 checked={draft.telegram_enabled}
-                onChange={(v) => setDraft((p) => ({ ...p, telegram_enabled: v }))}
+                onChange={(v) => {
+                  setDraft((p) => ({ ...p, telegram_enabled: v }));
+                  void onSave({ telegram_enabled: v });
+                }}
                 label={t.telegramAlerts}
                 accent="cyan"
               />
@@ -721,7 +870,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <input
                 type={showSecrets ? 'text' : 'password'}
                 value={tgDraft.bot_token}
-                onChange={(e) => setTgDraft((p) => ({ ...p, bot_token: e.target.value }))}
+                onChange={(e) => {
+                  const next = { ...tgDraft, bot_token: e.target.value };
+                  setTgDraft(next);
+                  onSaveTelegram(next);
+                }}
                 placeholder="123456789:AAH..."
                 className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
               />
@@ -734,13 +887,40 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <input
                 type="text"
                 value={tgDraft.chat_id}
-                onChange={(e) => setTgDraft((p) => ({ ...p, chat_id: e.target.value }))}
+                onChange={(e) => {
+                  const next = { ...tgDraft, chat_id: e.target.value };
+                  setTgDraft(next);
+                  onSaveTelegram(next);
+                }}
                 placeholder="-1001234567890"
                 className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
               />
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+            {/* Telegram Real Money / Balance in Notification Toggle */}
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-emerald-500/35 bg-emerald-500/8 px-3 py-2.5">
+              <div className="flex items-start gap-2">
+                <DollarSign className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+                <div>
+                  <div className="font-mono-tech text-[11px] font-bold text-emerald-300">
+                    {t.tgNotifyBalanceToggle}
+                  </div>
+                  <p className="text-[10px] text-slate-400">{t.tgNotifyBalanceHint}</p>
+                </div>
+              </div>
+              <SciFiSwitch
+                checked={tgDraft.notify_balance !== false}
+                onChange={(v) => {
+                  const next = { ...tgDraft, notify_balance: v };
+                  setTgDraft(next);
+                  onSaveTelegram(next);
+                }}
+                label={t.tgNotifyBalanceToggle}
+                accent="emerald"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 pt-1">
               <NeonButton
                 type="button"
                 variant="cyan"
@@ -752,20 +932,33 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 {testingTg ? 'DISPATCHING...' : t.testTelegramBtn}
               </NeonButton>
 
-              {tgFeedback && (
-                <span
-                  className={`font-mono-tech text-[11px] ${
-                    tgFeedback.ok ? 'text-emerald-400' : 'text-amber-300'
-                  }`}
-                >
-                  {tgFeedback.text}
-                </span>
-              )}
+              <NeonButton
+                type="button"
+                variant="emerald"
+                disabled={sendingBalTg}
+                onClick={handleSendBalTg}
+                className="min-h-[36px] px-3 py-1 text-[11px]"
+              >
+                <DollarSign className="h-3.5 w-3.5" />
+                {sendingBalTg ? 'SENDING...' : t.tgSendBalanceNowBtn}
+              </NeonButton>
             </div>
+
+            {tgFeedback && (
+              <div
+                className={`rounded-lg border px-2.5 py-1.5 font-mono-tech text-[11px] ${
+                  tgFeedback.ok
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                    : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                }`}
+              >
+                {tgFeedback.text}
+              </div>
+            )}
           </div>
 
           {/* Binance API Key & Secret */}
-          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d] p-4">
+          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d]/90 p-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-amber-300">
                 <KeyRound className="h-4 w-4" />
@@ -774,7 +967,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               </div>
               <button
                 type="button"
-                onClick={() => setBnDraft((p) => ({ ...p, use_testnet: !p.use_testnet }))}
+                onClick={() => {
+                  const next = { ...bnDraft, use_testnet: !bnDraft.use_testnet };
+                  setBnDraft(next);
+                  onSaveBinance(next);
+                }}
                 className={`cursor-pointer rounded border px-2 py-0.5 font-mono-tech text-[10px] font-semibold uppercase ${
                   bnDraft.use_testnet
                     ? 'border-amber-400/60 bg-amber-500/15 text-amber-300'
@@ -792,9 +989,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <input
                 type={showSecrets ? 'text' : 'password'}
                 value={bnDraft.api_key}
-                onChange={(e) =>
-                  setBnDraft((p) => ({ ...p, api_key: e.target.value, verified: false }))
-                }
+                onChange={(e) => {
+                  const next = { ...bnDraft, api_key: e.target.value, verified: false };
+                  setBnDraft(next);
+                  onSaveBinance(next);
+                }}
                 placeholder="Binance Spot API Key..."
                 className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
               />
@@ -807,34 +1006,82 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <input
                 type={showSecrets ? 'text' : 'password'}
                 value={bnDraft.api_secret}
-                onChange={(e) =>
-                  setBnDraft((p) => ({ ...p, api_secret: e.target.value, verified: false }))
-                }
+                onChange={(e) => {
+                  const next = { ...bnDraft, api_secret: e.target.value, verified: false };
+                  setBnDraft(next);
+                  onSaveBinance(next);
+                }}
                 placeholder="Binance Spot API Secret..."
                 className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
               />
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-              <NeonButton
-                type="button"
-                variant="amber"
-                onClick={handleVerifyBn}
-                className="min-h-[36px] px-3 py-1 text-[11px]"
-              >
-                {t.verifyBinanceBtn}
-              </NeonButton>
-
-              {bnFeedback && (
-                <span
-                  className={`font-mono-tech text-[11px] ${
-                    bnFeedback.ok ? 'text-emerald-400' : 'text-rose-400'
-                  }`}
+              <div className="flex flex-wrap items-center gap-2">
+                <NeonButton
+                  type="button"
+                  variant="amber"
+                  disabled={syncingBalance}
+                  onClick={handleVerifyBn}
+                  className="min-h-[36px] px-3 py-1 text-[11px]"
                 >
-                  {bnFeedback.text}
+                  {syncingBalance ? 'SYNCING BINANCE...' : t.verifyBinanceBtn}
+                </NeonButton>
+
+                <NeonButton
+                  type="button"
+                  variant="emerald"
+                  disabled={sendingBalTg || syncingBalance}
+                  onClick={handleSendBalFromBinancePanel}
+                  className="min-h-[36px] px-3 py-1 text-[11px]"
+                >
+                  <Send className="h-3.5 w-3.5" />
+                  <span>{sendingBalTg ? 'SENDING...' : t.viewRealMoneyTelegramBtn}</span>
+                </NeonButton>
+              </div>
+
+              {binanceAccount?.connected && (
+                <span className="font-mono-tech text-[11px] font-bold text-emerald-300">
+                  ${binanceAccount.totalPortfolioUsd.toFixed(2)} USD · ৳
+                  {Math.round(binanceAccount.totalPortfolioUsd * BDT_PER_USD).toLocaleString('en-US')}
                 </span>
               )}
             </div>
+
+            {bnFeedback && (
+              <div
+                className={`rounded-lg border px-2.5 py-1.5 font-mono-tech text-[11px] ${
+                  bnFeedback.ok
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                    : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                }`}
+              >
+                {bnFeedback.text}
+              </div>
+            )}
+
+            {binanceAccount?.connected && (
+              <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-2.5 font-mono-tech text-[10px]">
+                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 text-emerald-300 font-bold">
+                  <span>REAL BINANCE HOLDINGS</span>
+                  <span>USDT FREE: ${binanceAccount.usdtFree.toFixed(2)}</span>
+                </div>
+                {binanceAccount.assets.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {binanceAccount.assets.slice(0, 6).map((a) => (
+                      <span
+                        key={a.asset}
+                        className="rounded border border-slate-700/80 bg-[#090d16] px-2 py-0.5 text-slate-200"
+                      >
+                        {a.asset}: {a.total} (${a.usdValue.toFixed(2)})
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-amber-300">{t.liveBalanceEmptyZero}</div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </TerminalPanel>

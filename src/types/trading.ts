@@ -48,12 +48,15 @@ export interface CandlePoint {
   vwap?: number;
 }
 
+export type BackgroundPresetId = 'tiger' | 'lion' | 'eagle' | 'none';
+
 export interface TelegramConfig {
   bot_token: string;
   chat_id: string;
   notify_trades: boolean;
   notify_tp_sl: boolean;
   notify_status: boolean;
+  notify_balance?: boolean;
 }
 
 export interface BinanceConfig {
@@ -61,6 +64,31 @@ export interface BinanceConfig {
   api_secret: string;
   use_testnet: boolean;
   verified: boolean;
+}
+
+export interface BinanceAssetHolding {
+  asset: string;
+  free: number;
+  locked: number;
+  total: number;
+  usdValue: number;
+}
+
+export interface BinanceAccountSummary {
+  connected: boolean;
+  usdtFree: number;
+  usdtLocked: number;
+  totalUsdt: number;
+  totalPortfolioUsd: number;
+  spotUsd?: number;
+  fundingUsd?: number;
+  earnUsd?: number;
+  walletBreakdown?: { walletName: string; balanceUsd: number }[];
+  assets: BinanceAssetHolding[];
+  canTrade: boolean;
+  lastSyncedAt: string;
+  errorDetail?: string | null;
+  serverIp?: string | null;
 }
 
 export interface BotSettings {
