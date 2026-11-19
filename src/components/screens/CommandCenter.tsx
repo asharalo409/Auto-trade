@@ -22,6 +22,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { SUPPORTED_PAIRS } from '../../data/demoData';
 import { audioSynth } from '../../lib/audioSynth';
 import {
   DesktopNotificationPermission,
@@ -48,7 +49,7 @@ import { CandlestickChart } from '../charts/CandlestickChart';
 import { QuantumCore3D } from '../three/QuantumCore3D';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { InfoTip } from '../ui/InfoTip';
-import { SkeletonBlock } from '../ui/MotionPrimitives';
+import { NeonButton, SkeletonBlock } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
 import { BinanceOrderBook } from '../widgets/BinanceOrderBook';
 import { MarketSentimentWidget } from '../widgets/MarketSentimentWidget';
@@ -139,6 +140,58 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   );
   const [activeSignalNotice, setActiveSignalNotice] = useState<LiveSignalNotice | null>(null);
 
+  const [customAlerts, setCustomAlerts] = useState<{
+    id: string;
+    pair: string;
+    condition: 'ABOVE' | 'BELOW';
+    targetPrice: number;
+    active: boolean;
+    createdAt: string;
+  }[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const saved = window.localStorage.getItem('aegis_custom_price_alerts_v1');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return [
+      { id: 'al-1', pair: 'BTCUSDT', condition: 'ABOVE', targetPrice: 98000, active: true, createdAt: new Date().toISOString() },
+      { id: 'al-2', pair: 'ETHUSDT', condition: 'BELOW', targetPrice: 2800, active: true, createdAt: new Date().toISOString() },
+    ];
+  });
+  const [alertPairInput, setAlertPairInput] = useState('BTCUSDT');
+  const [alertCondInput, setAlertCondInput] = useState<'ABOVE' | 'BELOW'>('ABOVE');
+  const [alertPriceInput, setAlertPriceInput] = useState('');
+
+  const handleAddPriceAlert = (e: React.FormEvent) => {
+    e.preventDefault();
+    const priceNum = parseFloat(alertPriceInput);
+    if (!Number.isFinite(priceNum) || priceNum <= 0) return;
+    audioSynth.playClick();
+    const newAlert = {
+      id: `alert-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      pair: alertPairInput,
+      condition: alertCondInput,
+      targetPrice: priceNum,
+      active: true,
+      createdAt: new Date().toISOString(),
+    };
+    const next = [newAlert, ...customAlerts];
+    setCustomAlerts(next);
+    setAlertPriceInput('');
+    try {
+      window.localStorage.setItem('aegis_custom_price_alerts_v1', JSON.stringify(next));
+    } catch {}
+  };
+
+  const handleRemoveAlert = (id: string) => {
+    audioSynth.playClick();
+    const next = customAlerts.filter((a) => a.id !== id);
+    setCustomAlerts(next);
+    try {
+      window.localStorage.setItem('aegis_custom_price_alerts_v1', JSON.stringify(next));
+    } catch {}
+  };
+
   const prevSignalsRef = useRef<Map<string, PairMarketData['signal']> | null>(null);
   const seenAlertIdsRef = useRef<Set<string> | null>(null);
   const seenTradeStatesRef = useRef<Map<string, Trade['status']> | null>(null);
@@ -148,25 +201,6 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   const isRunning = botStatus === 'RUNNING';
   const isOffline = botStatus === 'OFFLINE';
   const theme = TERMINAL_THEMES[effectiveTheme];
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.setItem(DESKTOP_ALERTS_STORAGE_KEY, String(desktopAlertsEnabled));
-    } catch {
-      // ignore storage errors
-    }
-  }, [desktopAlertsEnabled]);
-
-  useEffect(() => {
-    const syncPerm = () => setNotifPermission(getDesktopNotificationPermission());
-    window.addEventListener('focus', syncPerm);
-    document.addEventListener('visibilitychange', syncPerm);
-    return () => {
-      window.removeEventListener('focus', syncPerm);
-      document.removeEventListener('visibilitychange', syncPerm);
-    };
-  }, []);
 
   const dispatchTradeSignalNotification = useCallback(
     (payload: {
@@ -214,6 +248,40 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     },
     [desktopAlertsEnabled]
   );
+
+  useEffect(() => {
+    if (customAlerts.length === 0) return;
+    let mutated = false;
+    const nextAlerts = customAlerts.map((alert) => {
+      if (!alert.active) return alert;
+      const pairData = marketPairs.find((p) => p.symbol === alert.pair);
+      if (!pairData) return alert;
+      const crossed =
+        alert.condition === 'ABOVE'
+          ? pairData.price >= alert.targetPrice
+          : pairData.price <= alert.targetPrice;
+      if (crossed) {
+        mutated = true;
+        dispatchTradeSignalNotification({
+          pair: alert.pair,
+          signal: alert.condition === 'ABOVE' ? 'BUY' : 'SELL',
+          price: pairData.price,
+          title: `🎯 Price Alert Triggered: ${alert.pair}`,
+          detail: `Price @ $${pairData.price.toLocaleString()} crossed ${alert.condition} $${alert.targetPrice.toLocaleString()}`,
+          bypassCooldown: true,
+        });
+        return { ...alert, active: false };
+      }
+      return alert;
+    });
+
+    if (mutated) {
+      setCustomAlerts(nextAlerts);
+      try {
+        window.localStorage.setItem('aegis_custom_price_alerts_v1', JSON.stringify(nextAlerts));
+      } catch {}
+    }
+  }, [marketPairs, customAlerts, dispatchTradeSignalNotification]);
 
   // Auto-clear in-app signal toast banner after 12 seconds
   useEffect(() => {
@@ -1005,6 +1073,112 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           />
         </div>
       </div>
+
+      {/* Row 4.5: Custom Price Alert Rules Manager */}
+      <TerminalPanel
+        accent="cyan"
+        title={t.priceAlertsTitle}
+        subtitle={t.priceAlertsSub}
+        rightSlot={<InfoTip text={t.priceAlertsSub} label={t.priceAlertsTitle} />}
+      >
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+          {/* Add Price Alert Form */}
+          <form onSubmit={handleAddPriceAlert} className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d] p-4 lg:col-span-5">
+            <div className="font-mono-tech text-xs font-bold text-cyan-300 uppercase">
+              {t.addPriceAlert}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="mb-1 block font-mono-tech text-[10px] text-slate-400">{t.alertPair}</label>
+                <select
+                  value={alertPairInput}
+                  onChange={(e) => setAlertPairInput(e.target.value)}
+                  className="min-h-[38px] w-full rounded-lg border border-slate-700/80 bg-[#090d16] px-2 font-mono-tech text-xs text-slate-200 focus:border-cyan-400 focus:outline-none"
+                >
+                  {SUPPORTED_PAIRS.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block font-mono-tech text-[10px] text-slate-400">{t.alertCondition}</label>
+                <select
+                  value={alertCondInput}
+                  onChange={(e) => setAlertCondInput(e.target.value as 'ABOVE' | 'BELOW')}
+                  className="min-h-[38px] w-full rounded-lg border border-slate-700/80 bg-[#090d16] px-2 font-mono-tech text-xs text-slate-200 focus:border-cyan-400 focus:outline-none"
+                >
+                  <option value="ABOVE">{t.abovePrice}</option>
+                  <option value="BELOW">{t.belowPrice}</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="mb-1 block font-mono-tech text-[10px] text-slate-400">{t.alertTarget}</label>
+              <input
+                type="number"
+                step="any"
+                required
+                placeholder="e.g. 98500"
+                value={alertPriceInput}
+                onChange={(e) => setAlertPriceInput(e.target.value)}
+                className="min-h-[38px] w-full rounded-lg border border-slate-700/80 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
+              />
+            </div>
+            <NeonButton type="submit" variant="cyan" className="w-full min-h-[36px] py-1 text-xs">
+              + {t.addPriceAlert}
+            </NeonButton>
+          </form>
+
+          {/* Active / Triggered Alert Rules List */}
+          <div className="space-y-2 rounded-xl border border-slate-800/80 bg-[#05070d] p-4 lg:col-span-7">
+            <div className="flex items-center justify-between font-mono-tech text-xs font-semibold text-slate-200">
+              <span>Active Rules ({customAlerts.filter(a => a.active).length})</span>
+              <span className="text-slate-500">{customAlerts.length} Total</span>
+            </div>
+            <div className="max-h-48 overflow-y-auto space-y-2 pr-1">
+              {customAlerts.length === 0 ? (
+                <div className="py-6 text-center font-mono-tech text-xs text-slate-500">
+                  No price alerts configured yet. Add one on the left.
+                </div>
+              ) : (
+                customAlerts.map((alert) => {
+                  const pairData = marketPairs.find((p) => p.symbol === alert.pair);
+                  const currentPrice = pairData?.price ?? 0;
+                  return (
+                    <div
+                      key={alert.id}
+                      className={`flex items-center justify-between gap-3 rounded-lg border px-3 py-2 font-mono-tech text-xs ${
+                        alert.active
+                          ? 'border-slate-800 bg-[#090d16]'
+                          : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-white">{alert.pair}</span>
+                          <span className={alert.condition === 'ABOVE' ? 'text-emerald-400' : 'text-rose-400'}>
+                            {alert.condition === 'ABOVE' ? '≥' : '≤'} ${alert.targetPrice.toLocaleString()}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-slate-400">
+                          Current: ${currentPrice.toLocaleString()} · {alert.active ? 'Monitoring...' : 'Triggered ✓'}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveAlert(alert.id)}
+                        className="cursor-pointer rounded p-1 text-slate-500 hover:text-rose-400 transition-colors"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      </TerminalPanel>
 
       {/* Row 5: Open Positions + Live Feed Preview */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">

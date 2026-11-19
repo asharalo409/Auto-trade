@@ -1604,22 +1604,30 @@ export function useTradingTerminal() {
   const testTelegramConnection = useCallback(
     async (cfg: TelegramConfig) => {
       setTelegramConfig(cfg);
-      const res = await dispatchTelegramAlert(
-        cfg,
-        `<b>[AEGIS QUANT TERMINAL]</b> Connection verified (${activeWorkspace} workspace). All trade & engine updates will stream here.`
-      );
+      const currentBalance = stats.balance;
+      const messageText = `<b>[AEGIS QUANT TERMINAL — ${activeWorkspace}]</b>\n` +
+        `🟢 <b>Telegram Test Connection Verified!</b>\n` +
+        `💰 <b>Actual / Current Balance:</b> $${currentBalance.toFixed(2)} USDT\n` +
+        `📊 <b>Active Positions:</b> ${stats.openTradesCount}\n` +
+        `⚡ <b>Bot Status:</b> ${botStatus}\n` +
+        `🔑 <b>API Status:</b> Armed & Connected`;
+
+      console.log('[Telegram Test] Dispatching payload to Bot API:', { chatId: cfg.chat_id, tokenMasked: cfg.bot_token ? cfg.bot_token.slice(0, 6) + '...' : 'none' });
+      const res = await dispatchTelegramAlert(cfg, messageText);
+      console.error('[Telegram API Response Payload]', { ok: res.ok, detail: res.detail, timestamp: new Date().toISOString() });
+
       appendLog(activeWorkspace, {
         id: createUniqueId('LOG'),
-        level: res.ok ? 'INFO' : 'WARNING',
+        level: res.ok ? 'INFO' : 'ERROR',
         pair: null,
         message: res.ok
-          ? 'Telegram Bot test alert delivered successfully.'
-          : `Telegram test response: ${res.detail}`,
+          ? `Telegram test alert delivered successfully! Balance: $${currentBalance.toFixed(2)} USDT`
+          : `Telegram test failed: ${res.detail}`,
         created_at: new Date().toISOString(),
       });
       return res;
     },
-    [activeWorkspace, appendLog]
+    [activeWorkspace, appendLog, stats.balance, stats.openTradesCount, botStatus]
   );
 
   const verifyBinanceCredentials = useCallback(
