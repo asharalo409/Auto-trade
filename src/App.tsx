@@ -422,6 +422,7 @@ export default function App() {
                   onResetVirtual={() => terminal.resetVirtualBalance(10000)}
                   onRefreshBalance={terminal.refreshBinanceBalance}
                   onSendSignalTelegram={terminal.sendSignalToTelegram}
+                  onSendBalanceTelegram={terminal.sendTelegramBalanceSnapshot}
                   onNavigateTab={(tab) => handleTabChange(tab)}
                 />
               )}

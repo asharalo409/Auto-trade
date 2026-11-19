@@ -100,6 +100,7 @@ interface CommandCenterProps {
     detail: string,
     options?: { force?: boolean }
   ) => Promise<{ ok: boolean; detail: string }>;
+  onSendBalanceTelegram: () => Promise<unknown>;
   onNavigateTab: (tab: 'trades' | 'feed' | 'market' | 'settings') => void;
 }
 
@@ -145,6 +146,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   onResetVirtual,
   onRefreshBalance,
   onSendSignalTelegram,
+  onSendBalanceTelegram,
   onNavigateTab,
 }) => {
   const reducedMotion = useReducedMotion();
@@ -836,6 +838,17 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                   <span>{t.refreshBalanceBtn}</span>
                 </button>
               )}
+              <button
+                type="button"
+                onClick={() => {
+                  audioSynth.playClick();
+                  void onSendBalanceTelegram();
+                }}
+                className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-cyan-400/50 bg-cyan-500/15 px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/25"
+              >
+                <Send className="h-3 w-3" />
+                <span>{t.reportBalanceBtn}</span>
+              </button>
               <button
                 type="button"
                 onClick={() => onNavigateTab('settings')}

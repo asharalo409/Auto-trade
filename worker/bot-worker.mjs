@@ -28,22 +28,135 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-// Optional HTTP Healthcheck Server
-const PORT = Number(process.env.PORT || 0);
+// Optional CORS HTTP Server & API Endpoints
+const PORT = Number(process.env.PORT || 10000);
 if (PORT > 0) {
   http
-    .createServer((_req, res) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          service: 'aegis-quant-worker',
-          status: 'ok',
-          timestamp: new Date().toISOString(),
-        })
-      );
+    .createServer(async (req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-MBX-APIKEY');
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const pathname = url.pathname;
+
+      if (req.method === 'GET' && (pathname === '/' || pathname === '/health' || pathname === '/api/health')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            service: 'aegis-quant-worker',
+            status: 'ok',
+            timestamp: new Date().toISOString(),
+          })
+        );
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/verify-keys') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            const apiKey = String(data.apiKey || data.api_key || '').trim();
+            const apiSecret = String(data.apiSecret || data.api_secret || '').trim();
+            const testnet = process.env.BINANCE_TESTNET === 'true' ? true : Boolean(data.testnet ?? data.use_testnet ?? false);
+
+            if (!apiKey || !apiSecret) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Missing apiKey or apiSecret' }));
+              return;
+            }
+
+            const usdtBalance = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, testnet);
+            if (usdtBalance === null) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Failed to verify Binance keys or fetch balance' }));
+              return;
+            }
+
+            const { data: settingsRow } = await supabase.from('settings').select('id').limit(1).maybeSingle();
+            if (settingsRow) {
+              await supabase
+                .from('settings')
+                .update({
+                  binance_api_key: apiKey,
+                  binance_api_secret: apiSecret,
+                  use_testnet: testnet,
+                  balance_usdt: usdtBalance,
+                  last_heartbeat: new Date().toISOString(),
+                })
+                .eq('id', settingsRow.id);
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                usdtBalance,
+                message: `Binance API verified successfully. USDT Balance: $${usdtBalance.toFixed(2)}`,
+              })
+            );
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      if ((req.method === 'GET' || req.method === 'POST') && (pathname === '/api/balance' || pathname === '/api/binance/balance')) {
+        try {
+          const { data: settingsRow } = await supabase.from('settings').select('*').limit(1).maybeSingle();
+          if (!settingsRow) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, usdtBalance: 0, totalUsdt: 0, totalPortfolioUsd: 0 }));
+            return;
+          }
+
+          const apiKey = (ENV_BINANCE_KEY || settingsRow.binance_api_key || '').trim();
+          const apiSecret = (ENV_BINANCE_SECRET || settingsRow.binance_api_secret || '').trim();
+          const useTestnet = process.env.BINANCE_TESTNET === 'false' ? false : (ENV_TESTNET || Boolean(settingsRow.use_testnet));
+
+          let usdtBalance = Number(settingsRow.balance_usdt || 0);
+          if (apiKey && apiSecret) {
+            const fetched = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet);
+            if (fetched !== null && Number.isFinite(fetched)) {
+              usdtBalance = fetched;
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              usdtBalance,
+              totalUsdt: usdtBalance,
+              totalPortfolioUsd: usdtBalance,
+              spotUsd: usdtBalance,
+              fundingUsd: 0,
+              earnUsd: 0,
+              assets: [],
+            })
+          );
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not Found' }));
     })
     .listen(PORT, '0.0.0.0', () => {
-      console.log(`[WORKER] Healthcheck listening on port ${PORT}`);
+      console.log(`[WORKER] HTTP server listening on port ${PORT}`);
     });
 }
 
@@ -283,7 +396,7 @@ async function runCycle() {
     // Resolve credentials from env or Supabase settings table
     const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
     const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
-    const useTestnet = ENV_TESTNET || Boolean(settings.use_testnet);
+    const useTestnet = process.env.BINANCE_TESTNET === 'false' ? false : (ENV_TESTNET || Boolean(settings.use_testnet));
     const telegramToken = (settings.telegram_bot_token || settings.bot_token || '').trim();
     const telegramChatId = (settings.telegram_chat_id || settings.chat_id || '').trim();
 

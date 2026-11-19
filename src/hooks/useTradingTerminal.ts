@@ -37,6 +37,8 @@ import {
   TradingMode,
 } from '../types/trading';
 
+const WORKER_URL = import.meta.env.VITE_WORKER_URL || "https://aegis-quant-worker-eu.onrender.com";
+
 const STORAGE_PREFS_KEY = 'aegis_quant_prefs_v2';
 const STORAGE_TG_KEY = 'aegis_quant_telegram_v1';
 const STORAGE_BN_KEY = 'aegis_quant_binance_v1';
@@ -1683,98 +1685,56 @@ export function useTradingTerminal() {
       }
 
       setSyncingBalance(true);
-      console.info('[useTradingTerminal] Syncing live Binance balance...', {
-        useTestnet: activeCfg.use_testnet,
-        keyPrefix: apiKey.slice(0, 6),
-      });
       try {
-        const res = await fetch('/api/binance/balance', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            apiKey,
-            apiSecret,
-            useTestnet: activeCfg.use_testnet,
-          }),
-        });
-        const data = (await res.json()) as {
-          ok?: boolean;
-          usdtFree?: number;
-          usdtLocked?: number;
-          totalUsdt?: number;
-          totalPortfolioUsd?: number;
-          spotUsd?: number;
-          fundingUsd?: number;
-          earnUsd?: number;
-          walletBreakdown?: { walletName: string; balanceUsd: number }[];
-          assets?: BinanceAccountSummary['assets'];
-          canTrade?: boolean;
-          lastSyncedAt?: string;
-          detail?: string;
-          code?: number | null;
-          upstreamStatus?: number;
-          serverIp?: string | null;
-        };
+        let res: Response;
+        try {
+          res = await fetch(`${WORKER_URL}/api/balance`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apiKey,
+              apiSecret,
+              testnet: activeCfg.use_testnet,
+            }),
+          });
+        } catch {
+          res = await fetch('/api/binance/balance', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apiKey,
+              apiSecret,
+              useTestnet: activeCfg.use_testnet,
+            }),
+          });
+        }
+        const text = await res.text();
+        const data = text ? JSON.parse(text) : {};
 
-        if (res.ok && data.ok) {
-          const totalPortfolioUsd = Number(data.totalPortfolioUsd ?? data.totalUsdt ?? 0);
-          const totalUsdt = Number(data.totalUsdt ?? 0);
-          const realUsd = Number((totalPortfolioUsd > 0 ? totalPortfolioUsd : totalUsdt).toFixed(2));
+        if (res.ok && (data.ok || data.usdtBalance !== undefined || data.totalUsdt !== undefined)) {
+          const usdtBal = Number(data.usdtBalance ?? data.totalUsdt ?? data.totalPortfolioUsd ?? 0);
           const summary: BinanceAccountSummary & { ok: boolean } = {
             ok: true,
             connected: true,
-            usdtFree: Number(data.usdtFree ?? 0),
+            usdtFree: Number(data.usdtFree ?? usdtBal),
             usdtLocked: Number(data.usdtLocked ?? 0),
-            totalUsdt,
-            totalPortfolioUsd,
-            spotUsd: Number(data.spotUsd ?? 0),
+            totalUsdt: usdtBal,
+            totalPortfolioUsd: usdtBal,
+            spotUsd: Number(data.spotUsd ?? usdtBal),
             fundingUsd: Number(data.fundingUsd ?? 0),
             earnUsd: Number(data.earnUsd ?? 0),
-            walletBreakdown: Array.isArray(data.walletBreakdown) ? data.walletBreakdown : [],
+            walletBreakdown: Array.isArray(data.walletBreakdown) && data.walletBreakdown.length > 0
+              ? data.walletBreakdown
+              : [{ walletName: 'Spot', balanceUsd: usdtBal }],
             assets: Array.isArray(data.assets) ? data.assets : [],
-            canTrade: Boolean(data.canTrade),
-            lastSyncedAt: data.lastSyncedAt ?? new Date().toISOString(),
+            canTrade: true,
+            lastSyncedAt: new Date().toISOString(),
             errorDetail: null,
           };
-          console.info('[useTradingTerminal] Live Binance balance synced:', {
-            realUsd,
-            spotUsd: summary.spotUsd,
-            fundingUsd: summary.fundingUsd,
-            earnUsd: summary.earnUsd,
-            assetsCount: summary.assets.length,
-          });
           setBinanceAccount(summary);
-          setBinanceConfig({ ...activeCfg, verified: true });
-          setLiveSettings((prev) => ({
-            ...prev,
-            balance_usdt: realUsd,
-            last_heartbeat: new Date().toISOString(),
-          }));
-
-          if (supabase && !isDemoMode) {
-            try {
-              await supabase
-                .from('settings')
-                .update({
-                  balance_usdt: realUsd,
-                  binance_api_key: apiKey,
-                  binance_api_secret: apiSecret,
-                  use_testnet: activeCfg.use_testnet,
-                })
-                .eq('id', liveSettings.id);
-            } catch {
-              // ignore offline supabase update
-            }
-          }
+          setLiveSettings((prev) => ({ ...prev, balance_usdt: usdtBal }));
           return summary;
         }
-
-        console.warn('[useTradingTerminal] Binance balance sync rejected:', {
-          httpStatus: data.upstreamStatus ?? res.status,
-          code: data.code ?? null,
-          detail: data.detail,
-          serverIp: data.serverIp ?? null,
-        });
 
         const errSummary: BinanceAccountSummary & { ok: boolean } = {
           ok: false,
@@ -1786,15 +1746,14 @@ export function useTradingTerminal() {
           assets: [],
           canTrade: false,
           lastSyncedAt: new Date().toISOString(),
-          errorDetail: data.detail || `Binance HTTP ${data.upstreamStatus ?? res.status}`,
-          serverIp: data.serverIp ?? null,
+          errorDetail: data.error || data.detail || `Binance HTTP ${res.status}`,
         };
         setBinanceAccount(errSummary);
         setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
         return errSummary;
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Unable to reach Binance balance service';
-        console.error('[useTradingTerminal] Binance balance request exception:', err);
+        console.warn('[useTradingTerminal] Binance balance fetch fallback warning:', msg);
         const errSummary: BinanceAccountSummary & { ok: boolean } = {
           ok: false,
           connected: false,
@@ -2064,37 +2023,70 @@ export function useTradingTerminal() {
       }
 
       setBinanceConfig(trimmedCfg);
-      const result = await refreshBinanceBalance(trimmedCfg);
-      if (result.ok) {
-        const realUsd = result.totalPortfolioUsd > 0 ? result.totalPortfolioUsd : result.totalUsdt;
-        const bdtVal = Math.round(realUsd * BDT_PER_USD);
+      try {
+        let res: Response;
+        try {
+          res = await fetch(`${WORKER_URL}/api/verify-keys`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apiKey: trimmedCfg.api_key,
+              apiSecret: trimmedCfg.api_secret,
+              testnet: trimmedCfg.use_testnet,
+            }),
+          });
+        } catch {
+          res = await fetch('/api/binance/balance', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apiKey: trimmedCfg.api_key,
+              apiSecret: trimmedCfg.api_secret,
+              useTestnet: trimmedCfg.use_testnet,
+            }),
+          });
+        }
+        const text = await res.text();
+        const data = text ? JSON.parse(text) : {};
+        if (res.ok && (data.ok || data.usdtBalance !== undefined || data.totalUsdt !== undefined)) {
+          const usdtBalance = Number(data.usdtBalance ?? data.totalUsdt ?? data.totalPortfolioUsd ?? 0);
+          const bdtVal = Math.round(usdtBalance * BDT_PER_USD);
+          setBinanceConfig({ ...trimmedCfg, verified: true });
+          setLiveSettings((prev) => ({ ...prev, balance_usdt: usdtBalance }));
+          appendLog('LIVE', {
+            id: createUniqueId('LOG'),
+            level: 'INFO',
+            pair: null,
+            message: `Binance API verified (${
+              trimmedCfg.use_testnet ? 'TESTNET' : 'MAINNET'
+            })! USDT Balance: $${usdtBalance.toFixed(2)} USD (৳${bdtVal.toLocaleString('en-US')} BDT)`,
+            created_at: new Date().toISOString(),
+          });
+          return {
+            ok: true,
+            detail: `Connected ✓ USDT Balance: $${usdtBalance.toFixed(2)} (৳${bdtVal.toLocaleString('en-US')})`,
+          };
+        }
+        const errDetail = data.error || data.detail || `Verification failed (HTTP ${res.status})`;
         appendLog('LIVE', {
           id: createUniqueId('LOG'),
-          level: 'INFO',
+          level: 'ERROR',
           pair: null,
-          message: `Binance API verified (${
-            trimmedCfg.use_testnet ? 'TESTNET' : 'MAINNET'
-          })! Real Balance: $${realUsd.toFixed(2)} USD (৳${bdtVal.toLocaleString('en-US')} BDT) · Free USDT: $${result.usdtFree.toFixed(2)}`,
+          message: `Binance verification error: ${errDetail}`,
           created_at: new Date().toISOString(),
         });
-        return {
-          ok: true,
-          detail: `Connected ✓ Real Balance: $${realUsd.toFixed(2)} (৳${bdtVal.toLocaleString('en-US')}) · USDT Free: $${result.usdtFree.toFixed(2)}`,
-        };
+        return { ok: false, detail: errDetail };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Network error verifying keys';
+        appendLog('LIVE', {
+          id: createUniqueId('LOG'),
+          level: 'ERROR',
+          pair: null,
+          message: `Binance verification exception: ${msg}`,
+          created_at: new Date().toISOString(),
+        });
+        return { ok: false, detail: msg };
       }
-
-      const ipNote = result.serverIp ? ` (Server IP: ${result.serverIp})` : '';
-      appendLog('LIVE', {
-        id: createUniqueId('LOG'),
-        level: 'ERROR',
-        pair: null,
-        message: `Binance balance fetch error: ${result.errorDetail}${ipNote}`,
-        created_at: new Date().toISOString(),
-      });
-      return {
-        ok: false,
-        detail: `${result.errorDetail || 'Verification failed'}${ipNote}`,
-      };
     },
     [appendLog, refreshBinanceBalance]
   );
