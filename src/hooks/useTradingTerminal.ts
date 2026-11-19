@@ -1285,20 +1285,20 @@ export function useTradingTerminal() {
             .update(extendedPayload)
             .eq('id', next.id);
           if (error) {
-            // Automatic compatibility retry if Supabase table predates extended columns
-            if (error.code === 'PGRST204' || error.code === '42703') {
+            if (error.code === 'PGRST204' || error.code === '42703' || error.code === '42P01') {
               const { error: retryErr } = await supabase
                 .from('settings')
                 .update(corePayload)
                 .eq('id', next.id);
-              if (retryErr) throw retryErr;
+              if (retryErr && retryErr.code !== 'PGRST204' && retryErr.code !== '42703' && retryErr.code !== '42P01') {
+                console.warn('Supabase settings table/columns not ready yet. Please run the provided SQL setup script in Supabase.');
+              }
             } else {
-              throw error;
+              console.warn('Supabase settings update warning:', error.message);
             }
           }
         } catch (err) {
-          console.error('Failed to save settings:', err);
-          setErrorMsg(err instanceof Error ? err.message : 'Failed to update settings');
+          console.warn('Failed to save settings to Supabase (using local state):', err);
         }
       } else {
         await new Promise((r) => setTimeout(r, 120));

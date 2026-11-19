@@ -47,14 +47,16 @@ if (PORT > 0) {
     });
 }
 
-async function sendTelegram(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+async function sendTelegram(text, token, chatId) {
+  const t = (token || TELEGRAM_BOT_TOKEN || '').trim();
+  const c = (chatId || TELEGRAM_CHAT_ID || '').trim();
+  if (!t || !c) return;
   try {
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    await fetch(`https://api.telegram.org/bot${t}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
+        chat_id: c,
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
@@ -282,6 +284,8 @@ async function runCycle() {
     const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
     const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
     const useTestnet = ENV_TESTNET || Boolean(settings.use_testnet);
+    const telegramToken = (settings.telegram_bot_token || settings.bot_token || '').trim();
+    const telegramChatId = (settings.telegram_chat_id || settings.chat_id || '').trim();
 
     // 1. ALWAYS sync Real Binance Spot USDT Balance in every 15s loop (regardless of bot_enabled ON/OFF)
     const heartbeatPatch = { last_heartbeat: new Date().toISOString() };
@@ -398,7 +402,7 @@ async function runCycle() {
             netPnlAfterFees >= 0 ? '+' : ''
           }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`;
           await appendLog('TRADE', msg, symbol);
-          if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`);
+          if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`, telegramToken, telegramChatId);
           continue;
         }
 
@@ -431,7 +435,7 @@ async function runCycle() {
             });
             const msg = `DCA RE-BUY #${pairOpen.length + 1} ${symbol} @ $${livePx} (-${dropPct.toFixed(2)}% dip) | $${lot} USDT`;
             await appendLog('TRADE', msg, symbol);
-            if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`);
+            if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`, telegramToken, telegramChatId);
           }
         }
       } else if (activeTrades.length < maxOpenTrades) {
@@ -473,7 +477,7 @@ async function runCycle() {
           activeTrades.push({ pair: symbol });
           const detailedMsg = `🚀 <b>AEGIS LIVE ENTRY BUY</b>\nPair: <b>${symbol}</b>\nPrice: $${livePx}\nInvested: $${lot} USDT\n24h Change: ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%\nVolume: $${Math.round(quoteVolume).toLocaleString()}\nMode: ${zeroLoss ? 'Zero-Loss Shield ON' : 'Standard'}`;
           await appendLog('TRADE', detailedMsg, symbol);
-          if (settings.telegram_enabled) await sendTelegram(detailedMsg);
+          if (settings.telegram_enabled) await sendTelegram(detailedMsg, telegramToken, telegramChatId);
         }
       }
     }
