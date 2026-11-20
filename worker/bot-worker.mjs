@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
+import { renderPnlCard } from './pnl-card.mjs';
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -26,6 +27,34 @@ const TELEGRAM_POLL_TIMEOUT_SECONDS = 25;
 const TELEGRAM_OPEN_TERMINAL_MARKUP = {
   inline_keyboard: [[{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }]],
 };
+const TELEGRAM_STATUS_BUTTON = { text: '📈 Live Status', callback_data: 'refresh_status' };
+
+/**
+ * Two rows of inline actions on every trade alert: the Mini App entry point, plus
+ * a one-tap close for THAT pair and an instant portfolio snapshot.
+ */
+function tradeAlertMarkup(symbol) {
+  const secondRow = [];
+  if (symbol) secondRow.push({ text: `🛑 Close ${symbol}`, callback_data: `close_symbol:${symbol}` });
+  secondRow.push(TELEGRAM_STATUS_BUTTON);
+  return {
+    inline_keyboard: [
+      [{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }],
+      secondRow,
+    ],
+  };
+}
+
+/* ------------------------------------------------------------------------- *
+ * Institutional risk intelligence constants
+ * ------------------------------------------------------------------------- */
+
+/** Flash-crash circuit breaker: a 5-minute drop at or beyond this % pauses a pair. */
+const CRASH_GUARD_DROP_PCT = 4.0;
+const CRASH_GUARD_WINDOW_MINUTES = 5;
+const CRASH_GUARD_PAUSE_MINUTES = 15;
+/** symbol -> { blockedUntil:number, dropPct:number, triggeredAt:number } */
+const crashGuardState = new Map();
 const IPV4_REGEX = /\b((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})\b/;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -62,6 +91,22 @@ if (PORT > 0) {
             service: 'aegis-quant-worker',
             status: 'ok',
             timestamp: new Date().toISOString(),
+            guards: describeCrashGuards(),
+          })
+        );
+        return;
+      }
+
+      // Live circuit-breaker state for the terminal's "🛡️ Crash Guard: Active" badge.
+      if (req.method === 'GET' && pathname === '/api/guards') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            timestamp: new Date().toISOString(),
+            dropPctTrigger: CRASH_GUARD_DROP_PCT,
+            pauseMinutes: CRASH_GUARD_PAUSE_MINUTES,
+            guards: describeCrashGuards(),
           })
         );
         return;
@@ -288,6 +333,75 @@ async function sendTelegram(text, token, chatId, options = {}) {
   }
 }
 
+/** Sends a rendered PNG with an HTML caption (used for the shareable PnL card). */
+async function sendTelegramPhoto(pngBuffer, caption, token, chatId, replyMarkup) {
+  const t = (token || TELEGRAM_BOT_TOKEN || '').trim();
+  const c = (chatId || TELEGRAM_CHAT_ID || '').trim();
+  if (!t || !c || !pngBuffer) return false;
+  try {
+    const form = new FormData();
+    form.append('chat_id', c);
+    form.append('caption', caption);
+    form.append('parse_mode', 'HTML');
+    if (replyMarkup) form.append('reply_markup', JSON.stringify(replyMarkup));
+    form.append('photo', new Blob([pngBuffer], { type: 'image/png' }), 'aegis-pnl.png');
+    const res = await fetch(`https://api.telegram.org/bot${t}/sendPhoto`, {
+      method: 'POST',
+      body: form,
+      signal: AbortSignal.timeout(25_000),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      console.warn('[TELEGRAM PHOTO ERROR]', data?.description || `HTTP ${res.status}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[TELEGRAM PHOTO ERROR]', err.message);
+    return false;
+  }
+}
+
+async function answerCallbackQuery(token, callbackQueryId, text, showAlert = false) {
+  try {
+    await telegramApiCall(
+      token,
+      'answerCallbackQuery',
+      { callback_query_id: callbackQueryId, text, show_alert: showAlert },
+      10_000
+    );
+  } catch (err) {
+    console.warn('[TELEGRAM CALLBACK] answer failed:', err.message);
+  }
+}
+
+/**
+ * Renders and pushes the AEGIS QUANT PnL card. Falls back silently (the text
+ * alert already carries the numbers) when the native renderer is unavailable.
+ */
+async function sendPnlCard(cfg, details) {
+  if (!cfg.telegramEnabled || !cfg.telegramToken || !cfg.telegramChatId) return false;
+  const png = await renderPnlCard({
+    symbol: details.symbol,
+    side: 'LONG SPOT',
+    roiPct: details.pnlPct,
+    netProfitUsd: details.pnlUsdt,
+    entryPrice: details.entryPrice,
+    exitPrice: details.exitPrice,
+    mode: MODE_LABEL[cfg.mode],
+    closedAt: new Date(),
+  });
+  if (!png) return false;
+  const caption = [
+    `<b>💰 ${details.symbol} CLOSED IN PROFIT</b>`,
+    `Net ${Number(details.pnlUsdt) >= 0 ? '+' : ''}$${Number(details.pnlUsdt).toFixed(2)} USDT · ${
+      Number(details.pnlPct) >= 0 ? '+' : ''
+    }${Number(details.pnlPct).toFixed(2)}% ROI`,
+    `Entry $${Number(details.entryPrice).toFixed(4)} → Exit $${Number(details.exitPrice).toFixed(4)}`,
+  ].join('\n');
+  return sendTelegramPhoto(png, caption, cfg.telegramToken, cfg.telegramChatId, tradeAlertMarkup(details.symbol));
+}
+
 function isMissingTableError(error) {
   if (!error) return false;
   const msg = String(error.message || '');
@@ -464,6 +578,162 @@ async function fetchBinancePrices(symbols, useTestnet) {
     map[row.symbol] = Number(row.price);
   }
   return map;
+}
+
+async function fetchKlines(symbol, interval, limit, useTestnet) {
+  const rows = await fetchPublicWithFallback(
+    `/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`,
+    useTestnet
+  );
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map((row) => ({
+      open: Number(row[1]),
+      high: Number(row[2]),
+      low: Number(row[3]),
+      close: Number(row[4]),
+      closeTime: Number(row[6]),
+    }))
+    .filter((row) => Number.isFinite(row.close) && row.close > 0);
+}
+
+function computeEma(values, period) {
+  if (!Array.isArray(values) || values.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
+  for (let i = period; i < values.length; i += 1) {
+    ema = values[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+function computeRsi(values, period = 14) {
+  if (!Array.isArray(values) || values.length <= period) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i += 1) {
+    const diff = values[i] - values[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  for (let i = period + 1; i < values.length; i += 1) {
+    const diff = values[i] - values[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(0, diff)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(0, -diff)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+/** Snapshot of every pair currently paused by the flash-crash guard. */
+function describeCrashGuards() {
+  const now = Date.now();
+  const active = [];
+  for (const [symbol, guard] of crashGuardState.entries()) {
+    if (guard.blockedUntil <= now) {
+      crashGuardState.delete(symbol);
+      continue;
+    }
+    active.push({
+      symbol,
+      dropPct: Number(guard.dropPct.toFixed(2)),
+      active: true,
+      triggeredAt: new Date(guard.triggeredAt).toISOString(),
+      resumeAt: new Date(guard.blockedUntil).toISOString(),
+      minutesRemaining: Math.max(0, Math.ceil((guard.blockedUntil - now) / 60_000)),
+    });
+  }
+  return active;
+}
+
+/**
+ * Flash-Crash & Volatility Guard (circuit breaker).
+ * Measures the last CRASH_GUARD_WINDOW_MINUTES of 1m candles; a drop at or beyond
+ * CRASH_GUARD_DROP_PCT pauses new entries + DCA re-buys for that pair for
+ * CRASH_GUARD_PAUSE_MINUTES and fires ONE Telegram warning per event.
+ */
+async function checkCrashGuard(symbol, cfg) {
+  const now = Date.now();
+  const existing = crashGuardState.get(symbol);
+  if (existing && existing.blockedUntil > now) {
+    return { blocked: true, dropPct: existing.dropPct, minutesRemaining: Math.ceil((existing.blockedUntil - now) / 60_000) };
+  }
+  if (existing) crashGuardState.delete(symbol);
+
+  try {
+    const klines = await fetchKlines(symbol, '1m', CRASH_GUARD_WINDOW_MINUTES + 1, cfg.useTestnet);
+    if (klines.length < 2) return { blocked: false };
+    const windowRows = klines.slice(-(CRASH_GUARD_WINDOW_MINUTES + 1));
+    const firstOpen = windowRows[0].open;
+    const lastClose = windowRows[windowRows.length - 1].close;
+    if (!firstOpen || !lastClose) return { blocked: false };
+    const changePct = ((lastClose - firstOpen) / firstOpen) * 100;
+
+    if (changePct <= -CRASH_GUARD_DROP_PCT) {
+      const guard = {
+        dropPct: changePct,
+        triggeredAt: now,
+        blockedUntil: now + CRASH_GUARD_PAUSE_MINUTES * 60_000,
+      };
+      crashGuardState.set(symbol, guard);
+      const message = `⚠️ CRASH GUARD PAUSED ${symbol}: ${changePct.toFixed(
+        2
+      )}% 5m drop detected — new entries and DCA re-buys paused for ${CRASH_GUARD_PAUSE_MINUTES} minutes.`;
+      console.warn(`[CRASH GUARD] ${message}`);
+      await appendLog('WARNING', `[${MODE_LABEL[cfg.mode]}] ${message}`, symbol);
+      await sendWarningTelegram(cfg, message);
+      return { blocked: true, dropPct: changePct, minutesRemaining: CRASH_GUARD_PAUSE_MINUTES };
+    }
+  } catch (err) {
+    // Market data outages must never stop the engine — trade on without the guard.
+    console.warn(`[CRASH GUARD] ${symbol} volatility check skipped:`, err.message);
+  }
+  return { blocked: false };
+}
+
+/**
+ * Multi-timeframe trend confirmation: only allow a fresh BUY when the 1h candle
+ * closes above its EMA20 and 1h RSI sits in the healthy 40-72 band, so the engine
+ * stops buying dips inside a macro downtrend.
+ */
+async function checkHigherTimeframeTrend(symbol, cfg) {
+  try {
+    const klines = await fetchKlines(symbol, '1h', 120, cfg.useTestnet);
+    const closes = klines.map((row) => row.close);
+    const ema20 = computeEma(closes, 20);
+    const rsi = computeRsi(closes, 14);
+    if (ema20 === null || rsi === null) return { ok: true, reason: 'insufficient 1h history' };
+    const lastClose = closes[closes.length - 1];
+    const bullish = lastClose > ema20;
+    const healthyRsi = rsi >= 40 && rsi <= 72;
+    return {
+      ok: bullish && healthyRsi,
+      close: lastClose,
+      ema20,
+      rsi,
+      reason: !bullish
+        ? `1h close ${lastClose.toFixed(4)} below 1h EMA20 ${ema20.toFixed(4)}`
+        : `1h RSI ${rsi.toFixed(1)} outside the 40-72 buy band`,
+    };
+  } catch (err) {
+    console.warn(`[MTF FILTER] ${symbol} 1h trend check skipped:`, err.message);
+    return { ok: true, reason: '1h data unavailable' };
+  }
+}
+
+/**
+ * Smart auto-compounding position sizing: a % of the live workspace balance,
+ * clamped above the Binance notional floor so LIVE orders stay valid.
+ */
+function resolveEntryNotional(cfg, balance) {
+  if (!cfg.autoCompounding) return cfg.lotRequested;
+  const pct = Math.min(100, Math.max(0.5, cfg.compoundAllocationPct));
+  const sized = (Number(balance) || 0) * (pct / 100);
+  const floor = cfg.mode === 'live' ? BINANCE_MIN_ORDER_USDT : 1;
+  return Math.max(floor, Number(sized.toFixed(2)));
 }
 
 async function fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet) {
@@ -705,6 +975,14 @@ function resolveTradingConfig(settings) {
     maxOpenTrades: Math.max(1, Number(settings.max_open_trades || 5)),
     trailingStopPct: Math.max(0, Number(settings.trailing_stop_pct ?? 1.5)),
     dailyMaxLossPct: Math.max(0, Number(settings.daily_max_loss_pct ?? 5)),
+    // Smart auto-compounding: size each ticket from the live workspace balance.
+    autoCompounding: Boolean(settings.auto_compounding),
+    compoundAllocationPct: Math.min(
+      100,
+      Math.max(0.5, Number(settings.compound_allocation_pct ?? 5))
+    ),
+    // Multi-timeframe bullish filter (15m/5m/1m signals must agree with 1h trend).
+    multiTimeframeFilter: settings.multi_timeframe_filter !== false,
   };
 }
 
@@ -748,7 +1026,12 @@ async function sendTradeTelegram(cfg, details) {
   );
   if (details.note) lines.push(details.note);
   lines.push(`🕒 ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`);
-  await sendTelegram(lines.join('\n'), cfg.telegramToken, cfg.telegramChatId);
+  await sendTelegram(
+    lines.join('\n'),
+    cfg.telegramToken,
+    cfg.telegramChatId,
+    { replyMarkup: tradeAlertMarkup(details.symbol) }
+  );
 }
 
 async function sendWarningTelegram(cfg, message) {
@@ -1038,6 +1321,7 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
       const lastCycle = settings.last_heartbeat
         ? new Date(settings.last_heartbeat).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
         : 'never';
+      const guardSummary = describeCrashGuards();
       await sendTelegram(
         [
           '📊 <b>AEGIS QUANT STATUS</b>',
@@ -1045,9 +1329,22 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
           `• Workspace mode: <b>${modeLabel}</b>`,
           `• Open positions: <b>${openCount}</b>`,
           `• Last cycle: ${lastCycle}`,
+          `• Crash Guard: <b>${
+            guardSummary.length > 0
+              ? `ACTIVE (${guardSummary.map((g) => g.symbol).join(', ')})`
+              : 'clear'
+          }</b>`,
         ].join('\n'),
         token,
-        chatId
+        chatId,
+        {
+          replyMarkup: {
+            inline_keyboard: [
+              [{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }],
+              [TELEGRAM_STATUS_BUTTON],
+            ],
+          },
+        }
       );
       return;
     }
@@ -1134,6 +1431,241 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
   }
 }
 
+/* ------------------------------------------------------------------------- *
+ * Inline callback actions: one-tap close + instant live status
+ * ------------------------------------------------------------------------- */
+
+async function buildLiveStatusMessage(cfg, settings) {
+  const { data: openRows } = await supabase.from('trades').select('*').eq('status', 'OPEN');
+  const positions = (openRows || []).filter((row) => tradeModeOf(row) === cfg.mode);
+  const openPnl = positions.reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
+  const invested = positions.reduce((sum, row) => sum + Number(row.invested_usdt || 0), 0);
+  const guards = describeCrashGuards();
+
+  let balance = readVirtualBalance(settings);
+  if (cfg.mode === 'live' && cfg.hasCredentials) {
+    try {
+      const portfolio = await fetchBinancePortfolioUsdt(cfg.apiKey, cfg.apiSecret, cfg.useTestnet);
+      if (portfolio) balance = portfolio.total;
+    } catch {
+      /* keep the last stored balance */
+    }
+  }
+
+  const lines = [
+    '📈 <b>AEGIS LIVE SNAPSHOT</b>',
+    `🎛 Workspace: <b>${MODE_LABEL[cfg.mode]}</b> · Engine ${cfg.isRunning ? '🟢 RUNNING' : '⚪ STOPPED'}`,
+    `🏦 Balance: <b>${money(balance)}</b>`,
+    `📂 Open: <b>${positions.length}</b> position(s) · ${money(invested)} deployed · ${
+      openPnl >= 0 ? '+' : ''
+    }${money(openPnl)} unrealized`,
+    `🛡️ Crash Guard: <b>${
+      guards.length > 0 ? `ACTIVE — ${guards.map((g) => `${g.symbol} ${g.dropPct}%`).join(', ')}` : 'clear'
+    }</b>`,
+  ];
+  if (positions.length > 0) {
+    lines.push('', '<b>POSITIONS</b>');
+    for (const row of positions.slice(0, 8)) {
+      const pnl = Number(row.profit_usdt || 0);
+      lines.push(
+        `• ${row.pair}: ${money(row.invested_usdt)} @ $${Number(row.entry_price).toFixed(
+          4
+        )} → $${Number(row.current_price || row.entry_price).toFixed(4)} (${
+          pnl >= 0 ? '+' : ''
+        }${pnl.toFixed(2)})`
+      );
+    }
+  } else {
+    lines.push('', '<i>No open positions in this workspace.</i>');
+  }
+  lines.push(`🕒 ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`);
+  return lines.join('\n');
+}
+
+/**
+ * Closes every open position of `symbol` in the active workspace straight from
+ * the Telegram keyboard: LIVE sells the real Spot quantity first, DEMO settles
+ * the paper P&L. Replies with the realized result (and the PnL card on profit).
+ */
+async function closeSymbolFromTelegram(symbol, cfg, token, chatId) {
+  const { data: openRows, error: openErr } = await supabase
+    .from('trades')
+    .select('*')
+    .eq('status', 'OPEN')
+    .eq('pair', symbol);
+  if (openErr) {
+    await sendTelegram(`⚠️ Could not read open ${symbol} positions: ${openErr.message}`, token, chatId);
+    return;
+  }
+  const positions = (openRows || []).filter((row) => tradeModeOf(row) === cfg.mode);
+  if (positions.length === 0) {
+    await sendTelegram(
+      `ℹ️ No open <b>${symbol}</b> position in the ${MODE_LABEL[cfg.mode]} workspace.`,
+      token,
+      chatId,
+      { replyMarkup: tradeAlertMarkup(symbol) }
+    );
+    return;
+  }
+
+  let livePx = Number(positions[0].current_price || positions[0].entry_price || 0);
+  try {
+    const prices = await fetchBinancePrices([symbol], cfg.useTestnet);
+    if (prices[symbol]) livePx = Number(prices[symbol]);
+  } catch (err) {
+    console.warn('[TELEGRAM CLOSE] live price unavailable:', err.message);
+  }
+
+  const closedAt = new Date().toISOString();
+  let closed = 0;
+  let realized = 0;
+  let invested = 0;
+  let failed = null;
+
+  for (const tr of positions) {
+    if (cfg.mode === 'live') {
+      try {
+        await placeBinanceMarketOrder(
+          symbol,
+          'SELL',
+          0,
+          Number(tr.quantity),
+          cfg.apiKey,
+          cfg.apiSecret,
+          cfg.useTestnet
+        );
+      } catch (sellErr) {
+        failed = sellErr.message;
+        continue;
+      }
+    }
+    const pnl = Number(((livePx - Number(tr.entry_price)) * Number(tr.quantity || 0)).toFixed(2));
+    const { error: closeErr } = await supabase
+      .from('trades')
+      .update({ status: 'CLOSED', exit_price: livePx, profit_usdt: pnl, closed_at: closedAt })
+      .eq('id', tr.id);
+    if (closeErr) {
+      failed = closeErr.message;
+      continue;
+    }
+    closed += 1;
+    realized += pnl;
+    invested += Number(tr.invested_usdt || 0);
+  }
+
+  if (closed === 0) {
+    await sendTelegram(
+      `⚠️ Could not close <b>${symbol}</b>: ${failed || 'unknown error'}. Position left open.`,
+      token,
+      chatId,
+      { replyMarkup: tradeAlertMarkup(symbol) }
+    );
+    return;
+  }
+
+  if (cfg.mode === 'virtual') {
+    const settings = await fetchSettingsRow();
+    const balance = readVirtualBalance(settings || {});
+    await writeVirtualBalance(cfg.id, balance + invested + realized, cfg);
+  }
+
+  const avgEntry =
+    invested > 0
+      ? positions.reduce((sum, tr) => sum + Number(tr.entry_price) * Number(tr.quantity || 0), 0) /
+        Math.max(
+          1e-12,
+          positions.reduce((sum, tr) => sum + Number(tr.quantity || 0), 0)
+        )
+      : Number(positions[0].entry_price || 0);
+  const roiPct = invested > 0 ? (realized / invested) * 100 : 0;
+
+  await appendLog(
+    'TRADE',
+    `[${MODE_LABEL[cfg.mode]}] TELEGRAM CLOSE ${symbol} (${closed} orders) @ $${livePx} | Realized ${
+      realized >= 0 ? '+' : ''
+    }$${realized.toFixed(2)} (${roiPct >= 0 ? '+' : ''}${roiPct.toFixed(2)}%)`,
+    symbol
+  );
+
+  await sendTelegram(
+    [
+      `🛑 <b>${symbol} CLOSED FROM TELEGRAM</b>`,
+      `Orders closed: <b>${closed}</b> · Workspace: <b>${MODE_LABEL[cfg.mode]}</b>`,
+      `Exit: $${livePx.toFixed(4)} · Avg entry: $${avgEntry.toFixed(4)}`,
+      `Realized PnL: <b>${realized >= 0 ? '+' : ''}$${realized.toFixed(2)} USDT</b> (${
+        roiPct >= 0 ? '+' : ''
+      }${roiPct.toFixed(2)}%)`,
+      failed ? `\n⚠️ Some orders could not close: ${failed}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    token,
+    chatId,
+    { replyMarkup: tradeAlertMarkup(symbol) }
+  );
+
+  if (realized > 0) {
+    await sendPnlCard(cfg, {
+      symbol,
+      pnlUsdt: realized,
+      pnlPct: roiPct,
+      entryPrice: avgEntry,
+      exitPrice: livePx,
+    });
+  }
+}
+
+async function handleTelegramCallback(callbackQuery, token, chatId) {
+  const id = String(callbackQuery?.id || '');
+  const data = String(callbackQuery?.data || '');
+  const incomingChatId = String(callbackQuery?.message?.chat?.id ?? '').trim();
+  if (incomingChatId !== chatId) {
+    await answerCallbackQuery(token, id, 'Unauthorized chat', true);
+    return;
+  }
+
+  const settings = await fetchSettingsRow();
+  if (!settings) {
+    await answerCallbackQuery(token, id, 'Settings row not found', true);
+    return;
+  }
+  const cfg = resolveTradingConfig(settings);
+  cfg.id = settings.id;
+  cfg.apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
+  cfg.apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
+  cfg.useTestnet =
+    process.env.BINANCE_TESTNET === 'false' ? false : ENV_TESTNET || Boolean(settings.use_testnet);
+  cfg.hasCredentials = Boolean(cfg.apiKey && cfg.apiSecret);
+
+  if (data === 'refresh_status') {
+    await answerCallbackQuery(token, id, 'Refreshing live snapshot…');
+    await sendTelegram(
+      await buildLiveStatusMessage(cfg, settings),
+      token,
+      chatId,
+      { replyMarkup: tradeAlertMarkup(null) }
+    );
+    return;
+  }
+
+  if (data.startsWith('close_symbol:')) {
+    const symbol = data.slice('close_symbol:'.length).trim().toUpperCase();
+    if (!symbol) {
+      await answerCallbackQuery(token, id, 'Missing symbol', true);
+      return;
+    }
+    if (cfg.mode === 'live' && !cfg.hasCredentials) {
+      await answerCallbackQuery(token, id, 'Binance API keys missing — cannot close LIVE', true);
+      return;
+    }
+    await answerCallbackQuery(token, id, `Closing ${symbol}…`);
+    await closeSymbolFromTelegram(symbol, cfg, token, chatId);
+    return;
+  }
+
+  await answerCallbackQuery(token, id, 'Unknown action', true);
+}
+
 async function pollTelegramUpdates() {
   if (telegramPolling) return;
   telegramPolling = true;
@@ -1162,7 +1694,7 @@ async function pollTelegramUpdates() {
         offset: telegramUpdateOffset,
         timeout: TELEGRAM_POLL_TIMEOUT_SECONDS,
         limit: 20,
-        allowed_updates: ['message'],
+        allowed_updates: ['message', 'callback_query'],
       },
       (TELEGRAM_POLL_TIMEOUT_SECONDS + 20) * 1000
     );
@@ -1179,6 +1711,13 @@ async function pollTelegramUpdates() {
       if (Number.isFinite(updateId)) {
         telegramUpdateOffset = Math.max(telegramUpdateOffset, updateId + 1);
       }
+      const callbackQuery = update?.callback_query;
+      if (callbackQuery) {
+        console.log(`[TELEGRAM BOT] Callback ${callbackQuery.data} from chat ${callbackQuery?.message?.chat?.id}`);
+        await handleTelegramCallback(callbackQuery, token, chatId);
+        continue;
+      }
+
       const message = update?.message;
       const text = String(message?.text || '').trim();
       if (!text) continue;
@@ -1447,6 +1986,19 @@ async function runCycle() {
       const livePx = prices[symbol];
       if (!livePx) continue;
       const pairOpen = activeTrades.filter((t) => t.pair === symbol);
+      // Flash-Crash & Volatility Guard: pause NEW entries and DCA re-buys for a
+      // pair that just lost >=4% in five minutes. Exits below still run normally.
+      const crashGuard = await checkCrashGuard(symbol, cfg);
+      if (crashGuard.blocked) {
+        await warnThrottled(
+          `crash-guard-${symbol}`,
+          `Crash Guard active on ${symbol} (${crashGuard.dropPct.toFixed(
+            2
+          )}% 5m drop) — entries and DCA re-buys paused for ${crashGuard.minutesRemaining}m.`,
+          symbol,
+          null
+        );
+      }
 
       if (pairOpen.length > 0) {
         const totalInvested = pairOpen.reduce((s, t) => s + Number(t.invested_usdt || 0), 0);
@@ -1551,21 +2103,39 @@ async function runCycle() {
                     )} peak — profit locked in.`
                   : 'Circuit breaker: stop-loss exit executed.',
             });
+
+            // Shareable Binance-style PnL card for every profitable close.
+            if (netPnlAfterFees > 0) {
+              const totalQty = pairOpen.reduce((sum, t) => sum + Number(t.quantity || 0), 0);
+              const avgEntryPx = totalQty > 0 ? totalInvested / totalQty : livePx;
+              await sendPnlCard(cfg, {
+                symbol,
+                pnlUsdt: netPnlAfterFees,
+                pnlPct: aggPct,
+                entryPrice: avgEntryPx,
+                exitPrice: livePx,
+              });
+            }
           }
           continue;
         }
 
         // DCA re-buy on a dip below the lowest open entry.
-        if (!dailyLossBreached && cfg.dcaEnabled && pairOpen.length < cfg.dcaMaxBuys) {
+        if (!dailyLossBreached && !crashGuard.blocked && cfg.dcaEnabled && pairOpen.length < cfg.dcaMaxBuys) {
           const lowestEntry = Math.min(...pairOpen.map((t) => Number(t.entry_price)));
           const dropPct = ((lowestEntry - livePx) / lowestEntry) * 100;
-          if (dropPct >= cfg.dcaStepPct && totalInvested + cfg.lotRequested <= cfg.maxPerPair) {
+          // Auto-compounding sizes every DCA ticket from the current balance too.
+          const dcaNotional = resolveEntryNotional(
+            cfg,
+            cfg.mode === 'live' ? liveSpot : virtualBalance
+          );
+          if (dropPct >= cfg.dcaStepPct && totalInvested + dcaNotional <= cfg.maxPerPair) {
             let row = null;
             if (cfg.mode === 'live') {
               const buy = await buyWithGuards(
                 symbol,
                 'DCA',
-                cfg.lotRequested,
+                dcaNotional,
                 livePx,
                 cfg.apiKey,
                 cfg.apiSecret,
@@ -1587,12 +2157,12 @@ async function runCycle() {
               if (!(await insertTradeWithMode(row, 'live'))) continue;
               liveSpot = Math.max(0, liveSpot - buy.notional);
             } else {
-              if (virtualBalance < cfg.lotRequested) {
+              if (virtualBalance < dcaNotional) {
                 await warnThrottled(
                   `virtual-funds-${symbol}`,
                   `DEMO ${symbol} DCA skipped — virtual balance ${money(
                     virtualBalance
-                  )} is below the ${money(cfg.lotRequested)} lot.`,
+                  )} is below the ${money(dcaNotional)} lot.`,
                   symbol,
                   cfg
                 );
@@ -1602,14 +2172,14 @@ async function runCycle() {
                 mode: 'virtual',
                 symbol,
                 price: livePx,
-                quantity: Number((cfg.lotRequested / livePx).toFixed(8)),
-                notional: cfg.lotRequested,
+                quantity: Number((dcaNotional / livePx).toFixed(8)),
+                notional: dcaNotional,
                 tpPct: cfg.tpPct,
                 zeroLoss: cfg.zeroLoss,
                 stopLossPct: cfg.stopLossPct,
               });
               if (!(await insertTradeWithMode(row, 'virtual'))) continue;
-              virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - cfg.lotRequested, cfg);
+              virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - dcaNotional, cfg);
             }
             activeTrades.push(row);
             const msg = `DCA RE-BUY #${pairOpen.length + 1} ${symbol} @ $${livePx} (-${dropPct.toFixed(
@@ -1627,7 +2197,7 @@ async function runCycle() {
             });
           }
         }
-      } else if (!dailyLossBreached && activeTrades.length < cfg.maxOpenTrades) {
+      } else if (!dailyLossBreached && !crashGuard.blocked && activeTrades.length < cfg.maxOpenTrades) {
         if (cfg.mode === 'live' && !cfg.hasCredentials) {
           await warnThrottled(
             'live-missing-keys',
@@ -1652,12 +2222,32 @@ async function runCycle() {
         const favorableMomentum = priceChangePercent > -5.0;
 
         if (hasHealthyVolume && favorableMomentum) {
+          // Multi-timeframe confirmation: a 1m/5m BUY is vetoed when the 1h trend
+          // is not bullish (close > EMA20) with RSI inside the 40-72 buy band.
+          if (cfg.multiTimeframeFilter) {
+            const trend = await checkHigherTimeframeTrend(symbol, cfg);
+            if (!trend.ok) {
+              await warnThrottled(
+                `mtf-filter-${symbol}`,
+                `MTF FILTER skipped ${symbol} entry — ${trend.reason}.`,
+                symbol,
+                null
+              );
+              continue;
+            }
+          }
+
+          // Smart auto-compounding: ticket = compoundAllocationPct% of balance.
+          const entryNotional = resolveEntryNotional(
+            cfg,
+            cfg.mode === 'live' ? liveSpot : virtualBalance
+          );
           let row = null;
           if (cfg.mode === 'live') {
             const buy = await buyWithGuards(
               symbol,
               'ENTRY',
-              cfg.lotRequested,
+              entryNotional,
               livePx,
               cfg.apiKey,
               cfg.apiSecret,
@@ -1679,12 +2269,12 @@ async function runCycle() {
             if (!(await insertTradeWithMode(row, 'live'))) continue;
             liveSpot = Math.max(0, liveSpot - buy.notional);
           } else {
-            if (virtualBalance < cfg.lotRequested) {
+            if (virtualBalance < entryNotional) {
               await warnThrottled(
                 `virtual-funds-${symbol}`,
                 `DEMO ${symbol} entry skipped — virtual balance ${money(
                   virtualBalance
-                )} is below the ${money(cfg.lotRequested)} lot.`,
+                )} is below the ${money(entryNotional)} lot.`,
                 symbol,
                 cfg
               );
@@ -1694,14 +2284,14 @@ async function runCycle() {
               mode: 'virtual',
               symbol,
               price: livePx,
-              quantity: Number((cfg.lotRequested / livePx).toFixed(8)),
-              notional: cfg.lotRequested,
+              quantity: Number((entryNotional / livePx).toFixed(8)),
+              notional: entryNotional,
               tpPct: cfg.tpPct,
               zeroLoss: cfg.zeroLoss,
               stopLossPct: cfg.stopLossPct,
             });
             if (!(await insertTradeWithMode(row, 'virtual'))) continue;
-            virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - cfg.lotRequested, cfg);
+            virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - entryNotional, cfg);
           }
 
           activeTrades.push(row);

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { Check, Download, Layers, ShieldCheck, TrendingUp } from 'lucide-react';
+import { Check, Download, Layers, Share2, ShieldCheck, TrendingUp, X } from 'lucide-react';
 import { SUPPORTED_PAIRS } from '../../data/demoData';
 import { audioSynth } from '../../lib/audioSynth';
 import { downloadCsvFile } from '../../lib/csvExport';
@@ -39,6 +39,8 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
   const [statusFilter, setStatusFilter] = useState<'ALL' | TradeStatus>('ALL');
   const [dateFilter, setDateFilter] = useState<DateFilter>('ALL');
   const [csvDone, setCsvDone] = useState(false);
+  // Profitable closed trade rendered as the shareable AEGIS QUANT PnL card.
+  const [shareTrade, setShareTrade] = useState<Trade | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   // Tick every second so each open position shows a live elapsed countdown.
@@ -372,7 +374,8 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                   <th className="py-2.5 pr-3 text-right">{t.currentPrice}</th>
                   <th className="py-2.5 pr-3 text-right">{t.invested}</th>
                   <th className="py-2.5 pr-3 text-right">{t.pnlLabel}</th>
-                  <th className="py-2.5 text-right">TIME</th>
+                  <th className="py-2.5 pr-3 text-right">TIME</th>
+                  <th className="py-2.5 text-right">CARD</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/70">
@@ -424,8 +427,25 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                         {isPos ? '+' : ''}${tr.profit_usdt.toFixed(2)} ({isPos ? '+' : ''}
                         {tr.profit_pct.toFixed(2)}%)
                       </td>
-                      <td className="py-2.5 text-right text-slate-400">
+                      <td className="py-2.5 pr-3 text-right text-slate-400">
                         {new Date(tr.opened_at).toLocaleDateString()}
+                      </td>
+                      <td className="py-2.5 text-right">
+                        {tr.status === 'CLOSED' && tr.profit_usdt > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              audioSynth.playClick();
+                              setShareTrade(tr);
+                            }}
+                            className="inline-flex min-h-[28px] cursor-pointer items-center gap-1 rounded border border-amber-500/45 bg-amber-500/12 px-2 py-0.5 font-mono-tech text-[10px] font-bold text-amber-200 transition-colors hover:bg-amber-500/22"
+                          >
+                            <Share2 className="h-3 w-3" />
+                            PnL Card
+                          </button>
+                        ) : (
+                          <span className="text-slate-700">—</span>
+                        )}
                       </td>
                     </tr>
                   );
@@ -435,6 +455,97 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
           </div>
         )}
       </TerminalPanel>
+
+      {/* Shareable AEGIS QUANT PnL card (same design the worker sends to Telegram) */}
+      {shareTrade && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Aegis Quant PnL card"
+          onClick={() => setShareTrade(null)}
+        >
+          <motion.div
+            initial={reducedMotion ? false : { opacity: 0, scale: 0.94 }}
+            animate={{ opacity: 1, scale: 1 }}
+            onClick={(event) => event.stopPropagation()}
+            className="relative w-full max-w-md overflow-hidden rounded-2xl border-2 border-amber-400/60 bg-[#05080d] p-6 shadow-[0_0_60px_rgba(16,185,129,0.25)]"
+          >
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_85%_10%,rgba(16,185,129,0.28),transparent_60%)]" />
+            <button
+              type="button"
+              onClick={() => setShareTrade(null)}
+              aria-label="Close PnL card"
+              className="absolute top-3 right-3 z-10 flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-100"
+            >
+              <X className="h-4 w-4" />
+            </button>
+
+            <div className="relative">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="font-display text-lg font-black tracking-wider text-amber-300">
+                    AEGIS QUANT
+                  </p>
+                  <p className="font-mono-tech text-[10px] tracking-[0.2em] text-slate-400">
+                    MARKET TERMINAL PRO
+                  </p>
+                </div>
+                <span
+                  className={`rounded-full border px-2.5 py-1 font-mono-tech text-[10px] font-bold ${
+                    (shareTrade.mode ?? 'LIVE') === 'LIVE'
+                      ? 'border-rose-400/50 bg-rose-500/12 text-rose-200'
+                      : 'border-cyan-400/50 bg-cyan-500/12 text-cyan-200'
+                  }`}
+                >
+                  {(shareTrade.mode ?? 'LIVE') === 'LIVE' ? 'LIVE SPOT' : 'DEMO ENGINE'}
+                </span>
+              </div>
+
+              <p className="mt-5 font-display text-4xl font-black tracking-wide text-slate-50">
+                {shareTrade.pair}
+              </p>
+              <p className="font-mono-tech text-xs tracking-widest text-emerald-400">LONG SPOT</p>
+
+              <p className="mt-5 font-mono-tech text-[10px] tracking-widest text-slate-500">
+                RETURN ON INVESTMENT
+              </p>
+              <p className="font-display text-6xl font-black text-emerald-400">
+                +{shareTrade.profit_pct.toFixed(2)}%
+              </p>
+
+              <p className="mt-3 font-mono-tech text-[10px] tracking-widest text-slate-500">
+                NET PROFIT
+              </p>
+              <p className="font-display text-3xl font-black text-emerald-200">
+                +${shareTrade.profit_usdt.toFixed(2)} USD
+              </p>
+
+              <div className="mt-5 grid grid-cols-2 gap-3 font-mono-tech">
+                <div className="rounded-xl border border-slate-700/70 bg-slate-900/60 p-3">
+                  <p className="text-[10px] tracking-widest text-slate-500">ENTRY PRICE</p>
+                  <p className="text-base font-bold text-slate-200">${shareTrade.entry_price}</p>
+                </div>
+                <div className="rounded-xl border border-slate-700/70 bg-slate-900/60 p-3">
+                  <p className="text-[10px] tracking-widest text-slate-500">EXIT PRICE</p>
+                  <p className="text-base font-bold text-slate-200">
+                    ${shareTrade.exit_price ?? shareTrade.current_price}
+                  </p>
+                </div>
+              </div>
+
+              <p className="mt-4 font-mono-tech text-[10px] text-slate-500">
+                CLOSED{' '}
+                {new Date(shareTrade.closed_at ?? shareTrade.opened_at)
+                  .toISOString()
+                  .replace('T', ' ')
+                  .slice(0, 16)}{' '}
+                UTC · auto-trade-qxp7.onrender.com
+              </p>
+            </div>
+          </motion.div>
+        </div>
+      )}
     </div>
   );
 };

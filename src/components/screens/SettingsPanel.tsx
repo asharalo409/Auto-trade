@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Activity,
   Check,
   Clock,
   Copy,
@@ -136,6 +137,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       trailing_stop_pct: draft.trailing_stop_pct ?? 1.5,
       daily_max_loss_pct: draft.daily_max_loss_pct ?? 5,
       voice_language: draft.voice_language ?? 'en',
+      auto_compounding: draft.auto_compounding ?? false,
+      compound_allocation_pct: draft.compound_allocation_pct ?? 5,
+      multi_timeframe_filter: draft.multi_timeframe_filter ?? true,
       enabled_pairs: draft.enabled_pairs,
       telegram_enabled: draft.telegram_enabled,
       sound_enabled: draft.sound_enabled,
@@ -993,6 +997,100 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 />
                 <p className="mt-1 font-mono-tech text-[10px] text-slate-500">
                   Resets at 00:00 Asia/Dhaka · 0% disables it
+                </p>
+              </div>
+            </div>
+
+            {/* Smart Auto-Compounding + Multi-Timeframe Confirmation (worker-enforced) */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-xl border border-amber-500/35 bg-amber-500/8 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <DollarSign className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+                    <div>
+                      <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-amber-200 uppercase">
+                        <span>Auto-Compounding</span>
+                        <InfoTip
+                          text="Sizes every new entry and DCA ticket as a % of the current workspace balance, so position sizes grow with profit instead of a fixed dollar lot."
+                          label="Auto-Compounding"
+                        />
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-slate-300">
+                        Scales each ticket with balance
+                      </p>
+                    </div>
+                  </div>
+                  <SciFiSwitch
+                    checked={draft.auto_compounding ?? false}
+                    onChange={(v) => {
+                      audioSynth.playToggle(v);
+                      setDraft((p) => ({ ...p, auto_compounding: v }));
+                      void onSave({ auto_compounding: v });
+                    }}
+                    label="Auto-Compounding"
+                    accent="amber"
+                  />
+                </div>
+
+                {(draft.auto_compounding ?? false) && (
+                  <div className="mt-3 border-t border-amber-500/20 pt-3">
+                    <div className="mb-1 flex justify-between font-mono-tech text-[11px]">
+                      <span className="text-slate-300">Allocation per trade</span>
+                      <span className="font-bold text-amber-300">
+                        {(draft.compound_allocation_pct ?? 5).toFixed(1)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={50}
+                      step={0.5}
+                      value={draft.compound_allocation_pct ?? 5}
+                      onChange={(e) =>
+                        setDraft((p) => ({
+                          ...p,
+                          compound_allocation_pct: Number(e.target.value),
+                        }))
+                      }
+                      className="w-full accent-amber-400"
+                    />
+                    <p className="mt-1 font-mono-tech text-[10px] text-slate-500">
+                      Clamped to Binance&apos;s $5.50 minimum in LIVE
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-cyan-500/35 bg-cyan-500/8 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <Activity className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
+                    <div>
+                      <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-cyan-200 uppercase">
+                        <span>Multi-Timeframe Filter</span>
+                        <InfoTip
+                          text="Blocks a 1m/5m/15m BUY unless the 1h candle closes above its EMA20 with 1h RSI between 40 and 72, so the engine stops buying into macro downtrends."
+                          label="Multi-Timeframe Filter"
+                        />
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-slate-300">
+                        1h trend confirmation · RSI 40-72
+                      </p>
+                    </div>
+                  </div>
+                  <SciFiSwitch
+                    checked={draft.multi_timeframe_filter ?? true}
+                    onChange={(v) => {
+                      audioSynth.playToggle(v);
+                      setDraft((p) => ({ ...p, multi_timeframe_filter: v }));
+                      void onSave({ multi_timeframe_filter: v });
+                    }}
+                    label="Multi-Timeframe Filter"
+                    accent="cyan"
+                  />
+                </div>
+                <p className="mt-3 border-t border-cyan-500/20 pt-2 font-mono-tech text-[10px] text-slate-500">
+                  Crash Guard (±4% / 5m) and trailing exits always stay armed.
                 </p>
               </div>
             </div>

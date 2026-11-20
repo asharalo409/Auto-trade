@@ -32,6 +32,7 @@ import {
   BotSettings,
   BotStatus,
   CandleStyle,
+  CrashGuardState,
   CoreVisualMode,
   EquityPoint,
   EquityTimeframe,
@@ -163,6 +164,15 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
       row.voice_language === 'bn_en' || row.voice_language === 'en'
         ? row.voice_language
         : (fallback.voice_language ?? 'en'),
+    auto_compounding: Boolean(row.auto_compounding ?? fallback.auto_compounding),
+    compound_allocation_pct: Math.min(
+      100,
+      Math.max(0.5, Number(row.compound_allocation_pct ?? fallback.compound_allocation_pct ?? 5))
+    ),
+    multi_timeframe_filter:
+      row.multi_timeframe_filter === null || row.multi_timeframe_filter === undefined
+        ? (fallback.multi_timeframe_filter ?? true)
+        : Boolean(row.multi_timeframe_filter),
     mode: ((row.mode ?? row.workspace_mode ?? row.trading_mode ?? fallback.mode) as TradingMode),
     enabled_pairs,
     telegram_enabled: telegramEnabled,
@@ -390,6 +400,8 @@ export function useTradingTerminal() {
   // Telegram's mobile WebView answers "locked" until the first real gesture, so the
   // header renders an explicit Tap to Unlock Audio pill instead of pretending it works.
   const [audioReady, setAudioReady] = useState<boolean>(() => voiceAnnouncer.isAudioUnlocked());
+  // Flash-crash circuit breaker state, polled from the 24/7 worker (/api/guards).
+  const [crashGuards, setCrashGuards] = useState<CrashGuardState[]>([]);
 
   const [alertEnabledPairs, setAlertEnabledPairs] = useState<string[]>(() =>
     loadJson<string[]>(STORAGE_ALERT_PAIRS_KEY, [...SUPPORTED_PAIRS])
@@ -468,6 +480,31 @@ export function useTradingTerminal() {
     return () => {
       unsubscribe();
       window.clearInterval(retry);
+    };
+  }, []);
+
+  // The worker owns the crash guard; 30s polling keeps the header badge honest without
+  // a websocket. Failures are silent so a sleeping worker never breaks the terminal.
+  useEffect(() => {
+    let cancelled = false;
+    const loadGuards = async () => {
+      try {
+        const res = await fetch(`${WORKER_URL}/api/guards`, {
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setCrashGuards(Array.isArray(data?.guards) ? data.guards : []);
+      } catch {
+        // worker offline — leave the last known state alone
+      }
+    };
+    void loadGuards();
+    const timer = window.setInterval(() => void loadGuards(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -1643,7 +1680,10 @@ export function useTradingTerminal() {
         patch.candle_style !== undefined ||
         patch.voice_language !== undefined ||
         patch.trailing_stop_pct !== undefined ||
-        patch.daily_max_loss_pct !== undefined
+        patch.daily_max_loss_pct !== undefined ||
+        patch.auto_compounding !== undefined ||
+        patch.compound_allocation_pct !== undefined ||
+        patch.multi_timeframe_filter !== undefined
       ) {
         const uiSync = {
           sound_enabled: next.sound_enabled,
@@ -1657,6 +1697,9 @@ export function useTradingTerminal() {
           voice_language: next.voice_language ?? 'en',
           trailing_stop_pct: next.trailing_stop_pct ?? 1.5,
           daily_max_loss_pct: next.daily_max_loss_pct ?? 5,
+          auto_compounding: next.auto_compounding ?? false,
+          compound_allocation_pct: next.compound_allocation_pct ?? 5,
+          multi_timeframe_filter: next.multi_timeframe_filter ?? true,
         };
         setDemoSettings((p) => ({ ...p, ...uiSync }));
         setLiveSettings((p) => ({ ...p, ...uiSync }));
@@ -1702,6 +1745,9 @@ export function useTradingTerminal() {
           trailing_stop_pct: next.trailing_stop_pct ?? 1.5,
           daily_max_loss_pct: next.daily_max_loss_pct ?? 5,
           voice_language: next.voice_language ?? 'en',
+          auto_compounding: next.auto_compounding ?? false,
+          compound_allocation_pct: next.compound_allocation_pct ?? 5,
+          multi_timeframe_filter: next.multi_timeframe_filter ?? true,
           dca_enabled: next.dca_enabled,
           dca_step_pct: next.dca_step_pct,
           dca_max_buys: next.dca_max_buys,
@@ -2864,6 +2910,7 @@ export function useTradingTerminal() {
     resetVirtualBalance,
     voiceEnabled,
     audioReady,
+    crashGuards,
     toggleVoice,
     testVoice,
     speakBalance,

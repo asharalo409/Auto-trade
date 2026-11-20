@@ -123,6 +123,9 @@ alter table public.settings add column if not exists telegram_chat_id text;
 alter table public.settings add column if not exists trailing_stop_pct numeric default 1.5;
 alter table public.settings add column if not exists daily_max_loss_pct numeric default 5;
 alter table public.settings add column if not exists voice_language text default 'en';
+alter table public.settings add column if not exists auto_compounding boolean default false;
+alter table public.settings add column if not exists compound_allocation_pct numeric default 5;
+alter table public.settings add column if not exists multi_timeframe_filter boolean default true;
 alter table public.trades add column if not exists mode text default 'live';
 alter table public.trades add column if not exists peak_price numeric;`;
 
@@ -145,6 +148,9 @@ export const INITIAL_DEMO_SETTINGS: BotSettings = {
   trailing_stop_pct: 1.5,
   daily_max_loss_pct: 5,
   voice_language: 'en',
+  auto_compounding: false,
+  compound_allocation_pct: 5,
+  multi_timeframe_filter: true,
   mode: 'DEMO',
   enabled_pairs: [
     'BTCUSDT',

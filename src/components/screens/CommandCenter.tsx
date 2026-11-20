@@ -45,6 +45,7 @@ import {
   BotStatus,
   CandleStyle,
   CoreVisualMode,
+  CrashGuardState,
   EquityPoint,
   EquityTimeframe,
   LogEntry,
@@ -97,6 +98,8 @@ interface CommandCenterProps {
   alertEnabledPairs: string[];
   voiceEnabled: boolean;
   audioReady: boolean;
+  /** Pairs currently paused by the worker's flash-crash circuit breaker. */
+  crashGuards: CrashGuardState[];
   onToggleVoice: (enabled: boolean) => void;
   onTestVoice: () => void;
   onCloseAll: () => Promise<{ closed: number; realizedPnl: number }>;
@@ -161,6 +164,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   alertEnabledPairs,
   voiceEnabled,
   audioReady,
+  crashGuards,
   onToggleVoice,
   onTestVoice,
   onCloseAll,
@@ -871,6 +875,43 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         }}
         onOpenCalculator={handleOpenCalculator}
       />
+
+      {/* Crash Guard risk badge — live circuit-breaker state from the 24/7 worker */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono-tech text-[10px] font-bold tracking-wider uppercase ${
+            crashGuards.length > 0
+              ? 'border-rose-400/60 bg-rose-500/15 text-rose-200 shadow-[0_0_16px_rgba(244,63,94,0.28)]'
+              : 'border-emerald-500/35 bg-emerald-500/8 text-emerald-300/90'
+          }`}
+          title={
+            crashGuards.length > 0
+              ? `Paused pairs: ${crashGuards.map((g) => `${g.symbol} ${g.dropPct}%`).join(', ')}`
+              : 'No pair is in a flash-crash pause. Entries pause automatically on a 4% 5m drop.'
+          }
+        >
+          <ShieldAlert className="h-3 w-3" />
+          {crashGuards.length > 0 ? '🛡️ Crash Guard: Active' : '🛡️ Crash Guard: Armed'}
+        </span>
+        {crashGuards.map((guard) => (
+          <span
+            key={guard.symbol}
+            className="rounded border border-rose-400/40 bg-rose-500/10 px-2 py-1 font-mono-tech text-[10px] font-semibold text-rose-200"
+          >
+            {guard.symbol} {guard.dropPct.toFixed(2)}% · {guard.minutesRemaining}m
+          </span>
+        ))}
+        {settings.multi_timeframe_filter && (
+          <span className="rounded border border-cyan-500/35 bg-cyan-500/8 px-2 py-1 font-mono-tech text-[10px] font-semibold text-cyan-300">
+            1H TREND FILTER ON
+          </span>
+        )}
+        {settings.auto_compounding && (
+          <span className="rounded border border-amber-500/35 bg-amber-500/8 px-2 py-1 font-mono-tech text-[10px] font-semibold text-amber-300">
+            COMPOUND {Math.round((settings.compound_allocation_pct ?? 5) * 10) / 10}%/TRADE
+          </span>
+        )}
+      </div>
 
       {/* Manual Execution Deck — quick buy/sell + emergency close-all */}
       <ManualExecutionDeck

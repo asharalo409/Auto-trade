@@ -522,6 +522,7 @@ export default function App() {
                   onResetVirtual={() => terminal.resetVirtualBalance(10000)}
                   voiceEnabled={terminal.voiceEnabled}
                   audioReady={terminal.audioReady}
+                  crashGuards={terminal.crashGuards}
                   onToggleVoice={terminal.toggleVoice}
                   onTestVoice={terminal.testVoice}
                   onCloseAll={terminal.closeAllPositions}

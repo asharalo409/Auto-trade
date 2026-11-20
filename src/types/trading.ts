@@ -120,6 +120,12 @@ export interface BotSettings {
   daily_max_loss_pct?: number;
   /** 'en' = English only, 'bn_en' = Bengali summary then English detail. */
   voice_language?: 'en' | 'bn_en';
+  /** Sizes each ticket as `compound_allocation_pct`% of the live balance. */
+  auto_compounding?: boolean;
+  /** Auto-compounding allocation, in % of workspace balance (default 5%). */
+  compound_allocation_pct?: number;
+  /** Requires the 1h trend (close > EMA20, RSI 40-72) before any fresh BUY. */
+  multi_timeframe_filter?: boolean;
   mode: TradingMode;
   enabled_pairs: string[];
   telegram_enabled: boolean;
@@ -130,6 +136,16 @@ export interface BotSettings {
   last_heartbeat: string;
   balance_usdt?: number;
   updated_at?: string;
+}
+
+/** Pair currently paused by the worker's flash-crash circuit breaker. */
+export interface CrashGuardState {
+  symbol: string;
+  dropPct: number;
+  active: boolean;
+  triggeredAt?: string;
+  resumeAt?: string;
+  minutesRemaining: number;
 }
 
 export interface Trade {
