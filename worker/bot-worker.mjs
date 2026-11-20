@@ -178,6 +178,77 @@ if (PORT > 0) {
         return;
       }
 
+      // Manual execution from the Mini App / web terminal: a real signed Binance Spot
+      // MARKET order. The exchange decides the fill; the caller records that fill only.
+      if (req.method === 'POST' && pathname === '/api/order') {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            const { data: settingsRow } = await supabase.from('settings').select('*').limit(1).maybeSingle();
+            const apiKey = (ENV_BINANCE_KEY || data.apiKey || settingsRow?.binance_api_key || '').trim();
+            const apiSecret = (ENV_BINANCE_SECRET || data.apiSecret || settingsRow?.binance_api_secret || '').trim();
+            const useTestnet =
+              process.env.BINANCE_TESTNET === 'false'
+                ? false
+                : ENV_TESTNET || Boolean(data.testnet ?? data.useTestnet ?? settingsRow?.use_testnet);
+            const symbol = String(data.symbol || '').trim().toUpperCase();
+            const side = String(data.side || '').trim().toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+            const quoteOrderQty = Number(data.quoteOrderQty || 0);
+            const quantity = Number(data.quantity || 0);
+
+            if (!apiKey || !apiSecret) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Missing Binance API credentials' }));
+              return;
+            }
+            if (!symbol) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Missing symbol' }));
+              return;
+            }
+            if (side === 'BUY' && (!Number.isFinite(quoteOrderQty) || quoteOrderQty < BINANCE_MIN_ORDER_USDT)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: `Order notional must be at least $${BINANCE_MIN_ORDER_USDT.toFixed(2)} USDT`,
+                })
+              );
+              return;
+            }
+            if (side === 'SELL' && (!Number.isFinite(quantity) || quantity <= 0)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Missing sell quantity' }));
+              return;
+            }
+
+            const order = await placeBinanceMarketOrder(
+              symbol,
+              side,
+              quoteOrderQty,
+              quantity,
+              apiKey,
+              apiSecret,
+              useTestnet
+            );
+            await appendLog(
+              'TRADE',
+              `[MANUAL] ${side} ${symbol} filled: qty ${order.executedQty} for ${order.cummulativeQuoteQty} USDT`,
+              symbol
+            );
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, order }));
+          } catch (err) {
+            console.error('[MANUAL ORDER ERROR]', err.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not Found' }));
     })
@@ -632,6 +703,8 @@ function resolveTradingConfig(settings) {
     stopLossEnabled: !zeroLoss && Boolean(settings.stop_loss_enabled),
     maxPerPair: Number(settings.max_amount_per_pair || 500),
     maxOpenTrades: Math.max(1, Number(settings.max_open_trades || 5)),
+    trailingStopPct: Math.max(0, Number(settings.trailing_stop_pct ?? 1.5)),
+    dailyMaxLossPct: Math.max(0, Number(settings.daily_max_loss_pct ?? 5)),
   };
 }
 
@@ -685,6 +758,112 @@ async function sendWarningTelegram(cfg, message) {
     cfg.telegramToken,
     cfg.telegramChatId
   );
+}
+
+/* ------------------------------------------------------------------------- *
+ * Midnight daily PnL report — 00:00 Asia/Dhaka (18:00 UTC)
+ * ------------------------------------------------------------------------- */
+
+const BDT_PER_USD = 122.4;
+const DHAKA_OFFSET_MS = 6 * 3600_000;
+
+/** Start of the current Asia/Dhaka day, expressed as a UTC Date. */
+function dhakaDayStartUtc(now = new Date()) {
+  const dhaka = new Date(now.getTime() + DHAKA_OFFSET_MS);
+  dhaka.setUTCHours(0, 0, 0, 0);
+  return new Date(dhaka.getTime() - DHAKA_OFFSET_MS);
+}
+
+function dhakaDateKey(now = new Date()) {
+  return new Date(now.getTime() + DHAKA_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+let lastDailyReportKey = null;
+
+async function sendDailyPnlReport() {
+  const settings = await fetchSettingsRow();
+  if (!settings) return false;
+  const cfg = resolveTradingConfig(settings);
+
+  const since = new Date(Date.now() - 24 * 3600_000).toISOString();
+  const { data: rows } = await supabase
+    .from('trades')
+    .select('*')
+    .eq('status', 'CLOSED')
+    .gte('closed_at', since);
+  const closed = (rows || []).filter((row) => tradeModeOf(row) === cfg.mode);
+  const totalTrades = closed.length;
+  const wins = closed.filter((row) => Number(row.profit_usdt || 0) > 0).length;
+  const losses = Math.max(0, totalTrades - wins);
+  const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
+  const realized = closed.reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
+
+  let liveSpot = Number(settings.balance_usdt || 0);
+  let liveTotal = liveSpot;
+  const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
+  const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
+  const useTestnet =
+    process.env.BINANCE_TESTNET === 'false' ? false : ENV_TESTNET || Boolean(settings.use_testnet);
+  if (apiKey && apiSecret) {
+    try {
+      const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
+      if (portfolio) {
+        liveSpot = portfolio.spot;
+        liveTotal = portfolio.total;
+      }
+    } catch (err) {
+      console.warn('[DAILY REPORT] Portfolio sync skipped:', err.message);
+    }
+  }
+
+  const virtualBalance = readVirtualBalance(settings);
+  const bdtRealized = Math.round(realized * BDT_PER_USD);
+  const bdtLive = Math.round(liveTotal * BDT_PER_USD);
+  const bdtVirtual = Math.round(virtualBalance * BDT_PER_USD);
+
+  const lines = [
+    '<b>📊 AEGIS DAILY REPORT</b>',
+    `🗓 ${dhakaDateKey()} · Asia/Dhaka · past 24h`,
+    `🎛 Workspace: <b>${MODE_LABEL[cfg.mode]}</b> · Engine ${
+      cfg.isRunning ? '🟢 RUNNING' : '⚪ STOPPED'
+    }`,
+    '',
+    `📈 Trades closed: <b>${totalTrades}</b>`,
+    `✅ Win rate: <b>${winRate.toFixed(1)}%</b> (${wins}W / ${losses}L)`,
+    `💰 Realized PnL: <b>${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}</b> (৳${bdtRealized.toLocaleString(
+      'en-US'
+    )})`,
+    '',
+    `🏦 Live portfolio: $${liveTotal.toFixed(2)} · tradeable Spot $${liveSpot.toFixed(2)} (৳${bdtLive.toLocaleString(
+      'en-US'
+    )})`,
+    `🧪 Virtual balance: $${virtualBalance.toFixed(2)} (৳${bdtVirtual.toLocaleString('en-US')})`,
+  ];
+
+  if (!cfg.telegramEnabled) return false;
+  await sendTelegram(lines.join('\n'), cfg.telegramToken, cfg.telegramChatId);
+  await appendLog(
+    'INFO',
+    `[${MODE_LABEL[cfg.mode]}] Daily report sent — ${totalTrades} trades, ${winRate.toFixed(
+      1
+    )}% win rate, realized $${realized.toFixed(2)}.`
+  );
+  return true;
+}
+
+/** Fires once per Dhaka day during the first ten minutes after local midnight. */
+async function dailyReportLoop() {
+  try {
+    const dhaka = new Date(Date.now() + DHAKA_OFFSET_MS);
+    if (dhaka.getUTCHours() !== 0 || dhaka.getUTCMinutes() > 10) return;
+    const key = dhakaDateKey();
+    if (lastDailyReportKey === key) return;
+    lastDailyReportKey = key;
+    console.log(`[DAILY REPORT] Sending midnight summary for ${key}`);
+    await sendDailyPnlReport();
+  } catch (err) {
+    console.warn('[DAILY REPORT ERROR]', err.message);
+  }
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1204,13 +1383,63 @@ async function runCycle() {
       const profitPct = Number(
         ((profitUsdt / Math.max(0.01, Number(tr.invested_usdt))) * 100).toFixed(2)
       );
-      await supabase
+      // Highest watermark since entry, used by the trailing stop-loss.
+      const entryPx = Number(tr.entry_price) || 0;
+      const peakPrice = Math.max(Number(tr.peak_price) || 0, entryPx, livePx);
+      const pnlPatch = {
+        current_price: livePx,
+        profit_usdt: profitUsdt,
+        profit_pct: profitPct,
+        peak_price: peakPrice,
+      };
+      let { error: pnlError } = await supabase
         .from('trades')
-        .update({ current_price: livePx, profit_usdt: profitUsdt, profit_pct: profitPct })
+        .update(pnlPatch)
         .eq('id', tr.id);
+      if (pnlError && isMissingColumnError(pnlError)) {
+        // Pre-upgrade schema: keep PnL live and fall back to entry-only trailing.
+        const { peak_price: _ignoredPeak, ...legacyPatch } = pnlPatch;
+        ({ error: pnlError } = await supabase
+          .from('trades')
+          .update(legacyPatch)
+          .eq('id', tr.id));
+      }
       tr.current_price = livePx;
       tr.profit_usdt = profitUsdt;
       tr.profit_pct = profitPct;
+      tr.peak_price = peakPrice;
+    }
+
+    // 2.5 Daily max-loss guard (Asia/Dhaka day): pause new risk once the realized loss
+    // for the current day reaches daily_max_loss_pct of that day's opening equity.
+    let dailyLossBreached = false;
+    if (cfg.dailyMaxLossPct > 0) {
+      try {
+        const { data: closedToday } = await supabase
+          .from('trades')
+          .select('id,mode,trading_mode,profit_usdt,closed_at')
+          .eq('status', 'CLOSED')
+          .gte('closed_at', dhakaDayStartUtc().toISOString());
+        const realizedToday = (closedToday || [])
+          .filter((row) => tradeModeOf(row) === cfg.mode)
+          .reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
+        const equity = cfg.mode === 'live' ? liveSpot : virtualBalance;
+        const dayOpenEquity = Math.max(1, equity - realizedToday);
+        const lossPct = realizedToday < 0 ? (Math.abs(realizedToday) / dayOpenEquity) * 100 : 0;
+        dailyLossBreached = lossPct >= cfg.dailyMaxLossPct;
+        if (dailyLossBreached) {
+          await warnThrottled(
+            'daily-max-loss',
+            `Daily loss guard hit — realized loss ${lossPct.toFixed(2)}% of $${dayOpenEquity.toFixed(
+              2
+            )} opening equity (limit ${cfg.dailyMaxLossPct}%). New entries paused until 00:00 Asia/Dhaka.`,
+            null,
+            cfg
+          );
+        }
+      } catch (guardErr) {
+        console.warn('[DAILY GUARD WARNING]', guardErr.message);
+      }
     }
 
     // 3. Strategy: batch sell-all (fee-aware zero-loss), DCA re-buy, fresh entries.
@@ -1231,7 +1460,22 @@ async function runCycle() {
           aggPct >= requiredTpWithFees && (!cfg.zeroLoss || netPnlAfterFees > 0);
         const stopLossTriggered = cfg.stopLossEnabled && !cfg.zeroLoss && aggPct <= -cfg.stopLossPct;
 
-        if (takeProfitTriggered || stopLossTriggered) {
+        // Trailing stop-loss: lock in profit once price retraces trailing_stop_pct from
+        // the highest watermark reached since entry.
+        const peakPrice = Math.max(
+          ...pairOpen.map((t) => Number(t.peak_price) || Number(t.entry_price) || 0)
+        );
+        const peakAboveEntry = pairOpen.some(
+          (t) => (Number(t.peak_price) || 0) > Number(t.entry_price || 0)
+        );
+        const trailingTriggered =
+          cfg.trailingStopPct > 0 &&
+          peakAboveEntry &&
+          peakPrice > 0 &&
+          livePx <= peakPrice * (1 - cfg.trailingStopPct / 100) &&
+          netPnlAfterFees > 0;
+
+        if (takeProfitTriggered || stopLossTriggered || trailingTriggered) {
           const closedAt = new Date().toISOString();
           let closedCount = 0;
           for (const tr of pairOpen) {
@@ -1279,7 +1523,11 @@ async function runCycle() {
             } else {
               liveSpot = Math.max(0, liveSpot + proceeds);
             }
-            const tag = takeProfitTriggered ? 'BATCH SELL ALL' : 'STOP-LOSS EXIT';
+            const tag = takeProfitTriggered
+              ? 'BATCH SELL ALL'
+              : trailingTriggered
+                ? 'TRAILING STOP EXIT'
+                : 'STOP-LOSS EXIT';
             const msg = `${tag} ${symbol} (${closedCount} orders) @ $${livePx} | Net PnL ${
               netPnlAfterFees >= 0 ? '+' : ''
             }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`;
@@ -1297,14 +1545,18 @@ async function runCycle() {
                 ? cfg.zeroLoss
                   ? 'Zero-Loss Shield: exit cleared the 0.2% round-trip fee.'
                   : undefined
-                : 'Circuit breaker: stop-loss exit executed.',
+                : trailingTriggered
+                  ? `Trailing stop: price fell ${cfg.trailingStopPct}% from the $${peakPrice.toFixed(
+                      2
+                    )} peak — profit locked in.`
+                  : 'Circuit breaker: stop-loss exit executed.',
             });
           }
           continue;
         }
 
         // DCA re-buy on a dip below the lowest open entry.
-        if (cfg.dcaEnabled && pairOpen.length < cfg.dcaMaxBuys) {
+        if (!dailyLossBreached && cfg.dcaEnabled && pairOpen.length < cfg.dcaMaxBuys) {
           const lowestEntry = Math.min(...pairOpen.map((t) => Number(t.entry_price)));
           const dropPct = ((lowestEntry - livePx) / lowestEntry) * 100;
           if (dropPct >= cfg.dcaStepPct && totalInvested + cfg.lotRequested <= cfg.maxPerPair) {
@@ -1375,7 +1627,7 @@ async function runCycle() {
             });
           }
         }
-      } else if (activeTrades.length < cfg.maxOpenTrades) {
+      } else if (!dailyLossBreached && activeTrades.length < cfg.maxOpenTrades) {
         if (cfg.mode === 'live' && !cfg.hasCredentials) {
           await warnThrottled(
             'live-missing-keys',
@@ -1485,6 +1737,8 @@ async function startWorker() {
   );
   await logServerPublicIp();
   void startTelegramCommandLoop();
+  // Midnight Asia/Dhaka PnL report — checked every minute, sent once per day.
+  setInterval(() => void dailyReportLoop(), 60_000);
   await runCycle();
   setInterval(runCycle, 15_000);
 }

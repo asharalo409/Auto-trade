@@ -215,8 +215,8 @@
 
 .glass-surface {
   background: rgba(13, 19, 28, 0.72);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
-  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  backdrop-filter: blur(18px) saturate(150%);
   border-color: rgba(255, 255, 255, 0.1);
   box-shadow:
     0 18px 44px -30px rgba(0, 0, 0, 0.95),
@@ -241,6 +241,100 @@
   backdrop-filter: blur(14px) saturate(140%);
   box-shadow:
     0 20px 50px -12px rgba(0, 0, 0, 0.85),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+/* Next-gen cyber HUD: mesh backdrop, holographic depth glow, conic engine border */
+.cyber-mesh-bg {
+  background-image:
+    radial-gradient(60% 50% at 50% 0%, rgba(34, 211, 238, 0.1) 0%, transparent 70%),
+    radial-gradient(55% 45% at 85% 85%, rgba(16, 185, 129, 0.12) 0%, transparent 72%),
+    linear-gradient(to right, rgba(34, 211, 238, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(34, 211, 238, 0.05) 1px, transparent 1px),
+    linear-gradient(to right, rgba(16, 185, 129, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(16, 185, 129, 0.035) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    100% 100%,
+    44px 44px,
+    44px 44px,
+    11px 11px,
+    11px 11px;
+  background-color: #060a0f;
+  animation: mesh-drift 34s linear infinite;
+}
+
+@keyframes mesh-drift {
+  0% {
+    background-position:
+      0 0, 0 0, 0 0, 0 0, 0 0, 0 0;
+  }
+  100% {
+    background-position:
+      0 0, 0 0, 44px 44px, 44px 44px, 11px 11px, 11px 11px;
+  }
+}
+
+.hud-radial-glow {
+  background:
+    radial-gradient(45% 38% at 50% 8%, rgba(34, 211, 238, 0.16) 0%, transparent 70%),
+    radial-gradient(55% 42% at 88% 92%, rgba(16, 185, 129, 0.14) 0%, transparent 74%);
+}
+
+/* Animated conic-gradient active border for a running engine */
+.hud-conic-active {
+  position: relative;
+  isolation: isolate;
+}
+
+.hud-conic-active::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(
+    from var(--hud-angle, 0deg),
+    rgba(34, 211, 238, 0) 0deg,
+    rgba(34, 211, 238, 0.95) 60deg,
+    rgba(16, 185, 129, 0.95) 140deg,
+    rgba(34, 211, 238, 0) 220deg,
+    rgba(34, 211, 238, 0) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: hud-conic-spin 4.5s linear infinite;
+  pointer-events: none;
+  z-index: 1;
+}
+
+@property --hud-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes hud-conic-spin {
+  to {
+    --hud-angle: 360deg;
+  }
+}
+
+.holographic-card {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0) 42%),
+    rgba(8, 13, 20, 0.78);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  backdrop-filter: blur(18px) saturate(150%);
+  border-color: rgba(148, 163, 184, 0.16);
+  box-shadow:
+    0 24px 60px -34px rgba(0, 0, 0, 0.95),
     inset 0 1px 0 rgba(255, 255, 255, 0.07);
 }
 
@@ -351,6 +445,8 @@
   .animate-orbit-reverse,
   .skeleton-shimmer::after,
   .animate-tile-breathe,
+  .cyber-mesh-bg,
+  .hud-conic-active::before,
   .coin-pulse-up,
   .coin-pulse-down {
     animation: none !important;

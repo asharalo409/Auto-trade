@@ -254,6 +254,39 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
       radarBlips.push({ mesh, mat });
     }
 
+    // --- 5b. HOLOGRAPHIC SONAR PULSE RINGS + NEURAL ORDERBOOK SPOKES ---
+    const pulseGeo = new THREE.RingGeometry(0.9, 0.945, 64);
+    const pulseRings: { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial; phase: number }[] = [];
+    for (let i = 0; i < 3; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x22d3ee,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.3,
+      });
+      const mesh = new THREE.Mesh(pulseGeo, mat);
+      mesh.rotation.x = Math.PI / 2;
+      radarBlipsGroup.add(mesh);
+      pulseRings.push({ mesh, mat, phase: i / 3 });
+    }
+
+    const spokePositions: number[] = [];
+    for (let i = 0; i < 16; i++) {
+      const angle = (i / 16) * Math.PI * 2;
+      spokePositions.push(Math.cos(angle) * 0.5, 0, Math.sin(angle) * 0.5);
+      spokePositions.push(Math.cos(angle) * 1.62, 0, Math.sin(angle) * 1.62);
+    }
+    const spokeGeo = new THREE.BufferGeometry();
+    spokeGeo.setAttribute('position', new THREE.Float32BufferAttribute(spokePositions, 3));
+    const spokeMat = new THREE.LineBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.18,
+    });
+    const spokes = new THREE.LineSegments(spokeGeo, spokeMat);
+    spokes.rotation.x = Math.PI / 2;
+    radarBlipsGroup.add(spokes);
+
     const histEntryGeo = new THREE.OctahedronGeometry(0.055, 0);
     const histExitGeo = new THREE.SphereGeometry(0.058, 10, 10);
     const histConnectors: {
@@ -297,6 +330,8 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
     const targetSecondary = new THREE.Color();
     let frameId = 0;
     let disposed = false;
+    let lastClosedCount = tradesRef.current.filter((tr) => tr.status === 'CLOSED').length;
+    let pulseBoost = 0;
 
     const resizeObserver = new ResizeObserver((entries) => {
       if (disposed) return;
@@ -410,6 +445,26 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
         b.mesh.scale.setScalar(s);
       });
 
+      // A newly closed trade fires a bright sonar ring / spoke flash.
+      const closedCountNow = tradesRef.current.filter((tr) => tr.status === 'CLOSED').length;
+      if (closedCountNow !== lastClosedCount) {
+        lastClosedCount = closedCountNow;
+        pulseBoost = 1;
+      }
+      pulseBoost = Math.max(0, pulseBoost - delta * 0.9);
+
+      spokeMat.opacity = 0.14 + pulseBoost * 0.55;
+      spokes.rotation.z = elapsed * 0.14;
+
+      pulseRings.forEach((ring, i) => {
+        const cycle = (elapsed * (isRunning ? 0.42 : 0.16) + ring.phase) % 1;
+        const scale = 0.55 + cycle * 1.75 + pulseBoost * 0.35;
+        ring.mesh.scale.setScalar(scale);
+        ring.mesh.position.y = -0.02 + Math.sin(elapsed * 1.4 + i) * 0.05;
+        ring.mat.opacity = Math.max(0, (0.34 + pulseBoost * 0.45) * (1 - cycle));
+        ring.mat.color.lerp(isRunning ? targetPrimary : targetSecondary, 0.12);
+      });
+
       // Position historical closed trades as Entry -> Exit geometric beams (Green=Profit, Red=Loss)
       const histClosed = tradesRef.current.filter((tr) => tr.status === 'CLOSED').slice(0, 6);
       histConnectors.forEach((hc, i) => {
@@ -508,6 +563,10 @@ export const QuantumCore3D: React.FC<QuantumCore3DProps> = ({
       askMat.dispose();
       blipGeo.dispose();
       radarBlips.forEach((b) => b.mat.dispose());
+      pulseGeo.dispose();
+      pulseRings.forEach((r) => r.mat.dispose());
+      spokeGeo.dispose();
+      spokeMat.dispose();
       histEntryGeo.dispose();
       histExitGeo.dispose();
       histConnectors.forEach((hc) => {

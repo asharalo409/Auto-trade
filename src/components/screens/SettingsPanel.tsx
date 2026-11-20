@@ -133,6 +133,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       max_open_trades: draft.max_open_trades,
       max_amount_per_pair: draft.max_amount_per_pair,
       daily_loss_limit: draft.daily_loss_limit,
+      trailing_stop_pct: draft.trailing_stop_pct ?? 1.5,
+      daily_max_loss_pct: draft.daily_max_loss_pct ?? 5,
+      voice_language: draft.voice_language ?? 'en',
       enabled_pairs: draft.enabled_pairs,
       telegram_enabled: draft.telegram_enabled,
       sound_enabled: draft.sound_enabled,
@@ -370,7 +373,32 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   accent="cyan"
                 />
               </div>
-              <div className="flex flex-wrap justify-end gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <div className="mr-auto flex items-center gap-1 rounded-lg border border-slate-700/70 bg-[#090d16] p-0.5">
+                  {(
+                    [
+                      ['en', 'English'],
+                      ['bn_en', 'বাংলা + English'],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => {
+                        audioSynth.playClick();
+                        setDraft((p) => ({ ...p, voice_language: value }));
+                        void onSave({ voice_language: value });
+                      }}
+                      className={`min-h-[30px] cursor-pointer rounded px-2 font-mono-tech text-[10px] font-semibold transition-colors ${
+                        (draft.voice_language ?? 'en') === value
+                          ? 'bg-cyan-500/25 text-cyan-200'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
                 <button
                   type="button"
                   onClick={() => {
@@ -904,6 +932,69 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 }
                 className="w-full accent-rose-400"
               />
+            </div>
+
+            {/* Trailing Stop-Loss & Daily Max Loss Guard (enforced by the 24/7 worker) */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-xl border border-slate-800/80 bg-[#05070d] p-4">
+                <div className="mb-2 flex items-center justify-between font-mono-tech text-xs">
+                  <span className="flex items-center gap-1.5 text-slate-300">
+                    <span>Trailing Stop</span>
+                    <InfoTip
+                      text="Closes an open position once price retraces this % from its highest watermark, locking in profit."
+                      label="Trailing Stop"
+                    />
+                  </span>
+                  <span className="font-bold text-emerald-300">
+                    {(draft.trailing_stop_pct ?? 1.5).toFixed(1)}%
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={8}
+                  step={0.1}
+                  value={draft.trailing_stop_pct ?? 1.5}
+                  onChange={(e) =>
+                    setDraft((p) => ({ ...p, trailing_stop_pct: Number(e.target.value) }))
+                  }
+                  aria-label="Trailing stop percentage"
+                  className="w-full accent-emerald-400"
+                />
+                <p className="mt-1 font-mono-tech text-[10px] text-slate-500">
+                  Peak-price trailing exit · 0% disables it
+                </p>
+              </div>
+
+              <div className="rounded-xl border border-slate-800/80 bg-[#05070d] p-4">
+                <div className="mb-2 flex items-center justify-between font-mono-tech text-xs">
+                  <span className="flex items-center gap-1.5 text-slate-300">
+                    <span>Daily Max Loss</span>
+                    <InfoTip
+                      text="Pauses new entries for the rest of the Asia/Dhaka day once realized losses reach this % of the day's opening equity."
+                      label="Daily Max Loss"
+                    />
+                  </span>
+                  <span className="font-bold text-rose-400">
+                    {(draft.daily_max_loss_pct ?? 5).toFixed(1)}%
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={25}
+                  step={0.5}
+                  value={draft.daily_max_loss_pct ?? 5}
+                  onChange={(e) =>
+                    setDraft((p) => ({ ...p, daily_max_loss_pct: Number(e.target.value) }))
+                  }
+                  aria-label="Daily maximum loss percentage"
+                  className="w-full accent-rose-400"
+                />
+                <p className="mt-1 font-mono-tech text-[10px] text-slate-500">
+                  Resets at 00:00 Asia/Dhaka · 0% disables it
+                </p>
+              </div>
             </div>
 
             {/* Enabled Pairs */}

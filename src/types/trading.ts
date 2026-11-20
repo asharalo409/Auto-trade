@@ -114,6 +114,12 @@ export interface BotSettings {
   max_open_trades: number;
   max_amount_per_pair: number;
   daily_loss_limit: number;
+  /** Closes an open position once price retraces this % from its peak. */
+  trailing_stop_pct?: number;
+  /** Pauses new entries for the rest of the day at this realized loss %. */
+  daily_max_loss_pct?: number;
+  /** 'en' = English only, 'bn_en' = Bengali summary then English detail. */
+  voice_language?: 'en' | 'bn_en';
   mode: TradingMode;
   enabled_pairs: string[];
   telegram_enabled: boolean;

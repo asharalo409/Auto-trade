@@ -151,6 +151,18 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
     max_open_trades: Number(row.max_open_trades ?? fallback.max_open_trades),
     max_amount_per_pair: Number(row.max_amount_per_pair ?? fallback.max_amount_per_pair),
     daily_loss_limit: Number(row.daily_loss_limit ?? fallback.daily_loss_limit),
+    trailing_stop_pct: Math.max(
+      0,
+      Number(row.trailing_stop_pct ?? fallback.trailing_stop_pct ?? 1.5)
+    ),
+    daily_max_loss_pct: Math.max(
+      0,
+      Number(row.daily_max_loss_pct ?? fallback.daily_max_loss_pct ?? 5)
+    ),
+    voice_language:
+      row.voice_language === 'bn_en' || row.voice_language === 'en'
+        ? row.voice_language
+        : (fallback.voice_language ?? 'en'),
     mode: ((row.mode ?? row.workspace_mode ?? row.trading_mode ?? fallback.mode) as TradingMode),
     enabled_pairs,
     telegram_enabled: telegramEnabled,
@@ -375,6 +387,9 @@ export function useTradingTerminal() {
   const [syncingBalance, setSyncingBalance] = useState(false);
   // Master Voice & SFX switch. Mirrors the announcer module so the UI can render it.
   const [voiceEnabled, setVoiceEnabled] = useState<boolean>(() => voiceAnnouncer.isEnabled());
+  // Telegram's mobile WebView answers "locked" until the first real gesture, so the
+  // header renders an explicit Tap to Unlock Audio pill instead of pretending it works.
+  const [audioReady, setAudioReady] = useState<boolean>(() => voiceAnnouncer.isAudioUnlocked());
 
   const [alertEnabledPairs, setAlertEnabledPairs] = useState<string[]>(() =>
     loadJson<string[]>(STORAGE_ALERT_PAIRS_KEY, [...SUPPORTED_PAIRS])
@@ -446,6 +461,14 @@ export function useTradingTerminal() {
   // Android Chrome does not silently drop every later announcement.
   useEffect(() => {
     voiceAnnouncer.installUnlockHandlers();
+    const unsubscribe = voiceAnnouncer.onAudioReady(setAudioReady);
+    const retry = window.setInterval(() => {
+      setAudioReady(voiceAnnouncer.isAudioUnlocked());
+    }, 2500);
+    return () => {
+      unsubscribe();
+      window.clearInterval(retry);
+    };
   }, []);
 
   const settings = activeWorkspace === 'DEMO' ? demoSettings : liveSettings;
@@ -462,6 +485,10 @@ export function useTradingTerminal() {
   useEffect(() => {
     audioSynth.setEnabled(settings.sound_enabled);
   }, [settings.sound_enabled]);
+
+  useEffect(() => {
+    voiceAnnouncer.setLanguage(settings.voice_language === 'bn_en' ? 'bn_en' : 'en');
+  }, [settings.voice_language]);
 
   useEffect(() => {
     saveJson(STORAGE_PREFS_KEY, {
@@ -1613,7 +1640,10 @@ export function useTradingTerminal() {
         patch.dca_step_pct !== undefined ||
         patch.dca_max_buys !== undefined ||
         patch.core_visual !== undefined ||
-        patch.candle_style !== undefined
+        patch.candle_style !== undefined ||
+        patch.voice_language !== undefined ||
+        patch.trailing_stop_pct !== undefined ||
+        patch.daily_max_loss_pct !== undefined
       ) {
         const uiSync = {
           sound_enabled: next.sound_enabled,
@@ -1624,6 +1654,9 @@ export function useTradingTerminal() {
           dca_max_buys: next.dca_max_buys,
           core_visual: next.core_visual,
           candle_style: next.candle_style,
+          voice_language: next.voice_language ?? 'en',
+          trailing_stop_pct: next.trailing_stop_pct ?? 1.5,
+          daily_max_loss_pct: next.daily_max_loss_pct ?? 5,
         };
         setDemoSettings((p) => ({ ...p, ...uiSync }));
         setLiveSettings((p) => ({ ...p, ...uiSync }));
@@ -1666,6 +1699,9 @@ export function useTradingTerminal() {
           ...(telegramChatId ? { telegram_chat_id: telegramChatId } : {}),
           zero_loss_mode: next.zero_loss_mode,
           zero_loss_shield: next.zero_loss_mode,
+          trailing_stop_pct: next.trailing_stop_pct ?? 1.5,
+          daily_max_loss_pct: next.daily_max_loss_pct ?? 5,
+          voice_language: next.voice_language ?? 'en',
           dca_enabled: next.dca_enabled,
           dca_step_pct: next.dca_step_pct,
           dca_max_buys: next.dca_max_buys,
@@ -1704,10 +1740,109 @@ export function useTradingTerminal() {
     [activeWorkspace, demoSettings, isAuthenticated, isDemoMode, liveSettings, telegramConfig]
   );
 
+  /**
+   * Executes a real Binance Spot MARKET order through the 24/7 worker, which owns the
+   * signed request path. Returns what actually filled, so the UI never records a
+   * phantom position when the exchange rejects an order.
+   */
+  const submitLiveOrder = useCallback(
+    async (
+      symbol: string,
+      side: 'BUY' | 'SELL',
+      quoteOrderQty: number,
+      quantity: number
+    ): Promise<{ ok: boolean; executedQty: number; quoteQty: number; error?: string }> => {
+      const apiKey = binanceConfig.api_key.trim();
+      const apiSecret = binanceConfig.api_secret.trim();
+      if (!apiKey || !apiSecret) {
+        return { ok: false, executedQty: 0, quoteQty: 0, error: 'Binance API keys are not configured' };
+      }
+      try {
+        const res = await fetch(`${WORKER_URL}/api/order`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            apiKey,
+            apiSecret,
+            testnet: binanceConfig.use_testnet,
+            symbol,
+            side,
+            quoteOrderQty,
+            quantity,
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          order?: { executedQty?: string; cummulativeQuoteQty?: string };
+        };
+        if (!res.ok || data.ok === false) {
+          return {
+            ok: false,
+            executedQty: 0,
+            quoteQty: 0,
+            error: String(data.error || `Order rejected (HTTP ${res.status})`),
+          };
+        }
+        return {
+          ok: true,
+          executedQty: Number(data.order?.executedQty ?? 0),
+          quoteQty: Number(data.order?.cummulativeQuoteQty ?? 0),
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          executedQty: 0,
+          quoteQty: 0,
+          error: err instanceof Error ? err.message : 'Order request failed',
+        };
+      }
+    },
+    [binanceConfig]
+  );
+
   const placeQuickTrade = useCallback(
     async (pairSymbol: string, side: 'BUY' | 'SELL', amountUsdt: number) => {
       const pair = marketPairs.find((p) => p.symbol === pairSymbol) ?? marketPairs[0];
       const lot = Math.max(1, amountUsdt);
+
+      // LIVE Spot notional validation before anything is sent to the exchange.
+      if (activeWorkspace === 'LIVE' && side === 'BUY') {
+        const keysReady = Boolean(
+          binanceConfig.api_key.trim() && binanceConfig.api_secret.trim()
+        );
+        const available = binanceAccountRef.current?.usdtFree ?? 0;
+        const reject = (message: string) => {
+          audioSynth.playTradeChime(false);
+          appendLog('LIVE', {
+            id: createUniqueId('LOG'),
+            level: 'WARNING',
+            pair: pair.symbol,
+            message,
+            created_at: new Date().toISOString(),
+          });
+        };
+        if (!keysReady) {
+          reject('LIVE BUY blocked — Binance API keys are not linked in Settings.');
+          return;
+        }
+        if (lot < MIN_TRADEABLE_USDT) {
+          reject(
+            `LIVE BUY blocked — $${lot.toFixed(2)} is below Binance's $${MIN_TRADEABLE_USDT.toFixed(
+              2
+            )} minimum notional.`
+          );
+          return;
+        }
+        if (available + 0.01 < lot) {
+          reject(
+            `LIVE BUY blocked — $${available.toFixed(
+              2
+            )} spendable Spot USDT is below the $${lot.toFixed(2)} order.`
+          );
+          return;
+        }
+      }
 
       if (side === 'SELL') {
         const existingOpen = trades.find(
@@ -1728,6 +1863,25 @@ export function useTradingTerminal() {
               created_at: new Date().toISOString(),
             });
             return;
+          }
+          if (activeWorkspace === 'LIVE') {
+            const sell = await submitLiveOrder(
+              pair.symbol,
+              'SELL',
+              0,
+              existingOpen.quantity
+            );
+            if (!sell.ok) {
+              audioSynth.playTradeChime(false);
+              appendLog('LIVE', {
+                id: createUniqueId('LOG'),
+                level: 'ERROR',
+                pair: pair.symbol,
+                message: `LIVE SELL rejected: ${sell.error ?? 'unknown error'} — position kept open.`,
+                created_at: new Date().toISOString(),
+              });
+              return;
+            }
           }
           const closedAt = new Date().toISOString();
           const updater = (prev: Trade[]) =>
@@ -1758,7 +1912,25 @@ export function useTradingTerminal() {
         }
       }
 
-      const qty = Number((lot / pair.price).toFixed(pair.price > 100 ? 5 : 2));
+      let executedNotional = lot;
+      let executedQty = Number((lot / pair.price).toFixed(pair.price > 100 ? 5 : 2));
+      if (activeWorkspace === 'LIVE') {
+        const buy = await submitLiveOrder(pair.symbol, 'BUY', lot, 0);
+        if (!buy.ok) {
+          audioSynth.playTradeChime(false);
+          appendLog('LIVE', {
+            id: createUniqueId('LOG'),
+            level: 'ERROR',
+            pair: pair.symbol,
+            message: `LIVE BUY rejected: ${buy.error ?? 'unknown error'} — no trade recorded.`,
+            created_at: new Date().toISOString(),
+          });
+          return;
+        }
+        if (buy.executedQty > 0) executedQty = buy.executedQty;
+        if (buy.quoteQty > 0) executedNotional = buy.quoteQty;
+      }
+      const qty = executedQty;
       const newTrade: Trade = {
         id: createUniqueId('ORD', pair.base),
         pair: pair.symbol,
@@ -1767,7 +1939,7 @@ export function useTradingTerminal() {
         entry_price: pair.price,
         current_price: pair.price,
         quantity: qty,
-        invested_usdt: lot,
+        invested_usdt: executedNotional,
         profit_usdt: 0,
         profit_pct: 0,
         take_profit_price: Number(
@@ -1801,11 +1973,14 @@ export function useTradingTerminal() {
     [
       activeWorkspace,
       appendLog,
+      binanceConfig.api_key,
+      binanceConfig.api_secret,
       marketPairs,
       notifyTelegramIfConfigured,
       settings.stop_loss_pct,
       settings.take_profit_pct,
       settings.zero_loss_mode,
+      submitLiveOrder,
       trades,
     ]
   );
@@ -1982,6 +2157,139 @@ export function useTradingTerminal() {
       trades,
     ]
   );
+
+  /**
+   * Emergency "Close All": market-closes every open position in the active workspace,
+   * reports total realized PnL, and returns paper proceeds to the DEMO balance.
+   */
+  const closeAllPositions = useCallback(async () => {
+    const openList = trades.filter((t) => t.status === 'OPEN');
+    if (openList.length === 0) {
+      audioSynth.playTradeChime(false);
+      return { closed: 0, realizedPnl: 0 };
+    }
+
+    const closedAt = new Date().toISOString();
+    const closedIds = new Set<string>();
+    let realized = 0;
+
+    for (const tr of openList) {
+      const exitPx = tr.current_price > 0 ? tr.current_price : tr.entry_price;
+      if (activeWorkspace === 'LIVE') {
+        const sell = await submitLiveOrder(tr.pair, 'SELL', 0, tr.quantity);
+        if (!sell.ok) {
+          appendLog('LIVE', {
+            id: createUniqueId('LOG'),
+            level: 'ERROR',
+            pair: tr.pair,
+            message: `CLOSE ALL skipped ${tr.pair}: ${sell.error ?? 'Binance rejected the sell'} — position kept open.`,
+            created_at: new Date().toISOString(),
+          });
+          continue;
+        }
+      }
+      const pnl = Number(((exitPx - tr.entry_price) * tr.quantity).toFixed(2));
+      realized += pnl;
+      closedIds.add(tr.id);
+
+      if (!isDemoMode && isAuthenticated && supabase) {
+        try {
+          await supabase
+            .from('trades')
+            .update({
+              status: 'CLOSED',
+              exit_price: exitPx,
+              profit_usdt: pnl,
+              profit_pct: Number(
+                ((pnl / Math.max(0.01, tr.invested_usdt)) * 100).toFixed(2)
+              ),
+              closed_at: closedAt,
+            })
+            .eq('id', tr.id);
+        } catch (err) {
+          console.error('Close-all persistence error:', err);
+        }
+      }
+    }
+
+    if (closedIds.size === 0) {
+      audioSynth.playTradeChime(false);
+      return { closed: 0, realizedPnl: 0 };
+    }
+
+    const updater = (prev: Trade[]) =>
+      prev.map((t) => {
+        if (!closedIds.has(t.id)) return t;
+        const exitPx = t.current_price > 0 ? t.current_price : t.entry_price;
+        return {
+          ...t,
+          status: 'CLOSED' as const,
+          exit_price: exitPx,
+          profit_usdt: Number(((exitPx - t.entry_price) * t.quantity).toFixed(2)),
+          profit_pct: Number(
+            ((((exitPx - t.entry_price) * t.quantity) / Math.max(0.01, t.invested_usdt)) * 100).toFixed(
+              2
+            )
+          ),
+          closed_at: closedAt,
+        };
+      });
+
+    setDemoTrades(updater);
+    setLiveTrades(updater);
+
+    if (activeWorkspace === 'DEMO') {
+      // Paper equity base already excludes open exposure (stats adds open PnL back),
+      // so only the realized result moves the DEMO balance.
+      const nextBalance = Number(
+        ((demoSettingsRef.current.balance_usdt ?? 0) + realized).toFixed(2)
+      );
+      setDemoSettings((prev) => ({ ...prev, balance_usdt: nextBalance }));
+      if (!isDemoMode && isAuthenticated && supabase) {
+        const rowId = settingsRowIdRef.current;
+        if (rowId !== null) {
+          void supabase
+            .from('settings')
+            .update({ virtual_balance: nextBalance })
+            .eq('id', rowId)
+            .then(() => {});
+        }
+      }
+    }
+
+    audioSynth.playTradeChime(realized >= 0);
+    if (voiceAnnouncer.isEnabled()) {
+      if (realized >= 0) voiceAnnouncer.successChime();
+      else voiceAnnouncer.lossTone();
+      voiceAnnouncer.speak(
+        `Emergency close complete. ${closedIds.size} position${
+          closedIds.size === 1 ? '' : 's'
+        } closed. Net ${realized >= 0 ? 'profit' : 'loss'} ${Math.abs(realized).toFixed(2)} dollars.`
+      );
+    }
+
+    const summary = `🛑 CLOSE ALL ${activeWorkspace} — ${closedIds.size} position${
+      closedIds.size === 1 ? '' : 's'
+    } closed · Realized PnL ${realized >= 0 ? '+' : ''}$${realized.toFixed(2)} USDT`;
+    appendLog(activeWorkspace, {
+      id: createUniqueId('LOG'),
+      level: 'TRADE',
+      pair: null,
+      message: summary,
+      created_at: closedAt,
+    });
+    await notifyTelegramIfConfigured(summary, activeWorkspace);
+
+    return { closed: closedIds.size, realizedPnl: Number(realized.toFixed(2)) };
+  }, [
+    activeWorkspace,
+    appendLog,
+    isAuthenticated,
+    isDemoMode,
+    notifyTelegramIfConfigured,
+    submitLiveOrder,
+    trades,
+  ]);
 
   const resetVirtualBalance = useCallback(
     (amount = 10000) => {
@@ -2552,8 +2860,10 @@ export function useTradingTerminal() {
     togglePair,
     closeTrade,
     placeQuickTrade,
+    closeAllPositions,
     resetVirtualBalance,
     voiceEnabled,
+    audioReady,
     toggleVoice,
     testVoice,
     speakBalance,

@@ -120,7 +120,11 @@ alter table public.settings add column if not exists trading_mode text default '
 alter table public.settings add column if not exists virtual_balance numeric default 10000;
 alter table public.settings add column if not exists telegram_bot_token text;
 alter table public.settings add column if not exists telegram_chat_id text;
-alter table public.trades add column if not exists mode text default 'live';`;
+alter table public.settings add column if not exists trailing_stop_pct numeric default 1.5;
+alter table public.settings add column if not exists daily_max_loss_pct numeric default 5;
+alter table public.settings add column if not exists voice_language text default 'en';
+alter table public.trades add column if not exists mode text default 'live';
+alter table public.trades add column if not exists peak_price numeric;`;
 
 export const INITIAL_DEMO_SETTINGS: BotSettings = {
   id: 1,
@@ -138,6 +142,9 @@ export const INITIAL_DEMO_SETTINGS: BotSettings = {
   max_open_trades: 5,
   max_amount_per_pair: 500,
   daily_loss_limit: 150,
+  trailing_stop_pct: 1.5,
+  daily_max_loss_pct: 5,
+  voice_language: 'en',
   mode: 'DEMO',
   enabled_pairs: [
     'BTCUSDT',

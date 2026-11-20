@@ -73,9 +73,14 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
     audioSynth.playClick();
 
     const headers = [
-      'Trade ID',
+      'Date',
       'Symbol',
       'Side',
+      'Entry',
+      'Exit',
+      'PnL USD',
+      'Mode',
+      'Trade ID',
       'Status',
       'Quantity',
       'Entry Price (USDT)',
@@ -88,9 +93,14 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
     ];
 
     const rows = filteredHistory.map((tr) => [
-      tr.id,
+      new Date(tr.closed_at ?? tr.opened_at).toISOString(),
       tr.pair,
       tr.side,
+      tr.entry_price,
+      tr.exit_price ?? tr.current_price,
+      tr.profit_usdt.toFixed(2),
+      tr.mode ?? 'LIVE',
+      tr.id,
       tr.status,
       tr.quantity,
       tr.entry_price,
@@ -288,7 +298,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
               className="min-h-[34px] px-3 py-1 text-[11px]"
             >
               {csvDone ? <Check className="h-3.5 w-3.5" /> : <Download className="h-3.5 w-3.5" />}
-              {csvDone ? t.csvExported : t.downloadCsv}
+              {csvDone ? t.csvExported : `📥 Export CSV`}
             </NeonButton>
           </div>
         }
@@ -356,6 +366,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
               <thead>
                 <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-400 uppercase">
                   <th className="py-2.5 pr-3">PAIR</th>
+                  <th className="py-2.5 pr-3">MODE</th>
                   <th className="py-2.5 pr-3">STATUS</th>
                   <th className="py-2.5 pr-3 text-right">{t.entryPrice}</th>
                   <th className="py-2.5 pr-3 text-right">{t.currentPrice}</th>
@@ -371,6 +382,17 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                     <tr key={tr.id} className="transition-colors hover:bg-slate-900/45">
                       <td className="py-2.5 pr-3 font-semibold text-slate-100">
                         {tr.pair}
+                      </td>
+                      <td className="py-2.5 pr-3">
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                            (tr.mode ?? 'LIVE') === 'LIVE'
+                              ? 'bg-rose-500/15 text-rose-300'
+                              : 'bg-cyan-500/15 text-cyan-300'
+                          }`}
+                        >
+                          {tr.mode ?? 'LIVE'}
+                        </span>
                       </td>
                       <td className="py-2.5 pr-3">
                         <span

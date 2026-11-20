@@ -24,6 +24,7 @@ import { PerformanceScreen } from './components/screens/PerformanceScreen';
 import { RiskPanel } from './components/screens/RiskPanel';
 import { SettingsPanel } from './components/screens/SettingsPanel';
 import { TradesScreen } from './components/screens/TradesScreen';
+import { AudioStatusPill } from './components/ui/AudioStatusPill';
 import { BootSequence } from './components/ui/BootSequence';
 import { NeonButton } from './components/ui/MotionPrimitives';
 import { TelegramProfileBadge } from './components/ui/TelegramProfileBadge';
@@ -189,8 +190,10 @@ export default function App() {
       className="relative flex min-h-screen flex-col text-slate-100 transition-colors duration-500"
       style={{ backgroundColor: activeTheme.bgCanvas }}
     >
-      {/* Ambient Animated Background Layers + Predator Red-Eye Backdrop */}
+      {/* Ambient Animated Background Layers + Cyber Mesh HUD + Predator Red-Eye Backdrop */}
       <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
+        <div aria-hidden="true" className="cyber-mesh-bg absolute inset-0 opacity-90" />
+        <div aria-hidden="true" className="hud-radial-glow absolute inset-0" />
         {bgPredator !== 'none' && (
           <>
             <img
@@ -297,8 +300,17 @@ export default function App() {
             </nav>
           )}
 
-          {/* Right Controls: Isolated VIRTUAL / LIVE Switcher + Live Balance Pill + Language + Lock */}
+          {/* Right Controls: Isolated VIRTUAL / LIVE Switcher + Live Balance Pill + Audio + Language + Lock */}
           <div className="flex items-center gap-2 shrink-0">
+            {terminal.isAuthenticated && (
+              <div className="hidden sm:flex">
+                <AudioStatusPill
+                  ready={terminal.audioReady}
+                  voiceEnabled={terminal.voiceEnabled}
+                  onUnlock={terminal.testVoice}
+                />
+              </div>
+            )}
             {terminal.isAuthenticated && (
               <div className="hidden items-center gap-1.5 md:flex">
                 <div className="flex items-center rounded-lg border border-slate-800 bg-[#080b12] p-0.5">
@@ -509,8 +521,11 @@ export default function App() {
                   onQuickTrade={terminal.placeQuickTrade}
                   onResetVirtual={() => terminal.resetVirtualBalance(10000)}
                   voiceEnabled={terminal.voiceEnabled}
+                  audioReady={terminal.audioReady}
                   onToggleVoice={terminal.toggleVoice}
                   onTestVoice={terminal.testVoice}
+                  onCloseAll={terminal.closeAllPositions}
+                  liveUsdtFree={tradeableUsdt}
                   onRefreshBalance={() =>
                     terminal.refreshBinanceBalance(undefined, { announce: true })
                   }

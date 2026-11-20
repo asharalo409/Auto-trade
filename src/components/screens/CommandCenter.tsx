@@ -55,10 +55,13 @@ import {
   TradingMode,
 } from '../../types/trading';
 import { CandlestickChart } from '../charts/CandlestickChart';
+import { LiveTelemetryChart } from '../charts/LiveTelemetryChart';
 import { QuantumCore3D } from '../three/QuantumCore3D';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { InfoTip } from '../ui/InfoTip';
+import { ManualExecutionDeck } from '../ui/ManualExecutionDeck';
 import { CoinFlashSignal, PremiumCommandHero } from '../ui/PremiumCommandHero';
+import { MIN_TRADEABLE_USDT } from '../../lib/tradeLimits';
 import { NeonButton, SciFiSwitch, SkeletonBlock } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
 import { BinanceOrderBook } from '../widgets/BinanceOrderBook';
@@ -93,8 +96,11 @@ interface CommandCenterProps {
   syncingBalance: boolean;
   alertEnabledPairs: string[];
   voiceEnabled: boolean;
+  audioReady: boolean;
   onToggleVoice: (enabled: boolean) => void;
   onTestVoice: () => void;
+  onCloseAll: () => Promise<{ closed: number; realizedPnl: number }>;
+  liveUsdtFree: number;
   getEquitySeries: (tf: EquityTimeframe) => EquityPoint[];
   onToggleBot: () => Promise<void>;
   onToggleTelegram: (enabled: boolean) => Promise<void>;
@@ -154,8 +160,11 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   syncingBalance,
   alertEnabledPairs,
   voiceEnabled,
+  audioReady,
   onToggleVoice,
   onTestVoice,
+  onCloseAll,
+  liveUsdtFree,
   getEquitySeries,
   onToggleBot,
   onToggleTelegram,
@@ -171,6 +180,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   const reducedMotion = useReducedMotion();
   const [timeframe, setTimeframe] = useState<EquityTimeframe>('1D');
   const [chartPair, setChartPair] = useState<string>('BTCUSDT');
+  const [telemetryOpen, setTelemetryOpen] = useState(false);
   const lastChartTickRef = useRef<{ symbol: string; price: number } | null>(null);
 
   // Subtle Web Audio tick when the charted pair moves meaningfully. The announcer
@@ -851,12 +861,51 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         pairs={marketPairs}
         focusedSymbol={chartPair}
         flashSignal={tradeFlash}
-        onFocusCoin={setChartPair}
+        onFocusCoin={(symbol) => {
+          setChartPair(symbol);
+          setTelemetryOpen(true);
+          telegramHaptic('light');
+        }}
         onSyncBalance={() => {
           void onRefreshBalance();
         }}
         onOpenCalculator={handleOpenCalculator}
       />
+
+      {/* Manual Execution Deck — quick buy/sell + emergency close-all */}
+      <ManualExecutionDeck
+        workspace={workspace}
+        symbol={chartPair}
+        pairs={marketPairs}
+        trades={trades}
+        defaultAmount={settings.amount_per_trade}
+        availableUsdt={
+          workspace === 'LIVE'
+            ? liveUsdtFree
+            : (settings.balance_usdt ?? stats.availableBalance)
+        }
+        hasBinanceKeys={hasBinanceKeys}
+        minNotional={MIN_TRADEABLE_USDT}
+        onQuickTrade={onQuickTrade}
+        onCloseAll={onCloseAll}
+        onSelectSymbol={(symbol) => {
+          setChartPair(symbol);
+          setTelemetryOpen(true);
+        }}
+      />
+
+      {/* Interactive live candlestick + RSI telemetry drawer */}
+      <AnimatePresence initial={false}>
+        {telemetryOpen && (
+          <LiveTelemetryChart
+            key={`telemetry-${chartPair}`}
+            symbol={chartPair}
+            pair={marketPairs.find((p) => p.symbol === chartPair) ?? marketPairs[0]}
+            trades={trades}
+            onClose={() => setTelemetryOpen(false)}
+          />
+        )}
+      </AnimatePresence>
 
       {/* Workspace Banner (Virtual vs Live Isolated Pages) */}
       <div
@@ -1186,6 +1235,15 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               <span>{t.testVoiceBtn}</span>
             </button>
             <span
+              className={`rounded border px-1.5 py-0.5 font-mono-tech text-[10px] font-semibold ${
+                audioReady
+                  ? 'border-emerald-500/45 bg-emerald-500/12 text-emerald-300'
+                  : 'border-amber-500/45 bg-amber-500/12 text-amber-200'
+              }`}
+            >
+              {audioReady ? '🔊 Audio Ready' : '🔇 Tap Test Voice to Unlock'}
+            </span>
+            <span
               className={`font-mono-tech text-[11px] font-bold ${
                 voiceEnabled ? 'text-cyan-300' : 'text-slate-500'
               }`}
@@ -1302,7 +1360,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               </span>
             </div>
           }
-          className="lg:col-span-5"
+          className={`lg:col-span-5 ${isRunning ? 'hud-conic-active' : ''}`}
           delay={0.04}
         >
           <div className="grid grid-cols-1 items-center gap-4 sm:grid-cols-2">
