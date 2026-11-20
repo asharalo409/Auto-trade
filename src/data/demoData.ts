@@ -273,10 +273,25 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert on auth.users
   for each row execute function public.handle_new_user();
 
--- Promote the bot owner (edit the email to yours). The worker also auto-promotes
--- whichever account owns ADMIN_CHAT_ID / TELEGRAM_CHAT_ID on boot.
+-- The very first account bootstraps the admin seat, so a fresh project is usable
+-- before ADMIN_CHAT_ID is configured. The worker then promotes whichever account
+-- owns ADMIN_CHAT_ID / TELEGRAM_CHAT_ID on boot.
+create or replace function public.bootstrap_first_admin()
+returns trigger language plpgsql security definer set search_path = public as $func$
+begin
+  if not exists (select 1 from public.users u where u.is_admin = true) then
+    update public.users set is_admin = true, approval_status = 'approved' where id = new.id;
+  end if;
+  return new;
+end; $func$;
+
+drop trigger if exists users_bootstrap_first_admin on public.users;
+create trigger users_bootstrap_first_admin after insert on public.users
+  for each row execute function public.bootstrap_first_admin();
+
+-- Promote the bot owner (edit the email to yours).
 update public.users set is_admin = true, approval_status = 'approved'
-  where email = 'billahtaseen@gmail.com';
+  where email in ('billahtaseen@gmail.com', 'taseenbillah409@gmail.com');
 
 -- Leaderboard read model is exposed by the worker (/api/leaderboard), which returns
 -- aggregates only: names, mode, win rate and net PnL — no keys, no balances.
