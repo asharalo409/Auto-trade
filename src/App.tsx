@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import {
   Activity,
@@ -10,6 +10,7 @@ import {
   Layers,
   LineChart,
   Lock,
+  Power,
   RefreshCw,
   Settings as SettingsIcon,
   ShieldAlert,
@@ -31,6 +32,7 @@ import { MIN_TRADEABLE_USDT } from './lib/tradeLimits';
 import { useTradingTerminal } from './hooks/useTradingTerminal';
 import { translations } from './i18n/translations';
 import { audioSynth } from './lib/audioSynth';
+import { initTelegramMiniApp, telegramHaptic } from './lib/telegramWebApp';
 import { TERMINAL_THEMES } from './lib/themes';
 import { BackgroundPresetId, Language, TabId, TradingMode } from './types/trading';
 
@@ -71,6 +73,13 @@ export default function App() {
   }, []);
 
   const terminal = useTradingTerminal();
+  const [engineToggling, setEngineToggling] = useState(false);
+  const engineRunning = terminal.botStatus === 'RUNNING';
+
+  // Full-screen Telegram Mini App bootstrap (no-op in a normal browser tab).
+  useEffect(() => {
+    initTelegramMiniApp();
+  }, []);
   const t = translations[lang];
   const activeTheme = TERMINAL_THEMES[terminal.effectiveTheme];
   // Headline = full portfolio; only Spot USDT can actually fund orders.
@@ -107,6 +116,7 @@ export default function App() {
 
   const handleTabChange = (tab: TabId) => {
     if (tab !== activeTab) {
+      telegramHaptic('light');
       audioSynth.playTabSwitch();
       setActiveTab(tab);
     }
@@ -120,6 +130,57 @@ export default function App() {
     } else {
       terminal.switchWorkspace('DEMO');
     }
+  };
+
+  const handleEngineToggle = useCallback(async () => {
+    if (engineToggling) return;
+    telegramHaptic('light');
+    audioSynth.playToggle(!engineRunning);
+    setEngineToggling(true);
+    try {
+      await terminal.toggleBot();
+    } finally {
+      setEngineToggling(false);
+    }
+  }, [engineToggling, engineRunning, terminal.toggleBot]);
+
+  const handleDockWorkspace = (target: TradingMode) => {
+    if (target === terminal.activeWorkspace) return;
+    telegramHaptic('light');
+    handleRequestWorkspaceSwitch(target);
+  };
+
+  const dockTabClass = (active: boolean) =>
+    `relative flex min-h-[44px] flex-1 cursor-pointer flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
+      active ? activeTheme.accentText : 'text-slate-500 active:text-slate-200'
+    }`;
+
+  const renderDockTab = (item: (typeof navItems)[number]) => {
+    const Icon = item.icon;
+    const active = activeTab === item.id;
+    return (
+      <button
+        key={item.id}
+        type="button"
+        onClick={() => handleTabChange(item.id)}
+        aria-current={active ? 'page' : undefined}
+        className={dockTabClass(active)}
+      >
+        {active && (
+          <motion.span
+            layoutId="miniDockActive"
+            transition={
+              reducedMotion ? { duration: 0 } : { type: 'spring', stiffness: 460, damping: 30 }
+            }
+            className="absolute inset-x-1 inset-y-0.5 rounded-xl bg-white/[0.07] ring-1 ring-inset ring-white/10"
+          />
+        )}
+        <Icon className="relative z-10 h-[17px] w-[17px]" />
+        <span className="relative z-10 max-w-full truncate px-0.5 font-mono-tech text-[8px] font-semibold tracking-tight uppercase">
+          {item.shortLabel ?? item.label}
+        </span>
+      </button>
+    );
   };
 
   return (
@@ -369,7 +430,7 @@ export default function App() {
       </header>
 
       {/* Main Content Area */}
-      <main className="relative z-10 mx-auto w-full max-w-7xl flex-1 px-3 py-4 pb-24 sm:px-6 lg:pb-6">
+      <main className="relative z-10 mx-auto w-full max-w-7xl flex-1 px-3 py-4 pb-40 sm:px-6 lg:pb-6">
         {terminal.errorMsg && (
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-500/45 bg-rose-500/10 px-4 py-3 font-mono-tech text-xs text-rose-200">
             <div className="flex items-center gap-2">
@@ -588,7 +649,7 @@ export default function App() {
       </AnimatePresence>
 
       {/* Footer + Bottom Ticker */}
-      <footer className="relative z-10 mt-auto pb-16 lg:pb-0">
+      <footer className="relative z-10 mt-auto pb-28 lg:pb-0">
         <div className="border-t border-slate-800/70 bg-[#05060a]/90 px-4 py-3 text-center font-mono-tech text-[11px] tracking-wider text-slate-400">
           {t.footerCredit}
         </div>
@@ -604,49 +665,80 @@ export default function App() {
         </div>
       </footer>
 
-      {/* Mobile-First Spring Bottom Tab Bar */}
+      {/* Floating Mini App Dock — workspace switch + center engine action */}
       {terminal.isAuthenticated && (
-        <nav
-          aria-label="Mobile Navigation"
-          className="fixed right-0 bottom-0 left-0 z-40 border-t border-cyan-500/25 bg-[#060911]/95 px-1 pb-safe lg:hidden"
-        >
-          <div className="grid h-14 grid-cols-7 items-center">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const active = activeTab === item.id;
-              return (
+        <div className="fixed inset-x-0 bottom-0 z-40 lg:hidden">
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-36 bg-gradient-to-t from-[#070b10] via-[#070b10]/80 to-transparent" />
+          <div className="relative mx-auto w-full max-w-md px-3">
+            {/* Workspace switch pill */}
+            <div className="mb-2 flex justify-center">
+              <div className="flex items-center gap-0.5 rounded-full border border-white/10 bg-[#0a0f16]/90 p-0.5 backdrop-blur-xl">
                 <button
-                  key={item.id}
                   type="button"
-                  onClick={() => handleTabChange(item.id)}
-                  className={`relative flex h-full min-h-[44px] cursor-pointer flex-col items-center justify-center gap-0.5 transition-colors ${
-                    active ? activeTheme.accentText : 'text-slate-500 hover:text-slate-300'
+                  onClick={() => handleDockWorkspace('DEMO')}
+                  className={`min-h-[26px] cursor-pointer rounded-full px-3 font-mono-tech text-[9px] font-bold tracking-widest uppercase transition-colors ${
+                    terminal.activeWorkspace === 'DEMO'
+                      ? 'bg-cyan-500/25 text-cyan-200'
+                      : 'text-slate-500 active:text-slate-300'
                   }`}
                 >
-                  {active && (
-                    <motion.span
-                      layoutId="mobileBottomIndicator"
-                      transition={
-                        reducedMotion
-                          ? { duration: 0 }
-                          : { type: 'spring', stiffness: 460, damping: 30 }
-                      }
-                      className="absolute top-0 h-0.5 w-8 rounded-full"
-                      style={{
-                        backgroundColor: activeTheme.primaryHex,
-                        boxShadow: `0 0 10px ${activeTheme.primaryHex}`,
-                      }}
-                    />
-                  )}
-                  <Icon className="h-4 w-4" />
-                  <span className="font-mono-tech text-[9px] font-semibold tracking-tight uppercase truncate max-w-full px-0.5">
-                    {item.shortLabel ?? item.label}
-                  </span>
+                  Virtual
                 </button>
-              );
-            })}
+                <button
+                  type="button"
+                  onClick={() => handleDockWorkspace('LIVE')}
+                  className={`min-h-[26px] cursor-pointer rounded-full px-3 font-mono-tech text-[9px] font-bold tracking-widest uppercase transition-colors ${
+                    terminal.activeWorkspace === 'LIVE'
+                      ? 'bg-rose-500/30 text-rose-200'
+                      : 'text-slate-500 active:text-rose-300'
+                  }`}
+                >
+                  Live
+                </button>
+              </div>
+            </div>
+
+            <nav
+              aria-label="Mobile Navigation"
+              className="mini-dock relative mb-2 flex items-center gap-1 rounded-[26px] border border-white/10 px-1.5 py-2 backdrop-blur-2xl"
+            >
+              <div className="flex flex-1 items-center justify-around">
+                {navItems.slice(0, 3).map(renderDockTab)}
+              </div>
+
+              {/* Highlighted center engine action */}
+              <button
+                type="button"
+                onClick={() => void handleEngineToggle()}
+                disabled={engineToggling}
+                aria-label={engineRunning ? 'Stop trading engine' : 'Start trading engine'}
+                aria-pressed={engineRunning}
+                className={`relative -my-5 flex h-14 w-14 shrink-0 cursor-pointer flex-col items-center justify-center gap-0 rounded-full border transition-all active:scale-95 disabled:opacity-70 ${
+                  engineRunning
+                    ? 'dock-fab-on border-emerald-300/70 bg-gradient-to-br from-emerald-300 via-emerald-400 to-teal-600 text-[#04120c]'
+                    : 'dock-fab-off border-white/15 bg-gradient-to-br from-slate-700 to-slate-900 text-slate-300'
+                }`}
+              >
+                {engineRunning && !reducedMotion && (
+                  <motion.span
+                    aria-hidden="true"
+                    animate={{ scale: [1, 1.35, 1], opacity: [0.45, 0, 0.45] }}
+                    transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
+                    className="pointer-events-none absolute inset-0 rounded-full border border-emerald-300/60"
+                  />
+                )}
+                <Power className="h-[18px] w-[18px]" />
+                <span className="font-mono-tech text-[8px] font-black tracking-widest">
+                  {engineToggling ? '···' : engineRunning ? 'ON' : 'OFF'}
+                </span>
+              </button>
+
+              <div className="flex flex-1 items-center justify-around">
+                {navItems.slice(3).map(renderDockTab)}
+              </div>
+            </nav>
           </div>
-        </nav>
+        </div>
       )}
     </div>
   );

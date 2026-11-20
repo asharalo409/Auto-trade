@@ -37,6 +37,7 @@ import {
   sendDesktopNotification,
 } from '../../lib/desktopNotifications';
 import { TERMINAL_THEMES } from '../../lib/themes';
+import { telegramHaptic } from '../../lib/telegramWebApp';
 import { voiceAnnouncer } from '../../lib/voiceAnnouncer';
 import {
   BinanceAccountSummary,
@@ -57,6 +58,7 @@ import { CandlestickChart } from '../charts/CandlestickChart';
 import { QuantumCore3D } from '../three/QuantumCore3D';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { InfoTip } from '../ui/InfoTip';
+import { PremiumCommandHero } from '../ui/PremiumCommandHero';
 import { NeonButton, SciFiSwitch, SkeletonBlock } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
 import { BinanceOrderBook } from '../widgets/BinanceOrderBook';
@@ -608,6 +610,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   };
 
   const handlePowerClick = async () => {
+    telegramHaptic('light');
     setToggling(true);
     await onToggleBot();
     setToggling(false);
@@ -742,6 +745,24 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
 
   return (
     <div className="space-y-4">
+      {/* Premium Mini App Command Center Hero */}
+      <PremiumCommandHero
+        workspace={workspace}
+        balance={stats.balance}
+        todayProfit={stats.todayProfit}
+        dailyGoalUsd={Math.max(1, stats.balance * (settings.take_profit_pct / 100))}
+        hasBinanceKeys={hasBinanceKeys}
+        syncingBalance={syncingBalance}
+        botRunning={isRunning}
+        pairs={marketPairs}
+        focusedSymbol={chartPair}
+        onFocusCoin={setChartPair}
+        onSyncBalance={() => {
+          void onRefreshBalance();
+        }}
+        onOpenCalculator={handleOpenCalculator}
+      />
+
       {/* Workspace Banner (Virtual vs Live Isolated Pages) */}
       <div
         className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-2.5 backdrop-blur-sm ${
