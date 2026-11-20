@@ -1,8 +1,9 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { Check, Download, Layers, ShieldCheck, TrendingUp } from 'lucide-react';
 import { SUPPORTED_PAIRS } from '../../data/demoData';
 import { audioSynth } from '../../lib/audioSynth';
+import { downloadCsvFile } from '../../lib/csvExport';
 import { Trade, TradeStatus } from '../../types/trading';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { NeonButton, SkeletonBlock } from '../ui/MotionPrimitives';
@@ -18,6 +19,14 @@ interface TradesScreenProps {
 
 type DateFilter = 'ALL' | 'TODAY' | '7D' | '30D';
 
+function formatElapsed(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  return [hours, minutes, seconds].map((v) => String(v).padStart(2, '0')).join(':');
+}
+
 export const TradesScreen: React.FC<TradesScreenProps> = ({
   t,
   trades,
@@ -30,6 +39,13 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
   const [statusFilter, setStatusFilter] = useState<'ALL' | TradeStatus>('ALL');
   const [dateFilter, setDateFilter] = useState<DateFilter>('ALL');
   const [csvDone, setCsvDone] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  // Tick every second so each open position shows a live elapsed countdown.
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const openTrades = useMemo(
     () => trades.filter((tr) => tr.status === 'OPEN'),
@@ -55,14 +71,6 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
   const handleDownloadCsv = () => {
     if (filteredHistory.length === 0) return;
     audioSynth.playClick();
-
-    const escapeCell = (val: string | number | null | undefined): string => {
-      const str = val === null || val === undefined ? '' : String(val);
-      if (/[",\n\r]/.test(str)) {
-        return `"${str.replace(/"/g, '""')}"`;
-      }
-      return str;
-    };
 
     const headers = [
       'Trade ID',
@@ -94,22 +102,11 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
       tr.closed_at ? new Date(tr.closed_at).toISOString() : '',
     ]);
 
-    const csvContent =
-      '\uFEFF' +
-      [headers, ...rows]
-        .map((row) => row.map((cell) => escapeCell(cell)).join(','))
-        .join('\r\n');
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const dateStamp = new Date().toISOString().slice(0, 10);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `aegis-trades-tax-report-${dateStamp}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    downloadCsvFile(
+      `aegis-trades-tax-report-${new Date().toISOString().slice(0, 10)}.csv`,
+      headers,
+      rows
+    );
 
     setCsvDone(true);
     window.setTimeout(() => setCsvDone(false), 2200);
@@ -244,9 +241,23 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                   </div>
 
                   <div className="mt-3 flex items-center justify-between border-t border-slate-800/80 pt-2.5">
-                    <span className="font-mono-tech text-[10px] text-slate-500">
-                      {new Date(trade.opened_at).toLocaleString()}
-                    </span>
+                    <div className="flex flex-col gap-0.5">
+                      <span
+                        className="inline-flex items-center gap-1 font-mono-tech text-[11px] font-semibold text-cyan-300"
+                        title={new Date(trade.opened_at).toLocaleString()}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className={`inline-block h-1.5 w-1.5 rounded-full bg-cyan-400 ${
+                            reducedMotion ? '' : 'animate-pulse'
+                          }`}
+                        />
+                        {t.openFor} {formatElapsed(nowMs - new Date(trade.opened_at).getTime())}
+                      </span>
+                      <span className="font-mono-tech text-[10px] text-slate-500">
+                        {new Date(trade.opened_at).toLocaleString()}
+                      </span>
+                    </div>
                     <NeonButton
                       variant={blockedByZeroLoss ? 'ghost' : 'rose'}
                       onClick={() => onCloseTrade(trade.id)}

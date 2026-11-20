@@ -92,6 +92,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [sendingBalTg, setSendingBalTg] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
   const [showGuideSql, setShowGuideSql] = useState(false);
+  const [muted, setMuted] = useState(() => audioSynth.isMuted());
 
   // Sync draft only when switching workspace/settings row or explicit settings update (ignore last_heartbeat ticks)
   useEffect(() => {
@@ -209,6 +210,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     { id: 'depth', label: t.coreStyleDepth },
   ];
   const timeThemeInfo = getTimeBasedTheme();
+  // Mute is the master gate, but the Sound FX preference can also silence audio.
+  // Keep the badge honest about the effective state so the two switches never disagree.
+  const audioSilent = muted || !draft.sound_enabled;
+  // The portfolio total includes coins and Funding/Earn; only Spot USDT can be spent.
+  const tradeableUsdt = binanceAccount?.usdtFree ?? 0;
+  const canFundOrders = Boolean(binanceAccount?.canTrade);
 
   return (
     <div className="space-y-4">
@@ -270,15 +277,58 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <div className="flex justify-end">
                 <button
                   type="button"
+                  disabled={audioSilent}
+                  title={audioSilent ? t.muteSoundTitle : t.testSoundBtn}
                   onClick={() => {
                     audioSynth.setEnabled(true);
                     audioSynth.playTradeChime(true);
                     audioSynth.setEnabled(draft.sound_enabled);
                   }}
-                  className="cursor-pointer rounded border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1 font-mono-tech text-[10px] font-semibold text-cyan-200 hover:bg-cyan-500/20"
+                  className="cursor-pointer rounded border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1 font-mono-tech text-[10px] font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   ♪ {t.testSoundBtn}
                 </button>
+              </div>
+            </div>
+
+            {/* Global Mute Sound (persisted in localStorage, silences every audioSynth effect) */}
+            <div className="rounded-xl border border-rose-500/30 bg-[#05070d] p-3.5 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <VolumeX
+                    className={`mt-0.5 h-4 w-4 shrink-0 ${
+                      muted ? 'text-rose-300' : 'text-slate-500'
+                    }`}
+                  />
+                  <div>
+                    <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-slate-100 uppercase">
+                      <span>{t.muteSoundTitle}</span>
+                      <InfoTip text={t.muteSoundHint} label={t.muteSoundTitle} />
+                    </div>
+                    <p className="mt-0.5 text-[11px] text-slate-400">{t.muteSoundHint}</p>
+                  </div>
+                </div>
+                <SciFiSwitch
+                  checked={muted}
+                  onChange={(v) => {
+                    audioSynth.setMuted(v);
+                    setMuted(v);
+                    if (!v) audioSynth.playToggle(true);
+                  }}
+                  label={t.muteSoundTitle}
+                  accent="rose"
+                />
+              </div>
+              <div className="flex justify-end">
+                <span
+                  className={`rounded border px-2 py-0.5 font-mono-tech text-[10px] font-semibold ${
+                    audioSilent
+                      ? 'border-rose-500/45 bg-rose-500/10 text-rose-200'
+                      : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  }`}
+                >
+                  {audioSilent ? t.soundMutedBadge : t.soundOnBadge}
+                </span>
               </div>
             </div>
 
@@ -1042,7 +1092,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
 
               {binanceAccount?.connected && (
                 <span className="font-mono-tech text-[11px] font-bold text-emerald-300">
-                  ${binanceAccount.totalPortfolioUsd.toFixed(2)} USD · ৳
+                  {t.portfolioLabel}: ${binanceAccount.totalPortfolioUsd.toFixed(2)} USD · ৳
                   {Math.round(binanceAccount.totalPortfolioUsd * BDT_PER_USD).toLocaleString('en-US')}
                 </span>
               )}
@@ -1062,10 +1112,15 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
 
             {binanceAccount?.connected && (
               <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-2.5 font-mono-tech text-[10px]">
-                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 text-emerald-300 font-bold">
-                  <span>REAL BINANCE HOLDINGS</span>
-                  <span>USDT FREE: ${binanceAccount.usdtFree.toFixed(2)}</span>
+                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 font-bold">
+                  <span className="text-emerald-300">REAL BINANCE HOLDINGS</span>
+                  <span className={canFundOrders ? 'text-emerald-300' : 'text-amber-300'}>
+                    {t.tradeableUsdtLabel}: ${tradeableUsdt.toFixed(2)}
+                  </span>
                 </div>
+                {!canFundOrders && (
+                  <div className="mb-1.5 text-amber-300">{t.tradeableHint}</div>
+                )}
                 {binanceAccount.assets.length > 0 ? (
                   <div className="flex flex-wrap gap-1.5">
                     {binanceAccount.assets.slice(0, 6).map((a) => (

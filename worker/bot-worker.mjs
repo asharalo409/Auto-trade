@@ -74,8 +74,8 @@ if (PORT > 0) {
               return;
             }
 
-            const usdtBalance = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, testnet);
-            if (usdtBalance === null) {
+            const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, testnet);
+            if (!portfolio) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ ok: false, error: 'Failed to verify Binance keys or fetch balance' }));
               return;
@@ -89,7 +89,7 @@ if (PORT > 0) {
                   binance_api_key: apiKey,
                   binance_api_secret: apiSecret,
                   use_testnet: testnet,
-                  balance_usdt: usdtBalance,
+                  balance_usdt: portfolio.total,
                   last_heartbeat: new Date().toISOString(),
                 })
                 .eq('id', settingsRow.id);
@@ -99,8 +99,13 @@ if (PORT > 0) {
             res.end(
               JSON.stringify({
                 ok: true,
-                usdtBalance,
-                message: `Binance API verified successfully. USDT Balance: $${usdtBalance.toFixed(2)}`,
+                usdtBalance: portfolio.total,
+                totalPortfolioUsd: portfolio.total,
+                usdtFree: portfolio.spot,
+                spotUsd: portfolio.spot,
+                fundingUsd: portfolio.funding,
+                earnUsd: portfolio.earn,
+                message: `Binance API verified successfully. Portfolio balance: $${portfolio.total.toFixed(2)} (Spot $${portfolio.spot.toFixed(2)})`,
               })
             );
           } catch (err) {
@@ -124,24 +129,36 @@ if (PORT > 0) {
           const apiSecret = (ENV_BINANCE_SECRET || settingsRow.binance_api_secret || '').trim();
           const useTestnet = process.env.BINANCE_TESTNET === 'false' ? false : (ENV_TESTNET || Boolean(settingsRow.use_testnet));
 
-          let usdtBalance = Number(settingsRow.balance_usdt || 0);
+          let spotUsdt = Number(settingsRow.balance_usdt || 0);
+          let fundingUsd = 0;
+          let earnUsd = 0;
           if (apiKey && apiSecret) {
-            const fetched = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet);
-            if (fetched !== null && Number.isFinite(fetched)) {
-              usdtBalance = fetched;
+            const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
+            if (portfolio) {
+              spotUsdt = portfolio.spot;
+              fundingUsd = portfolio.funding;
+              earnUsd = portfolio.earn;
             }
           }
+          const totalPortfolioUsd = Number((spotUsdt + fundingUsd + earnUsd).toFixed(2));
+          const walletBreakdown = [
+            { walletName: 'Spot', balanceUsd: spotUsdt },
+            { walletName: 'Funding', balanceUsd: fundingUsd },
+            { walletName: 'Earn', balanceUsd: earnUsd },
+          ].filter((w) => w.balanceUsd > 0);
 
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(
             JSON.stringify({
               ok: true,
-              usdtBalance,
-              totalUsdt: usdtBalance,
-              totalPortfolioUsd: usdtBalance,
-              spotUsd: usdtBalance,
-              fundingUsd: 0,
-              earnUsd: 0,
+              usdtBalance: totalPortfolioUsd,
+              usdtFree: spotUsdt,
+              totalUsdt: totalPortfolioUsd,
+              totalPortfolioUsd,
+              spotUsd: spotUsdt,
+              fundingUsd,
+              earnUsd,
+              walletBreakdown,
               assets: [],
             })
           );
@@ -367,6 +384,56 @@ async function fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet) {
   return Number((Number(usdt.free || 0) + Number(usdt.locked || 0)).toFixed(2));
 }
 
+async function fetchBinanceFundingUsdt(apiKey, apiSecret, useTestnet) {
+  if (useTestnet) return 0;
+  try {
+    const rows = await signedBinanceRequest('POST', '/sapi/v1/asset/get-funding-asset', apiKey, apiSecret, useTestnet, {});
+    if (!Array.isArray(rows)) return 0;
+    return rows
+      .filter((r) => r.asset === 'USDT')
+      .reduce(
+        (sum, r) => sum + Number(r.free || 0) + Number(r.locked || 0) + Number(r.freeze || 0),
+        0
+      );
+  } catch (err) {
+    console.warn('[FUNDING WALLET WARNING]', err.message);
+    return 0;
+  }
+}
+
+async function fetchBinanceEarnUsdt(apiKey, apiSecret, useTestnet) {
+  if (useTestnet) return 0;
+  try {
+    const data = await signedBinanceRequest('GET', '/sapi/v1/simple-earn/flexible/position', apiKey, apiSecret, useTestnet, { size: '50' });
+    const rows = Array.isArray(data?.rows) ? data.rows : [];
+    return rows
+      .filter((r) => r.asset === 'USDT')
+      .reduce((sum, r) => sum + Number(r.totalAmount || 0), 0);
+  } catch (err) {
+    console.warn('[EARN WALLET WARNING]', err.message);
+    return 0;
+  }
+}
+
+/**
+ * Full wallet total (Spot + Funding + Earn) so real money never reads as $0.00.
+ * Returns null when the Spot account itself cannot be read (bad keys/IP block).
+ */
+async function fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet) {
+  const spot = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet);
+  if (spot === null) return null;
+  const [funding, earn] = await Promise.all([
+    fetchBinanceFundingUsdt(apiKey, apiSecret, useTestnet),
+    fetchBinanceEarnUsdt(apiKey, apiSecret, useTestnet),
+  ]);
+  return {
+    spot: Number(spot.toFixed(2)),
+    funding: Number(funding.toFixed(2)),
+    earn: Number(earn.toFixed(2)),
+    total: Number((spot + funding + earn).toFixed(2)),
+  };
+}
+
 async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity, apiKey, apiSecret, useTestnet) {
   const params = {
     symbol,
@@ -379,6 +446,97 @@ async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity, ap
     params.quantity = Number(quantity).toFixed(5);
   }
   return signedBinanceRequest('POST', '/api/v3/order', apiKey, apiSecret, useTestnet, params);
+}
+
+// Binance rejects any Spot order below the symbol's MIN_NOTIONAL (usually $5) with
+// "Filter failure: NOTIONAL" and below LOT_SIZE stepSize with "Filter failure: LOT_SIZE".
+// These helpers keep every live entry compliant instead of aborting the whole cycle.
+const BINANCE_MIN_ORDER_USDT = 5.5;
+let exchangeFiltersCache = { at: 0, data: null };
+const lastWarnAt = new Map();
+
+async function warnThrottled(key, message, pair = null) {
+  const now = Date.now();
+  if (now - (lastWarnAt.get(key) || 0) < 10 * 60_000) return;
+  lastWarnAt.set(key, now);
+  console.warn(message);
+  await appendLog('WARNING', message, pair);
+}
+
+async function getSymbolFilters(symbol, useTestnet) {
+  const fallback = { stepSize: 0, minQty: 0, minNotional: BINANCE_MIN_ORDER_USDT };
+  if (!exchangeFiltersCache.data || Date.now() - exchangeFiltersCache.at > 6 * 3600_000) {
+    try {
+      const info = await fetchPublicWithFallback('/api/v3/exchangeInfo', useTestnet);
+      const map = {};
+      for (const s of info.symbols || []) {
+        const filters = s.filters || [];
+        const lot = filters.find((f) => f.filterType === 'LOT_SIZE');
+        const notional =
+          filters.find((f) => f.filterType === 'MIN_NOTIONAL') ||
+          filters.find((f) => f.filterType === 'NOTIONAL');
+        map[s.symbol] = {
+          stepSize: Number(lot?.stepSize || 0),
+          minQty: Number(lot?.minQty || 0),
+          minNotional: Number(notional?.minNotional || notional?.notional || 5),
+        };
+      }
+      exchangeFiltersCache = { at: Date.now(), data: map };
+    } catch (err) {
+      console.warn('[FILTERS] exchangeInfo unavailable, using defaults:', err.message);
+      return fallback;
+    }
+  }
+  return exchangeFiltersCache.data[symbol] || fallback;
+}
+
+function floorToStep(qty, stepSize) {
+  if (!stepSize || stepSize <= 0) return Number(qty.toFixed(8));
+  const decimals = Math.max(0, Math.round(-Math.log10(stepSize)));
+  return Number((Math.floor(qty / stepSize) * stepSize).toFixed(decimals));
+}
+
+/**
+ * Places a MIN_NOTIONAL/LOT_SIZE-compliant live BUY, or logs one throttled warning
+ * and returns null. Never throws, so one rejected order cannot abort the whole cycle.
+ */
+async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret, useTestnet, availableUsdt) {
+  const filters = await getSymbolFilters(symbol, useTestnet);
+  const requested = Math.max(1, Number(quoteQty) || 1);
+  const notional = Math.max(requested, filters.minNotional || 5, BINANCE_MIN_ORDER_USDT);
+  const available = Number.isFinite(availableUsdt) ? availableUsdt : 0;
+
+  if (available < notional) {
+    await warnThrottled(
+      `no-funds-${symbol}`,
+      available <= 0
+        ? `LIVE ${label} SKIPPED ${symbol} — Binance Spot USDT is $0.00. Transfer USDT to your Spot wallet (Funding/Earn balances cannot be traded) and press Sync Balance.`
+        : `LIVE ${label} SKIPPED ${symbol} — needs $${notional.toFixed(2)} but Spot has $${available.toFixed(2)} available.`,
+      symbol
+    );
+    return null;
+  }
+
+  let qty = floorToStep(notional / livePx, filters.stepSize);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    qty = filters.minQty > 0 ? floorToStep(filters.minQty, filters.stepSize) || filters.minQty : 0;
+  }
+  if (!qty) return null;
+
+  try {
+    const order = await placeBinanceMarketOrder(symbol, 'BUY', notional, qty, apiKey, apiSecret, useTestnet);
+    return {
+      filledQty: Number(order?.executedQty) || qty,
+      notional: Number(order?.cummulativeQuoteQty) || notional,
+    };
+  } catch (err) {
+    await warnThrottled(
+      `order-failed-${symbol}`,
+      `LIVE ${label} REJECTED ${symbol}: ${err.message} — skipped this cycle (no phantom trade created).`,
+      symbol
+    );
+    return null;
+  }
 }
 
 let lastLoggedBalance = null;
@@ -402,14 +560,16 @@ async function runCycle() {
 
     // 1. ALWAYS sync Real Binance Spot USDT Balance in every 15s loop (regardless of bot_enabled ON/OFF)
     const heartbeatPatch = { last_heartbeat: new Date().toISOString() };
+    let tradeableUsdt = Number(settings.balance_usdt || 0);
     if (apiKey && apiSecret) {
       try {
-        const spotUsdt = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet);
-        if (spotUsdt !== null && Number.isFinite(spotUsdt)) {
-          heartbeatPatch.balance_usdt = spotUsdt;
-          if (lastLoggedBalance !== spotUsdt) {
-            lastLoggedBalance = spotUsdt;
-            const logMsg = `[BALANCE SYNC] Live Spot USDT: $${spotUsdt.toFixed(2)}`;
+        const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
+        if (portfolio) {
+          tradeableUsdt = portfolio.spot;
+          heartbeatPatch.balance_usdt = portfolio.total;
+          if (lastLoggedBalance !== portfolio.total) {
+            lastLoggedBalance = portfolio.total;
+            const logMsg = `[BALANCE SYNC] Portfolio $${portfolio.total.toFixed(2)} — Spot $${portfolio.spot.toFixed(2)} (tradeable) · Funding $${portfolio.funding.toFixed(2)} · Earn $${portfolio.earn.toFixed(2)}`;
             console.log(logMsg);
             await appendLog('INFO', logMsg);
           }
@@ -462,7 +622,14 @@ async function runCycle() {
       tr.profit_pct = profitPct;
     }
 
-    const lot = Math.max(1, Number(settings.amount_per_trade || 10));
+    const lotRequested = Math.max(1, Number(settings.amount_per_trade || 10));
+    const lot = apiKey && apiSecret ? Math.max(lotRequested, BINANCE_MIN_ORDER_USDT) : lotRequested;
+    if (lot > lotRequested) {
+      await warnThrottled(
+        'lot-raised',
+        `Lot size raised from $${lotRequested.toFixed(2)} to $${lot.toFixed(2)} — Binance Spot rejects orders under $5 MIN_NOTIONAL (this caused 'Filter failure: NOTIONAL').`
+      );
+    }
     const tpPct = Number(settings.take_profit_pct || 2.4);
     const dcaEnabled = settings.dca_enabled !== false;
     const dcaStepPct = Math.max(0.2, Number(settings.dca_step_pct || 1.5));
@@ -499,7 +666,16 @@ async function runCycle() {
         if (takeProfitTriggered || stopLossTriggered) {
           for (const tr of pairOpen) {
             if (apiKey && apiSecret) {
-              await placeBinanceMarketOrder(symbol, 'SELL', 0, tr.quantity, apiKey, apiSecret, useTestnet);
+              try {
+                await placeBinanceMarketOrder(symbol, 'SELL', 0, tr.quantity, apiKey, apiSecret, useTestnet);
+              } catch (sellErr) {
+                await warnThrottled(
+                  `sell-failed-${symbol}`,
+                  `LIVE SELL REJECTED ${symbol}: ${sellErr.message} — position kept open, next cycle will retry.`,
+                  symbol
+                );
+                continue;
+              }
             }
             await supabase
               .from('trades')
@@ -525,9 +701,22 @@ async function runCycle() {
           const dropPct = ((lowestEntry - livePx) / lowestEntry) * 100;
           if (dropPct >= dcaStepPct && totalInvested + lot <= maxPerPair) {
             let filledQty = Number((lot / livePx).toFixed(5));
+            let orderNotional = lot;
             if (apiKey && apiSecret) {
-              const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0, apiKey, apiSecret, useTestnet);
-              if (order.executedQty) filledQty = Number(order.executedQty);
+              const buy = await buyWithGuards(
+                symbol,
+                'DCA',
+                lot,
+                livePx,
+                apiKey,
+                apiSecret,
+                useTestnet,
+                tradeableUsdt
+              );
+              if (!buy) continue;
+              filledQty = buy.filledQty;
+              orderNotional = buy.notional;
+              tradeableUsdt = Math.max(0, Number((tradeableUsdt - orderNotional).toFixed(2)));
             }
             const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
             await supabase.from('trades').insert({
@@ -538,7 +727,7 @@ async function runCycle() {
               entry_price: livePx,
               current_price: livePx,
               quantity: filledQty,
-              invested_usdt: lot,
+              invested_usdt: orderNotional,
               profit_usdt: 0,
               profit_pct: 0,
               take_profit_price: Number(
@@ -546,7 +735,7 @@ async function runCycle() {
               ),
               opened_at: new Date().toISOString(),
             });
-            const msg = `DCA RE-BUY #${pairOpen.length + 1} ${symbol} @ $${livePx} (-${dropPct.toFixed(2)}% dip) | $${lot} USDT`;
+            const msg = `DCA RE-BUY #${pairOpen.length + 1} ${symbol} @ $${livePx} (-${dropPct.toFixed(2)}% dip) | $${orderNotional.toFixed(2)} USDT`;
             await appendLog('TRADE', msg, symbol);
             if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`, telegramToken, telegramChatId);
           }
@@ -566,9 +755,22 @@ async function runCycle() {
 
         if (hasHealthyVolume && favorableMomentum) {
           let filledQty = Number((lot / livePx).toFixed(5));
+          let orderNotional = lot;
           if (apiKey && apiSecret) {
-            const order = await placeBinanceMarketOrder(symbol, 'BUY', lot, 0, apiKey, apiSecret, useTestnet);
-            if (order.executedQty) filledQty = Number(order.executedQty);
+            const buy = await buyWithGuards(
+              symbol,
+              'ENTRY',
+              lot,
+              livePx,
+              apiKey,
+              apiSecret,
+              useTestnet,
+              tradeableUsdt
+            );
+            if (!buy) continue;
+            filledQty = buy.filledQty;
+            orderNotional = buy.notional;
+            tradeableUsdt = Math.max(0, Number((tradeableUsdt - orderNotional).toFixed(2)));
           }
           const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
           await supabase.from('trades').insert({
@@ -579,7 +781,7 @@ async function runCycle() {
             entry_price: livePx,
             current_price: livePx,
             quantity: filledQty,
-            invested_usdt: lot,
+            invested_usdt: orderNotional,
             profit_usdt: 0,
             profit_pct: 0,
             take_profit_price: Number(
@@ -588,7 +790,7 @@ async function runCycle() {
             opened_at: new Date().toISOString(),
           });
           activeTrades.push({ pair: symbol });
-          const detailedMsg = `🚀 <b>AEGIS LIVE ENTRY BUY</b>\nPair: <b>${symbol}</b>\nPrice: $${livePx}\nInvested: $${lot} USDT\n24h Change: ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%\nVolume: $${Math.round(quoteVolume).toLocaleString()}\nMode: ${zeroLoss ? 'Zero-Loss Shield ON' : 'Standard'}`;
+          const detailedMsg = `🚀 <b>AEGIS LIVE ENTRY BUY</b>\nPair: <b>${symbol}</b>\nPrice: $${livePx}\nInvested: $${orderNotional.toFixed(2)} USDT\n24h Change: ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%\nVolume: $${Math.round(quoteVolume).toLocaleString()}\nMode: ${zeroLoss ? 'Zero-Loss Shield ON' : 'Standard'}`;
           await appendLog('TRADE', detailedMsg, symbol);
           if (settings.telegram_enabled) await sendTelegram(detailedMsg, telegramToken, telegramChatId);
         }

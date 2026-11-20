@@ -8,6 +8,7 @@ import {
   Flame,
   Languages,
   Layers,
+  LineChart,
   Lock,
   RefreshCw,
   Settings as SettingsIcon,
@@ -18,6 +19,7 @@ import { CommandCenter } from './components/screens/CommandCenter';
 import { LiveEngineFeed } from './components/screens/LiveEngineFeed';
 import { LoginScreen } from './components/screens/LoginScreen';
 import { MarketHeatmap } from './components/screens/MarketHeatmap';
+import { PerformanceScreen } from './components/screens/PerformanceScreen';
 import { RiskPanel } from './components/screens/RiskPanel';
 import { SettingsPanel } from './components/screens/SettingsPanel';
 import { TradesScreen } from './components/screens/TradesScreen';
@@ -25,6 +27,7 @@ import { BootSequence } from './components/ui/BootSequence';
 import { NeonButton } from './components/ui/MotionPrimitives';
 import { TickerBar } from './components/ui/TickerBar';
 import { BDT_PER_USD } from './data/demoData';
+import { MIN_TRADEABLE_USDT } from './lib/tradeLimits';
 import { useTradingTerminal } from './hooks/useTradingTerminal';
 import { translations } from './i18n/translations';
 import { audioSynth } from './lib/audioSynth';
@@ -70,6 +73,8 @@ export default function App() {
   const terminal = useTradingTerminal();
   const t = translations[lang];
   const activeTheme = TERMINAL_THEMES[terminal.effectiveTheme];
+  // Headline = full portfolio; only Spot USDT can actually fund orders.
+  const tradeableUsdt = terminal.binanceAccount?.usdtFree ?? 0;
 
   const handleBootDone = useCallback(() => {
     setBootComplete(true);
@@ -78,12 +83,19 @@ export default function App() {
   const navItems: {
     id: TabId;
     label: string;
+    shortLabel?: string;
     icon: React.ComponentType<{ className?: string }>;
   }[] = [
     { id: 'command', label: t.navCommand, icon: Cpu },
     { id: 'market', label: t.navMarket, icon: Flame },
     { id: 'feed', label: t.navFeed, icon: Terminal },
     { id: 'trades', label: t.navTrades, icon: Layers },
+    {
+      id: 'performance',
+      label: t.navPerformance,
+      shortLabel: t.navPerformanceShort,
+      icon: LineChart,
+    },
     { id: 'risk', label: t.navRisk, icon: BarChart3 },
     { id: 'settings', label: t.navSettings, icon: SettingsIcon },
   ];
@@ -269,7 +281,7 @@ export default function App() {
                           ? `Binance Sync Error: ${terminal.binanceAccount.errorDetail}`
                           : terminal.syncingBalance
                             ? 'Syncing Live Binance Balance...'
-                            : 'Live Binance Portfolio Balance (USD & BDT)'
+                            : 'Live Binance portfolio — coins + Spot/Funding/Earn. Tradeable cash is Spot USDT only.'
                       : 'Virtual Demo USDT Balance (USD & BDT)'
                   }
                   className={`flex min-h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono-tech text-[11px] font-bold tracking-tight transition-all whitespace-nowrap ${
@@ -293,24 +305,37 @@ export default function App() {
                         : 'bg-cyan-400'
                     }`}
                   />
-                  <span>
-                    {terminal.activeWorkspace === 'LIVE' ? 'LIVE' : 'DEMO'}:{' '}
-                    {terminal.activeWorkspace === 'LIVE' && terminal.syncingBalance
-                      ? 'SYNCING...'
-                      : `$${terminal.stats.balance.toLocaleString('en-US', {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 2,
-                        })}`}
-                    {terminal.activeWorkspace === 'LIVE' && !terminal.hasBinanceKeys && (
-                      <span className="ml-1 text-[10px] text-amber-300">(NO KEYS)</span>
-                    )}
-                    {terminal.activeWorkspace === 'LIVE' && terminal.binanceAccount?.errorDetail && (
-                      <span className="ml-1 text-[10px] text-rose-300">(API ERR)</span>
-                    )}
-                    <span className="hidden sm:inline text-emerald-200/90">
-                      {' '}
-                      · ৳{Math.round(terminal.stats.balance * BDT_PER_USD).toLocaleString('en-US')}
+                  <span className="flex flex-col items-start leading-tight">
+                    <span>
+                      {terminal.activeWorkspace === 'LIVE' ? 'LIVE' : 'DEMO'}:{' '}
+                      {terminal.activeWorkspace === 'LIVE' && terminal.syncingBalance
+                        ? 'SYNCING...'
+                        : `$${terminal.stats.balance.toLocaleString('en-US', {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}`}
+                      {terminal.activeWorkspace === 'LIVE' && !terminal.hasBinanceKeys && (
+                        <span className="ml-1 text-[10px] text-amber-300">(NO KEYS)</span>
+                      )}
+                      {terminal.activeWorkspace === 'LIVE' && terminal.binanceAccount?.errorDetail && (
+                        <span className="ml-1 text-[10px] text-rose-300">(API ERR)</span>
+                      )}
+                      <span className="hidden text-emerald-200/90 sm:inline">
+                        {' '}
+                        · ৳{Math.round(terminal.stats.balance * BDT_PER_USD).toLocaleString('en-US')}
+                      </span>
                     </span>
+                    {terminal.activeWorkspace === 'LIVE' && terminal.binanceAccount?.connected && (
+                      <span
+                        className={`text-[9px] font-semibold tracking-tight ${
+                          tradeableUsdt >= MIN_TRADEABLE_USDT
+                            ? 'text-emerald-300/85'
+                            : 'text-amber-300'
+                        }`}
+                      >
+                        {t.tradeableUsdtShort}: ${tradeableUsdt.toFixed(2)}
+                      </span>
+                    )}
                   </span>
                 </button>
               </div>
@@ -464,6 +489,14 @@ export default function App() {
                 />
               )}
 
+              {activeTab === 'performance' && (
+                <PerformanceScreen
+                  t={t}
+                  trades={terminal.trades}
+                  stats={terminal.stats}
+                />
+              )}
+
               {activeTab === 'risk' && (
                 <RiskPanel
                   t={t}
@@ -568,7 +601,7 @@ export default function App() {
           aria-label="Mobile Navigation"
           className="fixed right-0 bottom-0 left-0 z-40 border-t border-cyan-500/25 bg-[#060911]/95 px-1 pb-safe lg:hidden"
         >
-          <div className="grid h-14 grid-cols-6 items-center">
+          <div className="grid h-14 grid-cols-7 items-center">
             {navItems.map((item) => {
               const Icon = item.icon;
               const active = activeTab === item.id;
@@ -598,7 +631,7 @@ export default function App() {
                   )}
                   <Icon className="h-4 w-4" />
                   <span className="font-mono-tech text-[9px] font-semibold tracking-tight uppercase truncate max-w-full px-0.5">
-                    {item.label}
+                    {item.shortLabel ?? item.label}
                   </span>
                 </button>
               );

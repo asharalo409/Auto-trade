@@ -1,10 +1,31 @@
 // Refined Web Audio API synthesizer with lowpass master chain and musical harmonic voicings
 
+const STORAGE_MUTE_KEY = 'aegis_mute_sound_v1';
+
+function readStoredMute(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(STORAGE_MUTE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function persistMute(value: boolean) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(STORAGE_MUTE_KEY, value ? 'true' : 'false');
+  } catch {
+    // ignore storage errors
+  }
+}
+
 class TerminalAudioSynth {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
   private filter: BiquadFilterNode | null = null;
   private enabled = false;
+  private muted = readStoredMute();
   private lastHoverAt = 0;
 
   setEnabled(value: boolean) {
@@ -15,8 +36,21 @@ class TerminalAudioSynth {
     return this.enabled;
   }
 
+  /** Global mute: suppresses every sound effect and survives reloads via localStorage. */
+  setMuted(value: boolean) {
+    this.muted = value;
+    persistMute(value);
+    if (value && this.ctx && this.ctx.state === 'running') {
+      this.ctx.suspend().catch(() => {});
+    }
+  }
+
+  isMuted() {
+    return this.muted;
+  }
+
   private getAudioGraph(): { ctx: AudioContext; destination: AudioNode } | null {
-    if (!this.enabled || typeof window === 'undefined') return null;
+    if (!this.enabled || this.muted || typeof window === 'undefined') return null;
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return null;
 
     if (!this.ctx) {

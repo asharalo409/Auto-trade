@@ -17,6 +17,7 @@ import { audioSynth } from '../lib/audioSynth';
 import { fetchBinance24hrTickers, openBinanceStream } from '../lib/binanceMarket';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { dispatchTelegramAlert } from '../lib/telegram';
+import { MIN_TRADEABLE_USDT } from '../lib/tradeLimits';
 import { getTimeBasedTheme } from '../lib/themes';
 import {
   BinanceAccountSummary,
@@ -207,6 +208,23 @@ function isMissingSupabaseTableError(error: { code?: string; message?: string } 
   );
 }
 
+/**
+ * Single source of truth for reading an account value out of a balance payload.
+ * Portfolio value (Spot + Funding + Earn + coin holdings) must win over USDT-only
+ * totals, otherwise an account holding BTC/ETH reports $0.00.
+ */
+function pickPortfolioUsd(
+  source:
+    | { totalPortfolioUsd?: number; totalUsdt?: number; usdtBalance?: number }
+    | null
+    | undefined,
+  fallback = 0
+): number {
+  if (!source) return fallback;
+  const value = source.totalPortfolioUsd ?? source.usdtBalance ?? source.totalUsdt;
+  return Number.isFinite(value) ? Number(value) : fallback;
+}
+
 function mergeAndDedupeLogs(entries: LogEntry[]): LogEntry[] {
   const sorted = [...entries].sort(
     (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
@@ -250,7 +268,19 @@ export function useTradingTerminal() {
   const [activeWorkspace, setActiveWorkspace] = useState<TradingMode>(() => {
     if (typeof window === 'undefined') return 'DEMO';
     try {
-      return (window.localStorage.getItem(STORAGE_WORKSPACE_KEY) as TradingMode) || 'DEMO';
+      // The workspace is persisted with JSON.stringify ("DEMO" / "LIVE") but was read
+      // raw here, so every reload after a workspace switch produced the value '"DEMO"'
+      // and fell through to the LIVE branch with an empty trade list.
+      const raw = window.localStorage.getItem(STORAGE_WORKSPACE_KEY);
+      if (!raw) return 'DEMO';
+      let value = raw;
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed === 'string') value = parsed;
+      } catch {
+        value = raw.replace(/"/g, '');
+      }
+      return value === 'LIVE' ? 'LIVE' : 'DEMO';
     } catch {
       return 'DEMO';
     }
@@ -432,9 +462,7 @@ export function useTradingTerminal() {
       const wsBal =
         workspace === 'LIVE'
           ? binanceAccountRef.current?.connected
-            ? binanceAccountRef.current.totalPortfolioUsd > 0
-              ? binanceAccountRef.current.totalPortfolioUsd
-              : binanceAccountRef.current.totalUsdt
+            ? pickPortfolioUsd(binanceAccountRef.current)
             : 0
           : Number(targetSettings.balance_usdt ?? 10000);
       const bdtVal = Math.round(wsBal * BDT_PER_USD);
@@ -1151,13 +1179,10 @@ export function useTradingTerminal() {
     const lockedCapital = Number(
       openTradesList.reduce((acc, t) => acc + t.invested_usdt, 0).toFixed(2)
     );
+    // Every backend now reports the full portfolio in totalPortfolioUsd, so the
+    // old USDT-only fallback (which hid coin holdings as $0.00) is no longer needed.
     const liveVerifiedBalance = binanceAccount?.connected
-      ? Number(
-          (binanceAccount.totalPortfolioUsd > 0
-            ? binanceAccount.totalPortfolioUsd
-            : binanceAccount.totalUsdt
-          ).toFixed(2)
-        )
+      ? Number(pickPortfolioUsd(binanceAccount).toFixed(2))
       : 0;
     const baseBalance =
       activeWorkspace === 'LIVE'
@@ -1712,22 +1737,25 @@ export function useTradingTerminal() {
         const data = text ? JSON.parse(text) : {};
 
         if (res.ok && (data.ok || data.usdtBalance !== undefined || data.totalUsdt !== undefined)) {
-          const usdtBal = Number(data.usdtBalance ?? data.totalUsdt ?? data.totalPortfolioUsd ?? 0);
+          const usdtBal = pickPortfolioUsd(data);
+          // usdtFree is the only spendable cash (Spot USDT). Never fall back to the
+          // portfolio total here, or coins/Funding would look like tradeable cash.
+          const usdtFree = Number(data.usdtFree ?? 0);
           const summary: BinanceAccountSummary & { ok: boolean } = {
             ok: true,
             connected: true,
-            usdtFree: Number(data.usdtFree ?? usdtBal),
+            usdtFree,
             usdtLocked: Number(data.usdtLocked ?? 0),
             totalUsdt: usdtBal,
             totalPortfolioUsd: usdtBal,
-            spotUsd: Number(data.spotUsd ?? usdtBal),
+            spotUsd: Number(data.spotUsd ?? usdtFree),
             fundingUsd: Number(data.fundingUsd ?? 0),
             earnUsd: Number(data.earnUsd ?? 0),
             walletBreakdown: Array.isArray(data.walletBreakdown) && data.walletBreakdown.length > 0
               ? data.walletBreakdown
               : [{ walletName: 'Spot', balanceUsd: usdtBal }],
             assets: Array.isArray(data.assets) ? data.assets : [],
-            canTrade: true,
+            canTrade: usdtFree >= MIN_TRADEABLE_USDT,
             lastSyncedAt: new Date().toISOString(),
             errorDetail: null,
           };
@@ -1876,7 +1904,7 @@ export function useTradingTerminal() {
       if (activeBn.api_key.trim() && activeBn.api_secret.trim()) {
         const synced = await refreshBinanceBalance(activeBn);
         if (synced.ok) {
-          liveUsd = synced.totalPortfolioUsd > 0 ? synced.totalPortfolioUsd : synced.totalUsdt;
+          liveUsd = pickPortfolioUsd(synced);
           usdtFree = synced.usdtFree;
           spotUsd = synced.spotUsd ?? 0;
           fundingUsd = synced.fundingUsd ?? 0;
@@ -2049,7 +2077,7 @@ export function useTradingTerminal() {
         const text = await res.text();
         const data = text ? JSON.parse(text) : {};
         if (res.ok && (data.ok || data.usdtBalance !== undefined || data.totalUsdt !== undefined)) {
-          const usdtBalance = Number(data.usdtBalance ?? data.totalUsdt ?? data.totalPortfolioUsd ?? 0);
+          const usdtBalance = pickPortfolioUsd(data);
           const bdtVal = Math.round(usdtBalance * BDT_PER_USD);
           setBinanceConfig({ ...trimmedCfg, verified: true });
           setLiveSettings((prev) => ({ ...prev, balance_usdt: usdtBalance }));

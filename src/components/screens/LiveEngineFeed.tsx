@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { Check, Copy, Pause, Play, Search, Terminal } from 'lucide-react';
+import { Check, Copy, Download, Pause, Play, Search, Terminal } from 'lucide-react';
+import { downloadCsvFile } from '../../lib/csvExport';
 import { LogEntry, LogLevel } from '../../types/trading';
 import { SkeletonBlock } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
@@ -49,6 +50,7 @@ export const LiveEngineFeed: React.FC<LiveEngineFeedProps> = ({ t, logs, loading
   const [searchQuery, setSearchQuery] = useState('');
   const [autoScroll, setAutoScroll] = useState(true);
   const [copiedIpKey, setCopiedIpKey] = useState<string | null>(null);
+  const [csvDone, setCsvDone] = useState(false);
   const scrollBoxRef = useRef<HTMLDivElement>(null);
 
   const handleCopyIp = async (logId: string, ip: string) => {
@@ -82,6 +84,22 @@ export const LiveEngineFeed: React.FC<LiveEngineFeedProps> = ({ t, logs, loading
     }
   }, [filteredLogs.length, autoScroll]);
 
+  const handleExportLogsCsv = () => {
+    if (filteredLogs.length === 0) return;
+    downloadCsvFile(
+      `aegis-engine-logs-${new Date().toISOString().slice(0, 10)}.csv`,
+      ['Timestamp (UTC)', 'Level', 'Pair', 'Message'],
+      filteredLogs.map((log) => [
+        new Date(log.created_at).toISOString(),
+        log.level,
+        log.pair ?? '',
+        log.message,
+      ])
+    );
+    setCsvDone(true);
+    window.setTimeout(() => setCsvDone(false), 2200);
+  };
+
   const getLevelColor = (lvl: LogLevel) => {
     switch (lvl) {
       case 'TRADE':
@@ -105,18 +123,34 @@ export const LiveEngineFeed: React.FC<LiveEngineFeedProps> = ({ t, logs, loading
       title={t.liveFeedTitle}
       subtitle={t.liveFeedSub}
       rightSlot={
-        <button
-          type="button"
-          onClick={() => setAutoScroll((v) => !v)}
-          className={`flex min-h-[36px] items-center gap-1.5 rounded-lg border px-3 py-1.5 font-mono-tech text-[11px] transition-colors ${
-            autoScroll
-              ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
-              : 'border-slate-700 bg-slate-900 text-slate-400'
-          }`}
-        >
-          {autoScroll ? <Play className="h-3 w-3" /> : <Pause className="h-3 w-3" />}
-          {autoScroll ? t.autoScrollOn : t.autoScrollOff}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleExportLogsCsv}
+            disabled={filteredLogs.length === 0}
+            title={`${t.exportLogsCsv} (${filteredLogs.length})`}
+            className={`flex min-h-[36px] items-center gap-1.5 rounded-lg border px-3 py-1.5 font-mono-tech text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+              csvDone
+                ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                : 'border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20'
+            }`}
+          >
+            {csvDone ? <Check className="h-3 w-3" /> : <Download className="h-3 w-3" />}
+            {csvDone ? t.logsExported : t.exportLogsCsv}
+          </button>
+          <button
+            type="button"
+            onClick={() => setAutoScroll((v) => !v)}
+            className={`flex min-h-[36px] items-center gap-1.5 rounded-lg border px-3 py-1.5 font-mono-tech text-[11px] transition-colors ${
+              autoScroll
+                ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                : 'border-slate-700 bg-slate-900 text-slate-400'
+            }`}
+          >
+            {autoScroll ? <Play className="h-3 w-3" /> : <Pause className="h-3 w-3" />}
+            {autoScroll ? t.autoScrollOn : t.autoScrollOff}
+          </button>
+        </div>
       }
     >
       <div className="mb-3 flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">

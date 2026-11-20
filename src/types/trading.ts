@@ -1,6 +1,13 @@
 export type Language = 'en' | 'bn';
 
-export type TabId = 'command' | 'market' | 'feed' | 'trades' | 'risk' | 'settings';
+export type TabId =
+  | 'command'
+  | 'market'
+  | 'feed'
+  | 'trades'
+  | 'performance'
+  | 'risk'
+  | 'settings';
 
 export type BotStatus = 'RUNNING' | 'STOPPED' | 'OFFLINE';
 

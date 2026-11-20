@@ -614,7 +614,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
 
   const kpis = [
     {
-      label: t.balance,
+      label: t.portfolioLabel,
       value: stats.balance,
       prefix: '$',
       decimals: 2,
@@ -756,6 +756,19 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           </p>
           {workspace === 'LIVE' && binanceAccount?.connected && (
             <div className="mt-1.5 flex flex-wrap items-center gap-1.5 font-mono-tech text-[10px]">
+              <span
+                title={t.tradeableHint}
+                className={`rounded border px-2 py-0.5 font-semibold ${
+                  binanceAccount.canTrade
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                    : 'border-amber-500/45 bg-amber-500/10 text-amber-200'
+                }`}
+              >
+                {t.tradeableUsdtLabel}: ${binanceAccount.usdtFree.toFixed(2)}
+              </span>
+              {!binanceAccount.canTrade && (
+                <span className="text-amber-300/90">{t.tradeableHint}</span>
+              )}
               {stats.balance === 0 ? (
                 <span className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-amber-200">
                   {t.liveBalanceEmptyZero}
