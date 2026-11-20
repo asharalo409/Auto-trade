@@ -58,7 +58,7 @@ import { CandlestickChart } from '../charts/CandlestickChart';
 import { QuantumCore3D } from '../three/QuantumCore3D';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { InfoTip } from '../ui/InfoTip';
-import { PremiumCommandHero } from '../ui/PremiumCommandHero';
+import { CoinFlashSignal, PremiumCommandHero } from '../ui/PremiumCommandHero';
 import { NeonButton, SciFiSwitch, SkeletonBlock } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
 import { BinanceOrderBook } from '../widgets/BinanceOrderBook';
@@ -114,6 +114,14 @@ interface CommandCenterProps {
 
 const TIMEFRAMES: EquityTimeframe[] = ['1D', '1W', '1M', 'ALL'];
 const DESKTOP_ALERTS_STORAGE_KEY = 'aegis_desktop_alerts_enabled_v1';
+
+interface TradeToastNotice {
+  id: string;
+  pair: string;
+  kind: 'OPEN' | 'CLOSED';
+  profit: number;
+  detail: string;
+}
 
 interface LiveSignalNotice {
   id: string;
@@ -269,6 +277,8 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
     getDesktopNotificationPermission()
   );
   const [activeSignalNotice, setActiveSignalNotice] = useState<LiveSignalNotice | null>(null);
+  const [tradeFlash, setTradeFlash] = useState<CoinFlashSignal | null>(null);
+  const [tradeToast, setTradeToast] = useState<TradeToastNotice | null>(null);
 
   const [customAlerts, setCustomAlerts] = useState<{
     id: string;
@@ -500,6 +510,20 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
       const prevStatus = seen.get(tr.id);
       if (!prevStatus) {
         seen.set(tr.id, tr.status);
+        if (tr.status === 'OPEN') {
+          setTradeFlash({
+            symbol: tr.pair,
+            direction: 'up',
+            id: `${tr.id}-open-${Date.now()}`,
+          });
+          setTradeToast({
+            id: `${tr.id}-open`,
+            pair: tr.pair,
+            kind: 'OPEN',
+            profit: 0,
+            detail: `${tr.side} $${tr.invested_usdt.toFixed(2)} @ $${tr.entry_price}`,
+          });
+        }
         if (desktopAlertsEnabled && tr.status === 'OPEN') {
           dispatchTradeSignalNotification({
             pair: tr.pair,
@@ -512,6 +536,18 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         }
       } else if (prevStatus === 'OPEN' && tr.status === 'CLOSED') {
         seen.set(tr.id, tr.status);
+        setTradeFlash({
+          symbol: tr.pair,
+          direction: tr.profit_usdt >= 0 ? 'up' : 'down',
+          id: `${tr.id}-close-${Date.now()}`,
+        });
+        setTradeToast({
+          id: `${tr.id}-close`,
+          pair: tr.pair,
+          kind: 'CLOSED',
+          profit: Number(tr.profit_usdt || 0),
+          detail: `Exit @ $${tr.exit_price ?? tr.current_price} · ${tr.profit_pct >= 0 ? '+' : ''}${tr.profit_pct.toFixed(2)}%`,
+        });
         if (desktopAlertsEnabled) {
           dispatchTradeSignalNotification({
             pair: tr.pair,
@@ -525,6 +561,15 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
       }
     }
   }, [trades, workspace, desktopAlertsEnabled, dispatchTradeSignalNotification]);
+
+  // Top sliding trade banner auto-dismisses so it never blocks the terminal.
+  useEffect(() => {
+    if (!tradeToast) return;
+    const timer = window.setTimeout(() => {
+      setTradeToast((prev) => (prev?.id === tradeToast.id ? null : prev));
+    }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [tradeToast]);
 
   const handleToggleDesktopAlerts = async () => {
     audioSynth.playClick();
@@ -745,6 +790,55 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
 
   return (
     <div className="space-y-4">
+      {/* Top sliding trade execution toast */}
+      <AnimatePresence>
+        {tradeToast && (
+          <motion.div
+            key={tradeToast.id}
+            initial={reducedMotion ? false : { opacity: 0, y: -80 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={reducedMotion ? undefined : { opacity: 0, y: -80 }}
+            transition={{ type: 'spring', stiffness: 420, damping: 34 }}
+            className="pointer-events-none fixed inset-x-3 top-3 z-[60] mx-auto flex max-w-md justify-center"
+          >
+            <div
+              role="status"
+              className={`pointer-events-auto flex w-full items-center gap-2.5 rounded-2xl border px-3.5 py-2.5 backdrop-blur-xl ${
+                tradeToast.kind === 'CLOSED'
+                  ? tradeToast.profit >= 0
+                    ? 'border-emerald-400/60 bg-[rgba(9,26,20,0.88)] shadow-[0_16px_40px_-16px_rgba(16,185,129,0.65)]'
+                    : 'border-rose-400/60 bg-[rgba(30,10,16,0.88)] shadow-[0_16px_40px_-16px_rgba(244,63,94,0.65)]'
+                  : 'border-cyan-400/55 bg-[rgba(9,20,28,0.88)] shadow-[0_16px_40px_-16px_rgba(34,211,238,0.55)]'
+              }`}
+            >
+              <span className="text-base leading-none">
+                {tradeToast.kind === 'OPEN' ? '⚡' : tradeToast.profit >= 0 ? '✅' : '🛑'}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-mono-tech text-[12px] font-bold text-white">
+                  {tradeToast.kind === 'OPEN'
+                    ? `${tradeToast.pair} Opened`
+                    : `${tradeToast.pair} Closed: ${tradeToast.profit >= 0 ? '+' : '-'}$${Math.abs(
+                        tradeToast.profit
+                      ).toFixed(2)} ${tradeToast.profit >= 0 ? 'Profit' : 'Loss'}`}
+                </p>
+                <p className="truncate font-mono-tech text-[10px] text-slate-300">
+                  {tradeToast.detail}
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Dismiss trade notification"
+                onClick={() => setTradeToast(null)}
+                className="shrink-0 cursor-pointer rounded-lg border border-white/15 px-1.5 py-0.5 font-mono-tech text-[10px] text-slate-300"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Premium Mini App Command Center Hero */}
       <PremiumCommandHero
         workspace={workspace}
@@ -756,6 +850,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         botRunning={isRunning}
         pairs={marketPairs}
         focusedSymbol={chartPair}
+        flashSignal={tradeFlash}
         onFocusCoin={setChartPair}
         onSyncBalance={() => {
           void onRefreshBalance();

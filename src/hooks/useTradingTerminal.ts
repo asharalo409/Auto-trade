@@ -133,7 +133,7 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
   return {
     ...fallback,
     id: (row.id as number | string) ?? fallback.id,
-    bot_enabled: Boolean(row.is_running ?? row.bot_enabled),
+    bot_enabled: Boolean(row.is_running ?? row.engine_running ?? row.bot_enabled),
     amount_per_trade: Math.max(1, Number(row.amount_per_trade ?? fallback.amount_per_trade)),
     take_profit_pct: Number(row.take_profit_pct ?? fallback.take_profit_pct),
     stop_loss_enabled: zeroLossResolved
@@ -151,7 +151,7 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
     max_open_trades: Number(row.max_open_trades ?? fallback.max_open_trades),
     max_amount_per_pair: Number(row.max_amount_per_pair ?? fallback.max_amount_per_pair),
     daily_loss_limit: Number(row.daily_loss_limit ?? fallback.daily_loss_limit),
-    mode: ((row.mode ?? row.trading_mode ?? fallback.mode) as TradingMode),
+    mode: ((row.mode ?? row.workspace_mode ?? row.trading_mode ?? fallback.mode) as TradingMode),
     enabled_pairs,
     telegram_enabled: telegramEnabled,
     last_heartbeat: String(

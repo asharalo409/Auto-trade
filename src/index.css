@@ -207,21 +207,100 @@
 }
 
 /* Premium Mini App command center surfaces */
-.premium-hero {
-  background:
-    radial-gradient(120% 140% at 100% 0%, rgba(16, 185, 129, 0.14) 0%, transparent 55%),
-    radial-gradient(120% 140% at 0% 100%, rgba(251, 191, 36, 0.1) 0%, transparent 60%),
-    linear-gradient(160deg, #0e1620 0%, #0a1017 52%, #080c12 100%);
+.coin-tile {
+  background: rgba(13, 19, 28, 0.72);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+}
+
+.glass-surface {
+  background: rgba(13, 19, 28, 0.72);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+  border-color: rgba(255, 255, 255, 0.1);
   box-shadow:
-    0 26px 60px -30px rgba(0, 0, 0, 0.95),
+    0 18px 44px -30px rgba(0, 0, 0, 0.95),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
+.premium-hero {
+  background:
+    radial-gradient(120% 140% at 100% 0%, rgba(16, 185, 129, 0.16) 0%, transparent 55%),
+    radial-gradient(120% 140% at 0% 100%, rgba(251, 191, 36, 0.1) 0%, transparent 60%),
+    rgba(13, 19, 28, 0.72);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+  box-shadow:
+    0 26px 60px -30px rgba(0, 0, 0, 0.95),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
 .mini-dock {
-  background: linear-gradient(165deg, rgba(14, 21, 29, 0.92) 0%, rgba(8, 12, 17, 0.96) 100%);
+  background: rgba(13, 19, 28, 0.72);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
   box-shadow:
     0 20px 50px -12px rgba(0, 0, 0, 0.85),
     inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+/* Live-price / trade-execution pulse on coin tiles */
+@keyframes coin-pulse-up {
+  0% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55);
+    background-color: rgba(16, 185, 129, 0.16);
+  }
+  55% {
+    box-shadow: 0 0 20px 2px rgba(16, 185, 129, 0.3);
+    background-color: rgba(16, 185, 129, 0.1);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
+}
+
+@keyframes coin-pulse-down {
+  0% {
+    box-shadow: 0 0 0 0 rgba(244, 63, 94, 0.55);
+    background-color: rgba(244, 63, 94, 0.16);
+  }
+  55% {
+    box-shadow: 0 0 20px 2px rgba(244, 63, 94, 0.3);
+    background-color: rgba(244, 63, 94, 0.1);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(244, 63, 94, 0);
+  }
+}
+
+.coin-pulse-up {
+  animation: coin-pulse-up 950ms ease-out;
+}
+
+.coin-pulse-down {
+  animation: coin-pulse-down 950ms ease-out;
+}
+
+/* Phone-first readable layout: no desktop zoom-out, bigger type + 44px targets */
+@media (max-width: 767px) {
+  html {
+    font-size: 17px;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    font-size: 1rem;
+    line-height: 1.55;
+  }
+
+  .tap-target {
+    min-height: 44px;
+  }
+
+  .premium-hero {
+    padding: 1.15rem;
+  }
 }
 
 .dock-fab-on {
@@ -271,7 +350,9 @@
   .animate-orbit-fast,
   .animate-orbit-reverse,
   .skeleton-shimmer::after,
-  .animate-tile-breathe {
+  .animate-tile-breathe,
+  .coin-pulse-up,
+  .coin-pulse-down {
     animation: none !important;
   }
 }

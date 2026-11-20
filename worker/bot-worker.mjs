@@ -17,6 +17,15 @@ const ENV_TESTNET = (process.env.BINANCE_TESTNET || '').trim() === 'true';
 const BINANCE_ROUND_TRIP_FEE_PCT = 0.2; // 0.1% Buy + 0.1% Sell Spot taker fees
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
+const TELEGRAM_MINI_APP_URL = (
+  process.env.TELEGRAM_MINI_APP_URL || 'https://auto-trade-qxp7.onrender.com'
+).trim();
+const TELEGRAM_POLL_TIMEOUT_SECONDS = 25;
+// Attached to every outgoing alert (BUY / SELL / TP / SL / status) so the
+// operator can jump straight from chat into the Mini App terminal.
+const TELEGRAM_OPEN_TERMINAL_MARKUP = {
+  inline_keyboard: [[{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }]],
+};
 const IPV4_REGEX = /\b((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})\b/;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -177,12 +186,14 @@ if (PORT > 0) {
     });
 }
 
-async function sendTelegram(text, token, chatId) {
+async function sendTelegram(text, token, chatId, options = {}) {
   const t = (token || TELEGRAM_BOT_TOKEN || '').trim();
   const c = (chatId || TELEGRAM_CHAT_ID || '').trim();
-  if (!t || !c) return;
+  if (!t || !c) return false;
+  const replyMarkup =
+    options.replyMarkup === null ? null : options.replyMarkup || TELEGRAM_OPEN_TERMINAL_MARKUP;
   try {
-    await fetch(`https://api.telegram.org/bot${t}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${t}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -190,10 +201,19 @@ async function sendTelegram(text, token, chatId) {
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       }),
+      signal: AbortSignal.timeout(15_000),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      console.warn('[TELEGRAM ERROR]', data?.description || `HTTP ${res.status}`);
+      return false;
+    }
+    return true;
   } catch (err) {
     console.error('[TELEGRAM ERROR]', err.message);
+    return false;
   }
 }
 
@@ -588,13 +608,14 @@ function resolveTradingConfig(settings) {
   const zeroLoss = Boolean(
     settings.zero_loss_shield ?? settings.zero_loss_mode ?? settings.sell_only_in_profit ?? true
   );
+  const runFlag = settings.is_running ?? settings.engine_running;
   const isRunning =
-    settings.is_running === null || settings.is_running === undefined
-      ? Boolean(settings.bot_enabled)
-      : Boolean(settings.is_running);
+    runFlag === null || runFlag === undefined ? Boolean(settings.bot_enabled) : Boolean(runFlag);
   return {
     isRunning,
-    mode: normalizeTradingMode(settings.trading_mode ?? settings.mode),
+    mode: normalizeTradingMode(
+      settings.workspace_mode ?? settings.trading_mode ?? settings.mode
+    ),
     telegramEnabled: settings.telegram_enabled !== false,
     telegramToken: String(
       settings.telegram_bot_token || settings.bot_token || TELEGRAM_BOT_TOKEN || ''
@@ -664,6 +685,364 @@ async function sendWarningTelegram(cfg, message) {
     cfg.telegramToken,
     cfg.telegramChatId
   );
+}
+
+/* ------------------------------------------------------------------------- *
+ * Telegram command bridge for @TaseenMarketBot
+ * Long-polls getUpdates with offset tracking, accepts commands only from the
+ * authorized TELEGRAM_CHAT_ID, and mutates the same Supabase settings row the
+ * 24/7 worker and web terminal already read — so chat commands and the UI stay
+ * in lockstep. Every reply carries the "Open Terminal" Mini App button.
+ * ------------------------------------------------------------------------- */
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let telegramUpdateOffset = 0;
+let telegramOffsetInitialised = false;
+let telegramPolling = false;
+let telegramBridgeCache = null;
+
+async function fetchSettingsRow() {
+  const { data, error } = await supabase.from('settings').select('*').limit(1).maybeSingle();
+  if (error) {
+    console.warn('[TELEGRAM BOT] Could not read settings:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function resolveTelegramBridge() {
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+    return { token: TELEGRAM_BOT_TOKEN, chatId: TELEGRAM_CHAT_ID };
+  }
+  if (telegramBridgeCache?.token && telegramBridgeCache?.chatId) return telegramBridgeCache;
+  const settings = await fetchSettingsRow();
+  telegramBridgeCache = {
+    token: (TELEGRAM_BOT_TOKEN || settings?.telegram_bot_token || settings?.bot_token || '').trim(),
+    chatId: (TELEGRAM_CHAT_ID || settings?.telegram_chat_id || settings?.chat_id || '').trim(),
+  };
+  return telegramBridgeCache;
+}
+
+async function telegramApiCall(token, method, payload, timeoutMs) {
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs || 30_000),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, ok: res.ok && data?.ok !== false, data };
+}
+
+/**
+ * Writes a settings patch, degrading to per-column writes when the Supabase
+ * schema predates some canonical columns (`engine_running`, `workspace_mode`).
+ */
+async function updateSettingsWithFallback(settingsId, patch) {
+  const full = await supabase.from('settings').update(patch).eq('id', settingsId);
+  if (!full.error) return { ok: true, applied: Object.keys(patch), skipped: [] };
+  if (!isMissingColumnError(full.error)) {
+    return { ok: false, applied: [], skipped: [], error: full.error.message };
+  }
+
+  const applied = [];
+  const skipped = [];
+  for (const [column, value] of Object.entries(patch)) {
+    const { error } = await supabase
+      .from('settings')
+      .update({ [column]: value })
+      .eq('id', settingsId);
+    if (error) skipped.push(column);
+    else applied.push(column);
+  }
+  return { ok: applied.length > 0, applied, skipped };
+}
+
+function settingsModeLabel(settings) {
+  const raw = String(
+    settings?.workspace_mode ?? settings?.trading_mode ?? settings?.mode ?? 'live'
+  )
+    .trim()
+    .toLowerCase();
+  return raw === 'live' || raw === 'real' ? 'LIVE' : 'VIRTUAL';
+}
+
+async function handleTelegramCommand(rawText, token, chatId, operatorName) {
+  const command = String(rawText || '')
+    .trim()
+    .split(/\s+/)[0]
+    .toLowerCase()
+    .replace(/@[a-z0-9_]+$/i, '');
+
+  const settings = await fetchSettingsRow();
+  if (!settings) {
+    await sendTelegram('⚠️ Aegis Quant: Supabase settings row not found — command ignored.', token, chatId);
+    return;
+  }
+
+  switch (command) {
+    case '/start':
+    case '/help': {
+      await sendTelegram(
+        [
+          '<b>🛡️ AEGIS QUANT — COMMAND MENU</b>',
+          '',
+          '/balance — live Spot USDT + virtual demo balance',
+          '/status — engine state, workspace mode, open positions',
+          '/start_bot — start the 24/7 engine (LIVE or VIRTUAL)',
+          '/stop_bot — pause trading immediately',
+          '/mode_live — switch the workspace to LIVE Binance Spot',
+          '/mode_demo — switch the workspace to VIRTUAL demo',
+          '',
+          `Operator: <b>${operatorName}</b>`,
+        ].join('\n'),
+        token,
+        chatId
+      );
+      return;
+    }
+
+    case '/balance': {
+      const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
+      const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
+      const useTestnet =
+        process.env.BINANCE_TESTNET === 'false'
+          ? false
+          : ENV_TESTNET || Boolean(settings.use_testnet);
+      let liveSpot = Number(settings.balance_usdt || 0);
+      let note = '';
+      if (apiKey && apiSecret) {
+        try {
+          const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
+          if (portfolio) {
+            liveSpot = portfolio.spot;
+            note = `\n<i>Spot $${portfolio.spot.toFixed(2)} · Funding $${portfolio.funding.toFixed(2)} · Earn $${portfolio.earn.toFixed(2)}</i>`;
+          } else {
+            note = '\n<i>Binance balance unavailable — check API keys and server IP access.</i>';
+          }
+        } catch (err) {
+          note = `\n<i>Binance balance unavailable: ${err.message}</i>`;
+        }
+      } else {
+        note = '\n<i>No Binance API keys linked.</i>';
+      }
+      const virtualBalance = readVirtualBalance(settings);
+      await sendTelegram(
+        [
+          '💰 <b>ACCOUNT BALANCES</b>',
+          `• Live Spot USDT: $${Number(liveSpot || 0).toFixed(2)}`,
+          `• Virtual Demo USDT: $${Number(virtualBalance || 0).toFixed(2)}`,
+          note,
+        ].join('\n'),
+        token,
+        chatId
+      );
+      return;
+    }
+
+    case '/status': {
+      const engineRunning =
+        settings.is_running === null || settings.is_running === undefined
+          ? Boolean(settings.engine_running ?? settings.bot_enabled)
+          : Boolean(settings.is_running);
+      const modeLabel = settingsModeLabel(settings);
+      const { data: openRows, error: openErr } = await supabase
+        .from('trades')
+        .select('*')
+        .eq('status', 'OPEN');
+      const openCount = openErr
+        ? 0
+        : (openRows || []).filter(
+            (row) => tradeModeOf(row) === (modeLabel === 'LIVE' ? 'live' : 'virtual')
+          ).length;
+      const lastCycle = settings.last_heartbeat
+        ? new Date(settings.last_heartbeat).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
+        : 'never';
+      await sendTelegram(
+        [
+          '📊 <b>AEGIS QUANT STATUS</b>',
+          `• Engine: <b>${engineRunning ? 'RUNNING' : 'STOPPED'}</b>`,
+          `• Workspace mode: <b>${modeLabel}</b>`,
+          `• Open positions: <b>${openCount}</b>`,
+          `• Last cycle: ${lastCycle}`,
+        ].join('\n'),
+        token,
+        chatId
+      );
+      return;
+    }
+
+    case '/start_bot': {
+      const modeLabel = settingsModeLabel(settings);
+      const result = await updateSettingsWithFallback(settings.id, {
+        engine_running: true,
+        is_running: true,
+        bot_enabled: true,
+      });
+      if (!result.ok) {
+        await sendTelegram(
+          `⚠️ Could not start the engine: ${result.error || 'no writable settings column'}.`,
+          token,
+          chatId
+        );
+        return;
+      }
+      await appendLog('INFO', `[TELEGRAM] Engine STARTED by ${operatorName} (Mode: ${modeLabel}).`);
+      await sendTelegram(
+        `✅ <b>Aegis Quant Engine STARTED</b> (Mode: ${modeLabel}).`,
+        token,
+        chatId
+      );
+      return;
+    }
+
+    case '/stop_bot': {
+      const result = await updateSettingsWithFallback(settings.id, {
+        engine_running: false,
+        is_running: false,
+        bot_enabled: false,
+      });
+      if (!result.ok) {
+        await sendTelegram(
+          `⚠️ Could not stop the engine: ${result.error || 'no writable settings column'}.`,
+          token,
+          chatId
+        );
+        return;
+      }
+      await appendLog('INFO', `[TELEGRAM] Engine STOPPED by ${operatorName}.`);
+      await sendTelegram('🛑 <b>Aegis Quant Engine STOPPED.</b>', token, chatId);
+      return;
+    }
+
+    case '/mode_live':
+    case '/mode_demo': {
+      const nextMode = command === '/mode_live' ? 'live' : 'virtual';
+      const modeLabel = nextMode === 'live' ? 'LIVE' : 'VIRTUAL';
+      const result = await updateSettingsWithFallback(settings.id, {
+        workspace_mode: nextMode,
+        trading_mode: nextMode,
+        mode: nextMode,
+      });
+      if (!result.ok) {
+        await sendTelegram(
+          `⚠️ Could not switch workspace: ${result.error || 'no writable settings column'}.`,
+          token,
+          chatId
+        );
+        return;
+      }
+      await appendLog('INFO', `[TELEGRAM] Workspace switched to ${modeLabel} by ${operatorName}.`);
+      await sendTelegram(
+        `✅ <b>Workspace switched to ${modeLabel}</b>${
+          nextMode === 'live' ? ' — Binance Spot (real money).' : ' — paper demo engine.'
+        }`,
+        token,
+        chatId
+      );
+      return;
+    }
+
+    default:
+      if (command.startsWith('/')) {
+        await sendTelegram(
+          `Unknown command: <code>${command}</code>\nSend /help to see the menu.`,
+          token,
+          chatId
+        );
+      }
+  }
+}
+
+async function pollTelegramUpdates() {
+  if (telegramPolling) return;
+  telegramPolling = true;
+  try {
+    const { token, chatId } = await resolveTelegramBridge();
+    if (!token || !chatId) return;
+
+    // Skip the backlog once at boot so a restart never replays days-old commands.
+    if (!telegramOffsetInitialised) {
+      const probe = await telegramApiCall(
+        token,
+        'getUpdates',
+        { offset: -1, limit: 1, timeout: 0 },
+        15_000
+      );
+      const results = Array.isArray(probe.data?.result) ? probe.data.result : [];
+      const lastId = Number(results[results.length - 1]?.update_id);
+      telegramUpdateOffset = Number.isFinite(lastId) ? lastId + 1 : 0;
+      telegramOffsetInitialised = true;
+    }
+
+    const { status, data } = await telegramApiCall(
+      token,
+      'getUpdates',
+      {
+        offset: telegramUpdateOffset,
+        timeout: TELEGRAM_POLL_TIMEOUT_SECONDS,
+        limit: 20,
+        allowed_updates: ['message'],
+      },
+      (TELEGRAM_POLL_TIMEOUT_SECONDS + 20) * 1000
+    );
+
+    if (status === 409) {
+      console.warn('[TELEGRAM BOT] 409 Conflict — another poller is active. Backing off 30s.');
+      await sleep(30_000);
+      return;
+    }
+    if (!data?.ok || !Array.isArray(data.result)) return;
+
+    for (const update of data.result) {
+      const updateId = Number(update?.update_id);
+      if (Number.isFinite(updateId)) {
+        telegramUpdateOffset = Math.max(telegramUpdateOffset, updateId + 1);
+      }
+      const message = update?.message;
+      const text = String(message?.text || '').trim();
+      if (!text) continue;
+
+      const incomingChatId = String(message?.chat?.id ?? '').trim();
+      if (incomingChatId !== chatId) {
+        console.warn(`[TELEGRAM BOT] Ignored command from unauthorized chat ${incomingChatId || 'unknown'}.`);
+        continue;
+      }
+
+      console.log(`[TELEGRAM BOT] Command from ${incomingChatId}: ${text}`);
+      await handleTelegramCommand(
+        text,
+        token,
+        incomingChatId,
+        String(message?.from?.first_name || 'Operator')
+      );
+    }
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (!msg.toLowerCase().includes('timeout') && !msg.toLowerCase().includes('abort')) {
+      console.warn('[TELEGRAM BOT] Poll failed:', msg);
+      await sleep(5_000);
+    }
+  } finally {
+    telegramPolling = false;
+  }
+}
+
+async function startTelegramCommandLoop() {
+  const { token, chatId } = await resolveTelegramBridge();
+  if (!token || !chatId) {
+    console.warn(
+      '[TELEGRAM BOT] Command listener idle — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured yet. Retrying in 60s.'
+    );
+    setTimeout(() => void startTelegramCommandLoop(), 60_000).unref?.();
+    return;
+  }
+  console.log('[TELEGRAM BOT] Command listener online — long polling, authorized chat only.');
+  for (;;) {
+    await pollTelegramUpdates();
+    await sleep(1_200);
+  }
 }
 
 function buildTradeRow({ mode, symbol, price, quantity, notional, tpPct, zeroLoss, stopLossPct }) {
@@ -1105,6 +1484,7 @@ async function startWorker() {
     '[AEGIS WORKER] Started — 24/7 engine for LIVE + DEMO/VIRTUAL modes. Polling Supabase settings every 15s...'
   );
   await logServerPublicIp();
+  void startTelegramCommandLoop();
   await runCycle();
   setInterval(runCycle, 15_000);
 }

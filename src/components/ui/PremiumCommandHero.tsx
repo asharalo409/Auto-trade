@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import {
   Calculator,
@@ -12,6 +12,12 @@ import { audioSynth } from '../../lib/audioSynth';
 import { telegramHaptic } from '../../lib/telegramWebApp';
 import { PairMarketData, TradingMode } from '../../types/trading';
 
+export interface CoinFlashSignal {
+  symbol: string;
+  direction: 'up' | 'down';
+  id: string;
+}
+
 interface PremiumCommandHeroProps {
   workspace: TradingMode;
   balance: number;
@@ -22,6 +28,7 @@ interface PremiumCommandHeroProps {
   botRunning: boolean;
   pairs: PairMarketData[];
   focusedSymbol: string;
+  flashSignal?: CoinFlashSignal | null;
   onFocusCoin: (symbol: string) => void;
   onSyncBalance: () => void;
   onOpenCalculator: () => void;
@@ -49,6 +56,61 @@ const COINS: CoinMeta[] = [
 const formatUsd = (value: number): string =>
   value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+const formatPrice = (value: number): string => {
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  if (value >= 1000) return value.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  if (value >= 1) return value.toFixed(2);
+  return value.toFixed(4);
+};
+
+/** Lightweight inline SVG price sparkline — no chart library, no canvas. */
+const CoinSparkline: React.FC<{ points: number[]; positive: boolean }> = ({ points, positive }) => {
+  const rawId = useId();
+  const gradientId = `spark-${rawId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
+  const width = 100;
+  const height = 26;
+  const series = points.length >= 2 ? points : [0, 0];
+  const min = Math.min(...series);
+  const max = Math.max(...series);
+  const span = max - min || 1;
+  const step = width / (series.length - 1);
+  const coords = series.map((value, index) => {
+    const x = index * step;
+    const y = height - ((value - min) / span) * height;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  });
+  const line = `M${coords.join(' L')}`;
+  const area = `${line} L${width},${height} L0,${height} Z`;
+  const color = positive ? '#34d399' : '#fb7185';
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      className="h-6 w-full"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <defs>
+        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.4" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path d={area} fill={`url(#${gradientId})`} />
+      <path
+        d={line}
+        fill="none"
+        stroke={color}
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        vectorEffect="non-scaling-stroke"
+      />
+    </svg>
+  );
+};
+
 export const PremiumCommandHero: React.FC<PremiumCommandHeroProps> = ({
   workspace,
   balance,
@@ -59,12 +121,15 @@ export const PremiumCommandHero: React.FC<PremiumCommandHeroProps> = ({
   botRunning,
   pairs,
   focusedSymbol,
+  flashSignal,
   onFocusCoin,
   onSyncBalance,
   onOpenCalculator,
 }) => {
   const reducedMotion = useReducedMotion();
   const isLive = workspace === 'LIVE';
+  const previousPricesRef = useRef<Record<string, number>>({});
+  const [pulses, setPulses] = useState<Record<string, 'up' | 'down'>>({});
 
   const dailyPct = useMemo(() => {
     const opening = balance - todayProfit;
@@ -78,8 +143,38 @@ export const PremiumCommandHero: React.FC<PremiumCommandHeroProps> = ({
 
   const coinRows = COINS.map((coin) => {
     const pair = pairs.find((p) => p.symbol === coin.symbol);
-    return { ...coin, change: pair?.change24h ?? 0, price: pair?.price ?? 0 };
+    return {
+      ...coin,
+      change: pair?.change24h ?? 0,
+      price: pair?.price ?? 0,
+      series: pair?.sparkline?.map((point) => point.p) ?? [],
+    };
   });
+
+  // Brief green/red highlight whenever a live tick changes a coin's price.
+  useEffect(() => {
+    if (reducedMotion) return;
+    const next: Record<string, 'up' | 'down'> = {};
+    for (const pair of pairs) {
+      const previous = previousPricesRef.current[pair.symbol];
+      if (previous !== undefined && pair.price > 0 && pair.price !== previous) {
+        next[pair.symbol] = pair.price > previous ? 'up' : 'down';
+      }
+      if (pair.price > 0) previousPricesRef.current[pair.symbol] = pair.price;
+    }
+    if (Object.keys(next).length === 0) return;
+    setPulses(next);
+    const timer = window.setTimeout(() => setPulses({}), 950);
+    return () => window.clearTimeout(timer);
+  }, [pairs, reducedMotion]);
+
+  // Stronger pulse on a trade opening/closing.
+  useEffect(() => {
+    if (!flashSignal || reducedMotion) return;
+    setPulses({ [flashSignal.symbol]: flashSignal.direction });
+    const timer = window.setTimeout(() => setPulses({}), 1000);
+    return () => window.clearTimeout(timer);
+  }, [flashSignal, reducedMotion]);
 
   const handleSync = () => {
     telegramHaptic('light');
@@ -159,7 +254,7 @@ export const PremiumCommandHero: React.FC<PremiumCommandHeroProps> = ({
             type="button"
             onClick={handleSync}
             disabled={syncingBalance}
-            className="flex min-h-[44px] cursor-pointer items-center justify-center gap-1.5 rounded-full bg-gradient-to-r from-amber-300 via-amber-400 to-yellow-500 px-3 py-2 font-mono-tech text-[11px] font-extrabold tracking-wide text-[#1b1206] uppercase shadow-[0_10px_26px_-8px_rgba(251,191,36,0.65)] transition-transform active:scale-[0.97] disabled:cursor-wait disabled:opacity-70"
+            className="tap-target flex min-h-[44px] cursor-pointer items-center justify-center gap-1.5 rounded-full bg-gradient-to-r from-amber-300 via-amber-400 to-yellow-500 px-3 py-2 font-mono-tech text-[11px] font-extrabold tracking-wide text-[#1b1206] uppercase shadow-[0_10px_26px_-8px_rgba(251,191,36,0.65)] transition-transform active:scale-[0.97] disabled:cursor-wait disabled:opacity-70"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${syncingBalance ? 'animate-spin' : ''}`} />
             {syncingBalance ? 'Syncing…' : 'Sync Balance'}
@@ -167,7 +262,7 @@ export const PremiumCommandHero: React.FC<PremiumCommandHeroProps> = ({
           <button
             type="button"
             onClick={handleCalculator}
-            className="flex min-h-[44px] cursor-pointer items-center justify-center gap-1.5 rounded-full border border-white/15 bg-white/[0.05] px-3 py-2 font-mono-tech text-[11px] font-bold tracking-wide text-slate-100 uppercase backdrop-blur-md transition-colors hover:border-white/25 hover:bg-white/[0.09] active:scale-[0.97]"
+            className="tap-target flex min-h-[44px] cursor-pointer items-center justify-center gap-1.5 rounded-full border border-white/15 bg-white/[0.05] px-3 py-2 font-mono-tech text-[11px] font-bold tracking-wide text-slate-100 uppercase backdrop-blur-md transition-colors hover:border-white/25 hover:bg-white/[0.09] active:scale-[0.97]"
           >
             <Calculator className="h-3.5 w-3.5 text-amber-300" />
             Profit Calculator
@@ -204,7 +299,7 @@ export const PremiumCommandHero: React.FC<PremiumCommandHeroProps> = ({
       </section>
 
       {/* Latest Trades coin grid */}
-      <section className="rounded-[22px] border border-white/10 bg-[#0a0f16]/85 p-3 backdrop-blur-xl">
+      <section className="glass-surface rounded-[22px] border p-3">
         <div className="mb-2.5 flex items-center justify-between">
           <div className="flex items-center gap-1.5 font-display text-xs font-bold tracking-[0.16em] text-slate-100 uppercase">
             <Sparkles className="h-3.5 w-3.5 text-amber-300" />
@@ -216,37 +311,52 @@ export const PremiumCommandHero: React.FC<PremiumCommandHeroProps> = ({
           </span>
         </div>
 
-        <div className="grid grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           {coinRows.map((coin) => {
             const up = coin.change >= 0;
             const focused = focusedSymbol === coin.symbol;
+            const pulse = pulses[coin.symbol];
             return (
               <button
                 key={coin.symbol}
                 type="button"
                 onClick={() => handleCoin(coin.symbol)}
                 aria-pressed={focused}
-                className={`flex cursor-pointer flex-col items-center gap-1 rounded-2xl border px-1 py-2 transition-all active:scale-[0.96] ${
+                className={`coin-tile tap-target flex cursor-pointer flex-col gap-1 rounded-2xl border px-2.5 py-2 text-left transition-colors active:scale-[0.97] sm:px-2 sm:py-2 ${
                   up
-                    ? 'border-emerald-500/35 bg-emerald-500/[0.06] shadow-[0_0_14px_-4px_rgba(16,185,129,0.5)]'
-                    : 'border-rose-500/35 bg-rose-500/[0.06] shadow-[0_0_14px_-4px_rgba(244,63,94,0.5)]'
-                } ${focused ? 'ring-1 ring-amber-300/70' : ''}`}
+                    ? 'border-emerald-500/35 shadow-[0_0_14px_-4px_rgba(16,185,129,0.5)]'
+                    : 'border-rose-500/35 shadow-[0_0_14px_-4px_rgba(244,63,94,0.5)]'
+                } ${focused ? 'ring-1 ring-amber-300/70' : ''} ${
+                  pulse === 'up' ? 'coin-pulse-up' : pulse === 'down' ? 'coin-pulse-down' : ''
+                }`}
               >
-                <span
-                  className={`flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br text-[9px] font-black text-black/85 ${coin.ring}`}
-                >
-                  {coin.ticker.slice(0, 1)}
+                <span className="flex w-full items-center justify-between gap-1.5">
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <span
+                      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-gradient-to-br text-[9px] font-black text-black/85 ${coin.ring}`}
+                    >
+                      {coin.ticker.slice(0, 1)}
+                    </span>
+                    <span className="truncate font-mono-tech text-[11px] font-bold tracking-wide text-slate-100 sm:text-[10px]">
+                      {coin.ticker}
+                    </span>
+                  </span>
+                  <span
+                    className={`shrink-0 rounded-full px-1.5 py-[1px] font-mono-tech text-[10px] font-bold sm:text-[9px] ${
+                      up ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'
+                    }`}
+                  >
+                    {up ? '+' : ''}
+                    {coin.change.toFixed(2)}%
+                  </span>
                 </span>
-                <span className="font-mono-tech text-[10px] font-bold tracking-wide text-slate-200">
-                  {coin.ticker}
+
+                <span className="w-full font-mono-tech text-[13px] leading-none font-bold text-white sm:text-[11px]">
+                  ${formatPrice(coin.price)}
                 </span>
-                <span
-                  className={`rounded-full px-1.5 py-[1px] font-mono-tech text-[9px] font-bold ${
-                    up ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'
-                  }`}
-                >
-                  {up ? '+' : ''}
-                  {coin.change.toFixed(2)}%
+
+                <span className="w-full pt-0.5">
+                  <CoinSparkline points={coin.series} positive={up} />
                 </span>
               </button>
             );

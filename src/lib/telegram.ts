@@ -1,5 +1,11 @@
 import { TelegramConfig } from '../types/trading';
 
+/** Every alert carries a Mini App shortcut back into the terminal. */
+const TELEGRAM_MINI_APP_URL = 'https://auto-trade-qxp7.onrender.com';
+const TELEGRAM_OPEN_TERMINAL_MARKUP = {
+  inline_keyboard: [[{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }]],
+};
+
 export interface TelegramDispatchResult {
   ok: boolean;
   detail: string;
@@ -52,6 +58,7 @@ export async function dispatchTelegramAlert(
         botToken: token,
         chatId,
         text,
+        replyMarkup: TELEGRAM_OPEN_TERMINAL_MARKUP,
       }),
     });
 
@@ -114,6 +121,7 @@ export async function dispatchTelegramAlert(
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
+        reply_markup: TELEGRAM_OPEN_TERMINAL_MARKUP,
       }),
     });
 

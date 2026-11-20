@@ -26,6 +26,7 @@ import { SettingsPanel } from './components/screens/SettingsPanel';
 import { TradesScreen } from './components/screens/TradesScreen';
 import { BootSequence } from './components/ui/BootSequence';
 import { NeonButton } from './components/ui/MotionPrimitives';
+import { TelegramProfileBadge } from './components/ui/TelegramProfileBadge';
 import { TickerBar } from './components/ui/TickerBar';
 import { BDT_PER_USD } from './data/demoData';
 import { MIN_TRADEABLE_USDT } from './lib/tradeLimits';
@@ -250,8 +251,9 @@ export default function App() {
             <span className="font-display text-lg font-bold tracking-widest text-white uppercase whitespace-nowrap sm:text-xl">
               {t.brandTitle}
             </span>
+            <TelegramProfileBadge />
             <span
-              className={`hidden font-mono-tech text-[10px] tracking-widest uppercase sm:inline ${activeTheme.accentText}`}
+              className={`hidden font-mono-tech text-[10px] tracking-widest uppercase xl:inline ${activeTheme.accentText}`}
             >
               {t.brandSub}
             </span>
@@ -298,7 +300,7 @@ export default function App() {
           {/* Right Controls: Isolated VIRTUAL / LIVE Switcher + Live Balance Pill + Language + Lock */}
           <div className="flex items-center gap-2 shrink-0">
             {terminal.isAuthenticated && (
-              <div className="flex items-center gap-1.5">
+              <div className="hidden items-center gap-1.5 md:flex">
                 <div className="flex items-center rounded-lg border border-slate-800 bg-[#080b12] p-0.5">
                   <button
                     type="button"
@@ -405,10 +407,10 @@ export default function App() {
             <button
               type="button"
               onClick={toggleLanguage}
-              className="flex min-h-[36px] cursor-pointer items-center gap-1.5 rounded-lg border border-slate-700/80 bg-[#090d16] px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-slate-200 transition-colors hover:border-cyan-400/60 hover:text-cyan-300 whitespace-nowrap"
+              className="tap-target flex min-h-[36px] cursor-pointer items-center gap-1.5 rounded-lg border border-slate-700/80 bg-[#090d16] px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-slate-200 transition-colors hover:border-cyan-400/60 hover:text-cyan-300 whitespace-nowrap"
             >
               <Languages className="h-3.5 w-3.5 text-cyan-400" />
-              <span>{lang === 'en' ? 'বাংলা' : 'EN'}</span>
+              <span className="hidden sm:inline">{lang === 'en' ? 'বাংলা' : 'EN'}</span>
             </button>
 
             {terminal.isAuthenticated && (
@@ -419,7 +421,7 @@ export default function App() {
                   terminal.signOut();
                 }}
                 title={t.signOutBtn}
-                className="flex min-h-[36px] cursor-pointer items-center gap-1 rounded-lg border border-slate-700/80 bg-[#090d16] px-2.5 py-1 font-mono-tech text-[11px] text-slate-300 transition-colors hover:border-rose-400/60 hover:text-rose-300 whitespace-nowrap"
+                className="tap-target flex min-h-[36px] cursor-pointer items-center gap-1 rounded-lg border border-slate-700/80 bg-[#090d16] px-2.5 py-1 font-mono-tech text-[11px] text-slate-300 transition-colors hover:border-rose-400/60 hover:text-rose-300 whitespace-nowrap"
               >
                 <Lock className="h-3.5 w-3.5" />
                 <span className="hidden sm:inline">{t.signOutBtn}</span>

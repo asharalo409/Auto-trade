@@ -12,6 +12,9 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
+const TELEGRAM_MINI_APP_URL = (
+  process.env.TELEGRAM_MINI_APP_URL || 'https://auto-trade-qxp7.onrender.com'
+).trim();
 
 const BINANCE_MAINNET_ENDPOINTS = [
   'https://api.binance.com',
@@ -248,6 +251,11 @@ async function startServer() {
           text,
           parse_mode: 'HTML',
           disable_web_page_preview: true,
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }],
+            ],
+          },
         }),
         signal: AbortSignal.timeout(10000),
       });

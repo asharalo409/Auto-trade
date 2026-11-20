@@ -26,7 +26,15 @@ export interface TelegramWebApp {
   platform?: string;
   colorScheme?: 'light' | 'dark';
   HapticFeedback?: TelegramHapticFeedback;
-  initDataUnsafe?: { user?: { id?: number; first_name?: string; username?: string } };
+  initDataUnsafe?: { user?: TelegramWebAppUser };
+}
+
+export interface TelegramWebAppUser {
+  id?: number;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  photo_url?: string;
 }
 
 declare global {
@@ -48,6 +56,15 @@ export function getTelegramWebApp(): TelegramWebApp | null {
 
 export function isTelegramMiniApp(): boolean {
   return getTelegramWebApp() !== null;
+}
+
+/** Telegram profile of the operator, or null in a normal browser tab. */
+export function getTelegramUser(): TelegramWebAppUser | null {
+  try {
+    return getTelegramWebApp()?.initDataUnsafe?.user ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** Signal readiness, go full-screen and paint Telegram's chrome to match the app. */
