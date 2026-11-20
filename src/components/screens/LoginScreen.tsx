@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { CheckCircle2, Lock, Play, ShieldAlert, Terminal, UserPlus } from 'lucide-react';
 import { audioSynth } from '../../lib/audioSynth';
+import { checkEmailWithApyhub } from '../../lib/emailValidation';
 import { NeonButton } from '../ui/MotionPrimitives';
 
 interface LoginScreenProps {
@@ -36,11 +37,13 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
+  const [emailNotice, setEmailNotice] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setInfoMsg(null);
+    setEmailNotice(null);
     if (!email.trim() || !password.trim()) {
       setError('ইমেইল এবং পাসওয়ার্ড দুটিই দিন।');
       return;
@@ -55,6 +58,20 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         return;
       }
       setLoading(true);
+      // Server-side ApyHub check (format, domain, disposable). Not a mailbox ownership check.
+      const check = await checkEmailWithApyhub(email.trim(), { disposableChecks: true });
+      if (check.status === 'invalid') {
+        setLoading(false);
+        setError(
+          'এই ইমেইলটি গ্রহণ করা যাচ্ছে না — ফরম্যাট/ডোমেইন সঠিক নয় অথবা এটি ডিসপোজেবল ইমেইল। (Format, domain & disposable check — not mailbox ownership.)'
+        );
+        return;
+      }
+      if (!check.ok) {
+        setEmailNotice(
+          'ApyHub ইমেইল যাচাই পাওয়া যায়নি — যাচাই ছাড়াই অ্যাকাউন্ট তৈরি হচ্ছে। (Validation service unavailable.)'
+        );
+      }
       const res = await onSignUp(email.trim(), password);
       setLoading(false);
       if (res.error) setError(res.error);
@@ -130,6 +147,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               setAuthMode('SIGNIN');
               setError(null);
               setInfoMsg(null);
+              setEmailNotice(null);
             }}
             className={`min-h-[36px] cursor-pointer rounded-lg font-mono-tech text-xs font-bold uppercase transition-colors ${
               authMode === 'SIGNIN'
@@ -146,6 +164,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               setAuthMode('SIGNUP');
               setError(null);
               setInfoMsg(null);
+              setEmailNotice(null);
             }}
             className={`min-h-[36px] cursor-pointer rounded-lg font-mono-tech text-xs font-bold uppercase transition-colors ${
               authMode === 'SIGNUP'
@@ -181,6 +200,15 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               disabled={!isSupabaseConfigured}
               className="min-h-[44px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 py-2.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 transition-colors focus:border-cyan-400 focus:outline-none disabled:opacity-50"
             />
+            <p className="mt-1.5 font-mono-tech text-[10px] leading-relaxed text-slate-500">
+              ApyHub checks format, domain &amp; disposable addresses on sign-up — not mailbox
+              ownership.
+            </p>
+            {emailNotice && (
+              <p className="mt-1.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-200">
+                {emailNotice}
+              </p>
+            )}
           </div>
 
           <div>

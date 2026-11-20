@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 import express from 'express';
 
@@ -79,6 +79,125 @@ async function fetchBinanceTickerPrices(useTestnet: boolean): Promise<Map<string
     }
   }
   return priceMap;
+}
+
+export const APYHUB_EMAIL_URL =
+  'https://api.eu.apyhub.com/apyhub/verify-email-validity-and-deliverability';
+const APYHUB_TIMEOUT_MS = 9000;
+
+export interface ApyhubEmailCheck {
+  ok: boolean;
+  status: 'valid' | 'invalid' | 'not_configured' | 'unavailable';
+  data?: boolean;
+  upstreamStatus?: number | null;
+  detail?: string;
+}
+
+/**
+ * ApyHub email checks: format, domain (MX) and — unless disabled — disposable domains.
+ * This confirms the address can receive mail; it is NOT a mailbox ownership check.
+ * `data` is the documented boolean verdict. Transport/auth problems are reported as
+ * `unavailable` so callers can tell them apart from a genuinely invalid address.
+ */
+export async function verifyEmailWithApyhub(
+  email: string,
+  options: { token?: string; disposableChecks?: boolean; timeoutMs?: number } = {}
+): Promise<ApyhubEmailCheck> {
+  const token = String(options.token ?? '').trim();
+  if (!token) {
+    return {
+      ok: false,
+      status: 'not_configured',
+      upstreamStatus: null,
+      detail: 'APY_TOKEN is not configured on the server',
+    };
+  }
+
+  const disposableChecks = options.disposableChecks !== false;
+
+  try {
+    const apyRes = await fetch(APYHUB_EMAIL_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apy-token': token,
+      },
+      body: JSON.stringify({ email, disposable_checks: disposableChecks }),
+      signal: AbortSignal.timeout(options.timeoutMs ?? APYHUB_TIMEOUT_MS),
+    });
+
+    const payload = (await apyRes.json().catch(() => ({}))) as {
+      data?: unknown;
+      message?: string;
+      error?: string;
+    };
+
+    if (apyRes.status === 429) {
+      return {
+        ok: false,
+        status: 'unavailable',
+        upstreamStatus: 429,
+        detail: 'ApyHub rate limit reached — try again in a moment',
+      };
+    }
+
+    if (apyRes.status === 401 || apyRes.status === 403) {
+      return {
+        ok: false,
+        status: 'unavailable',
+        upstreamStatus: apyRes.status,
+        detail: `ApyHub rejected APY_TOKEN (HTTP ${apyRes.status})`,
+      };
+    }
+
+    if (apyRes.status >= 500) {
+      return {
+        ok: false,
+        status: 'unavailable',
+        upstreamStatus: apyRes.status,
+        detail: `ApyHub service error (HTTP ${apyRes.status})`,
+      };
+    }
+
+    if (!apyRes.ok) {
+      return {
+        ok: false,
+        status: 'unavailable',
+        upstreamStatus: apyRes.status,
+        detail:
+          payload.message || payload.error || `ApyHub rejected the request (HTTP ${apyRes.status})`,
+      };
+    }
+
+    if (typeof payload.data !== 'boolean') {
+      return {
+        ok: false,
+        status: 'unavailable',
+        upstreamStatus: apyRes.status,
+        detail: 'ApyHub response did not include a boolean `data` verdict',
+      };
+    }
+
+    return {
+      ok: true,
+      status: payload.data ? 'valid' : 'invalid',
+      data: payload.data,
+    };
+  } catch (err) {
+    const isTimeout =
+      err instanceof Error &&
+      (err.name === 'TimeoutError' || err.name === 'AbortError');
+    return {
+      ok: false,
+      status: 'unavailable',
+      upstreamStatus: isTimeout ? 504 : null,
+      detail: isTimeout
+        ? 'ApyHub request timed out'
+        : err instanceof Error
+          ? `ApyHub unreachable: ${err.message}`
+          : 'ApyHub unreachable',
+    };
+  }
 }
 
 async function startServer() {
@@ -175,6 +294,38 @@ async function startServer() {
         detail: msg,
       });
     }
+  });
+
+  // Server-side ApyHub email validation (APY_TOKEN never leaves the server)
+  app.post('/api/email/validate', async (req, res) => {
+    const email = String(req.body?.email ?? '').trim();
+    // Disposable-domain rejection stays on unless a caller explicitly opts out.
+    const disposableChecks = req.body?.disposable_checks !== false;
+
+    if (!email || email.length > 254 || !email.includes('@')) {
+      return res.status(400).json({
+        ok: false,
+        status: 'invalid_input',
+        data: null,
+        detail: 'A valid email address is required',
+      });
+    }
+
+    const result = await verifyEmailWithApyhub(email, {
+      token: process.env.APY_TOKEN,
+      disposableChecks,
+    });
+
+    const domain = email.split('@').pop()?.toLowerCase() ?? '';
+    console.info('[APYHUB EMAIL CHECK]', {
+      domain,
+      status: result.status,
+      data: result.data ?? null,
+      upstreamStatus: result.upstreamStatus ?? 200,
+      disposableChecks,
+    });
+
+    return res.status(200).json({ ...result, disposableChecks });
   });
 
   // Server-side signed Binance Spot + All-Wallet (Funding/Earn/Margin) Real Balance endpoint
@@ -503,7 +654,9 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('[AEGIS SERVER FATAL]', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startServer().catch((err) => {
+    console.error('[AEGIS SERVER FATAL]', err);
+    process.exit(1);
+  });
+}
