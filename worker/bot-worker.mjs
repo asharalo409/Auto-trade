@@ -455,12 +455,13 @@ const BINANCE_MIN_ORDER_USDT = 5.5;
 let exchangeFiltersCache = { at: 0, data: null };
 const lastWarnAt = new Map();
 
-async function warnThrottled(key, message, pair = null) {
+async function warnThrottled(key, message, pair = null, cfg = null) {
   const now = Date.now();
   if (now - (lastWarnAt.get(key) || 0) < 10 * 60_000) return;
   lastWarnAt.set(key, now);
   console.warn(message);
-  await appendLog('WARNING', message, pair);
+  await appendLog('WARNING', cfg ? `[${MODE_LABEL[cfg.mode]}] ${message}` : message, pair);
+  if (cfg) await sendWarningTelegram(cfg, message);
 }
 
 async function getSymbolFilters(symbol, useTestnet) {
@@ -499,12 +500,27 @@ function floorToStep(qty, stepSize) {
 /**
  * Places a MIN_NOTIONAL/LOT_SIZE-compliant live BUY, or logs one throttled warning
  * and returns null. Never throws, so one rejected order cannot abort the whole cycle.
+ *
+ * The order size is NEVER silently resized. If the operator's lot is below the
+ * exchange minimum we skip the entry and say so in the log + Telegram, so the
+ * Settings value, the trade record and the exchange order always agree.
  */
-async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret, useTestnet, availableUsdt) {
+async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret, useTestnet, availableUsdt, cfg = null) {
   const filters = await getSymbolFilters(symbol, useTestnet);
   const requested = Math.max(1, Number(quoteQty) || 1);
-  const notional = Math.max(requested, filters.minNotional || 5, BINANCE_MIN_ORDER_USDT);
+  const minNotional = Math.max(filters.minNotional || 0, BINANCE_MIN_ORDER_USDT);
   const available = Number.isFinite(availableUsdt) ? availableUsdt : 0;
+
+  if (requested < minNotional) {
+    await warnThrottled(
+      `lot-below-min-${symbol}`,
+      `LIVE ${label} SKIPPED ${symbol} — your lot is $${requested.toFixed(2)} but Binance Spot requires at least $${minNotional.toFixed(2)}. Raise "Amount Per Trade" in Settings (no order was placed and nothing was resized).`,
+      symbol,
+      cfg
+    );
+    return null;
+  }
+  const notional = requested;
 
   if (available < notional) {
     await warnThrottled(
@@ -512,7 +528,8 @@ async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret,
       available <= 0
         ? `LIVE ${label} SKIPPED ${symbol} — Binance Spot USDT is $0.00. Transfer USDT to your Spot wallet (Funding/Earn balances cannot be traded) and press Sync Balance.`
         : `LIVE ${label} SKIPPED ${symbol} — needs $${notional.toFixed(2)} but Spot has $${available.toFixed(2)} available.`,
-      symbol
+      symbol,
+      cfg
     );
     return null;
   }
@@ -533,13 +550,217 @@ async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret,
     await warnThrottled(
       `order-failed-${symbol}`,
       `LIVE ${label} REJECTED ${symbol}: ${err.message} — skipped this cycle (no phantom trade created).`,
-      symbol
+      symbol,
+      cfg
     );
     return null;
   }
 }
 
 let lastLoggedBalance = null;
+
+const MODE_LABEL = { live: 'LIVE', virtual: 'DEMO' };
+
+function normalizeTradingMode(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  return v === 'live' || v === 'real' ? 'live' : 'virtual';
+}
+
+function normalizePairList(raw) {
+  if (Array.isArray(raw)) return raw.map((p) => String(p).trim().toUpperCase()).filter(Boolean);
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map((p) => String(p).trim().toUpperCase()).filter(Boolean);
+    } catch {
+      return raw.split(',').map((p) => p.trim().toUpperCase()).filter(Boolean);
+    }
+  }
+  return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
+}
+
+/**
+ * Everything the 15s cycle needs comes from the Supabase settings row, so the bot
+ * keeps running with zero browser tabs open. `is_running`/`trading_mode` are the
+ * canonical columns; the legacy `bot_enabled`/`mode` pair is still honoured.
+ */
+function resolveTradingConfig(settings) {
+  const zeroLoss = Boolean(
+    settings.zero_loss_shield ?? settings.zero_loss_mode ?? settings.sell_only_in_profit ?? true
+  );
+  const isRunning =
+    settings.is_running === null || settings.is_running === undefined
+      ? Boolean(settings.bot_enabled)
+      : Boolean(settings.is_running);
+  return {
+    isRunning,
+    mode: normalizeTradingMode(settings.trading_mode ?? settings.mode),
+    telegramEnabled: settings.telegram_enabled !== false,
+    telegramToken: String(
+      settings.telegram_bot_token || settings.bot_token || TELEGRAM_BOT_TOKEN || ''
+    ).trim(),
+    telegramChatId: String(settings.telegram_chat_id || settings.chat_id || TELEGRAM_CHAT_ID || '').trim(),
+    lotRequested: Math.max(1, Number(settings.trade_amount ?? settings.amount_per_trade ?? 10)),
+    pairs: normalizePairList(settings.enabled_pairs),
+    tpPct: Number(settings.take_profit_pct || 2.4),
+    dcaEnabled: settings.dca_enabled !== false,
+    dcaStepPct: Math.max(0.2, Number(settings.dca_step_pct || 1.5)),
+    dcaMaxBuys: Math.max(1, Number(settings.dca_max_buys || 12)),
+    zeroLoss,
+    stopLossPct: Math.abs(Number(settings.stop_loss_pct || 1.5)),
+    stopLossEnabled: !zeroLoss && Boolean(settings.stop_loss_enabled),
+    maxPerPair: Number(settings.max_amount_per_pair || 500),
+    maxOpenTrades: Math.max(1, Number(settings.max_open_trades || 5)),
+  };
+}
+
+/** Rows written before the `mode` column existed are still separable by id prefix. */
+function tradeModeOf(row) {
+  const declared = String(row?.mode ?? row?.trading_mode ?? '').trim().toLowerCase();
+  if (declared === 'live' || declared === 'virtual') return declared;
+  return String(row?.id ?? '').startsWith('VDEMO-') ? 'virtual' : 'live';
+}
+
+function isMissingColumnError(error) {
+  if (!error) return false;
+  const msg = String(error.message || '');
+  return error.code === '42703' || error.code === 'PGRST204' || msg.includes('column');
+}
+
+function money(value) {
+  return `$${Number(value || 0).toFixed(2)}`;
+}
+
+async function sendTradeTelegram(cfg, details) {
+  if (!cfg.telegramEnabled || !cfg.telegramToken || !cfg.telegramChatId) return;
+  const label = MODE_LABEL[cfg.mode];
+  const lines = [
+    `<b>[${label}] ${details.title}</b>`,
+    `Pair: <b>${details.symbol}</b> · ${details.side}`,
+    `Price: ${money(details.price)}`,
+    `Amount: ${money(details.amountUsd)} USDT`,
+  ];
+  if (details.pnlUsdt !== undefined && details.pnlUsdt !== null) {
+    const pnl = Number(details.pnlUsdt);
+    const pct = details.pnlPct === undefined ? null : Number(details.pnlPct);
+    lines.push(
+      `P&L: ${pnl >= 0 ? '+' : ''}${money(pnl)}${
+        pct === null ? '' : ` (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`
+      }`
+    );
+  }
+  lines.push(
+    `Balance: ${money(details.balanceUsd)} ${cfg.mode === 'live' ? '(Spot portfolio)' : '(virtual)'}`
+  );
+  if (details.note) lines.push(details.note);
+  lines.push(`🕒 ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`);
+  await sendTelegram(lines.join('\n'), cfg.telegramToken, cfg.telegramChatId);
+}
+
+async function sendWarningTelegram(cfg, message) {
+  if (!cfg.telegramEnabled || !cfg.telegramToken || !cfg.telegramChatId) return;
+  await sendTelegram(
+    `<b>[AEGIS ${MODE_LABEL[cfg.mode]}] ⚠️ WARNING</b>\n${message}`,
+    cfg.telegramToken,
+    cfg.telegramChatId
+  );
+}
+
+function buildTradeRow({ mode, symbol, price, quantity, notional, tpPct, zeroLoss, stopLossPct }) {
+  const id = `${mode === 'virtual' ? 'VDEMO' : 'ORD'}-${Date.now()}-${Math.floor(Math.random() * 999)}`;
+  return {
+    id,
+    pair: symbol,
+    side: 'BUY',
+    status: 'OPEN',
+    entry_price: price,
+    current_price: price,
+    quantity,
+    invested_usdt: Number(notional.toFixed(2)),
+    profit_usdt: 0,
+    profit_pct: 0,
+    take_profit_price: Number(
+      (price * (1 + (tpPct + (zeroLoss ? BINANCE_ROUND_TRIP_FEE_PCT : 0)) / 100)).toFixed(4)
+    ),
+    stop_loss_price: Number((price * (1 - stopLossPct / 100)).toFixed(4)),
+    opened_at: new Date().toISOString(),
+  };
+}
+
+async function insertTradeWithMode(row, mode) {
+  let { error } = await supabase.from('trades').insert({ ...row, mode });
+  if (error && isMissingColumnError(error)) {
+    const { mode: _ignored, ...legacyRow } = row;
+    ({ error } = await supabase.from('trades').insert(legacyRow));
+  }
+  if (error) {
+    console.error(`[TRADE INSERT ERROR] ${error.message}`);
+    await appendLog('ERROR', `Could not persist trade ${row.id} (${row.pair}): ${error.message}`, row.pair);
+    return false;
+  }
+  return true;
+}
+
+const VIRTUAL_BALANCE_START = 10_000;
+// Written in this order; the first column that accepts a write becomes the one we read back.
+const VIRTUAL_BALANCE_COLUMNS = ['virtual_balance', 'demo_balance'];
+let virtualBalanceColumn = VIRTUAL_BALANCE_COLUMNS[0];
+let virtualBalanceMemory = null;
+let virtualBalanceHeldInMemory = false;
+
+function readVirtualBalance(settings) {
+  // While no column accepts writes, the in-process balance is the only source of truth,
+  // otherwise every cycle would resurrect the stale DB value and restart the paper P&L.
+  if (virtualBalanceHeldInMemory && virtualBalanceMemory !== null) return virtualBalanceMemory;
+  const stored = Number(settings[virtualBalanceColumn] ?? settings.virtual_balance ?? settings.demo_balance);
+  if (Number.isFinite(stored)) {
+    virtualBalanceMemory = stored;
+    return stored;
+  }
+  if (virtualBalanceMemory !== null) return virtualBalanceMemory;
+  return VIRTUAL_BALANCE_START;
+}
+
+async function writeVirtualBalance(settingsId, balance, cfg = null) {
+  const value = Math.max(0, Number(balance.toFixed(2)));
+  virtualBalanceMemory = value;
+
+  let lastError = null;
+  for (const column of VIRTUAL_BALANCE_COLUMNS) {
+    const { error } = await supabase
+      .from('settings')
+      .update({ [column]: value })
+      .eq('id', settingsId);
+    if (!error) {
+      if (column !== virtualBalanceColumn) {
+        console.warn(`[DEMO BALANCE] Persisting paper balance in settings.${column}.`);
+      }
+      virtualBalanceColumn = column;
+      if (virtualBalanceHeldInMemory) {
+        virtualBalanceHeldInMemory = false;
+        await appendLog('INFO', `[${MODE_LABEL[cfg?.mode] || 'DEMO'}] Paper balance persistence restored — ${money(value)} saved to settings.${column}.`);
+      }
+      return value;
+    }
+    lastError = error;
+    if (!isMissingColumnError(error)) break;
+  }
+
+  const reason = lastError?.message || 'no writable settings column';
+  if (!virtualBalanceHeldInMemory) {
+    virtualBalanceHeldInMemory = true;
+    console.warn(
+      `[DEMO BALANCE] ${reason} — holding paper balance in memory so DEMO trades and P&L keep accumulating.`
+    );
+  }
+  await warnThrottled(
+    'virtual-balance-column',
+    `DEMO balance could not be saved (${reason}). Holding ${money(value)} in memory so paper trades and P&L keep accumulating — run "alter table public.settings add column if not exists virtual_balance numeric default 10000;" to persist it again.`,
+    null,
+    cfg
+  );
+  return value;
+}
 
 async function runCycle() {
   try {
@@ -551,21 +772,25 @@ async function runCycle() {
 
     if (setErr || !settings) return;
 
-    // Resolve credentials from env or Supabase settings table
-    const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
-    const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
-    const useTestnet = process.env.BINANCE_TESTNET === 'false' ? false : (ENV_TESTNET || Boolean(settings.use_testnet));
-    const telegramToken = (settings.telegram_bot_token || settings.bot_token || '').trim();
-    const telegramChatId = (settings.telegram_chat_id || settings.chat_id || '').trim();
+    const cfg = resolveTradingConfig(settings);
+    cfg.id = settings.id;
+    cfg.apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
+    cfg.apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
+    cfg.useTestnet =
+      process.env.BINANCE_TESTNET === 'false' ? false : ENV_TESTNET || Boolean(settings.use_testnet);
+    cfg.hasCredentials = Boolean(cfg.apiKey && cfg.apiSecret);
+    const label = MODE_LABEL[cfg.mode];
 
-    // 1. ALWAYS sync Real Binance Spot USDT Balance in every 15s loop (regardless of bot_enabled ON/OFF)
     const heartbeatPatch = { last_heartbeat: new Date().toISOString() };
-    let tradeableUsdt = Number(settings.balance_usdt || 0);
-    if (apiKey && apiSecret) {
+    let liveSpot = Number(settings.balance_usdt || 0);
+    let virtualBalance = readVirtualBalance(settings);
+
+    // 1. Always sync the real Binance balance for the LIVE readout (even on standby).
+    if (cfg.hasCredentials) {
       try {
-        const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
+        const portfolio = await fetchBinancePortfolioUsdt(cfg.apiKey, cfg.apiSecret, cfg.useTestnet);
         if (portfolio) {
-          tradeableUsdt = portfolio.spot;
+          liveSpot = portfolio.spot;
           heartbeatPatch.balance_usdt = portfolio.total;
           if (lastLoggedBalance !== portfolio.total) {
             lastLoggedBalance = portfolio.total;
@@ -579,220 +804,293 @@ async function runCycle() {
       }
     }
 
-    await supabase
-      .from('settings')
-      .update(heartbeatPatch)
-      .eq('id', settings.id);
+    await supabase.from('settings').update(heartbeatPatch).eq('id', settings.id);
 
-    if (!settings.bot_enabled) {
-      return; // Standby / OFF: Sync balance & heartbeat only, never place orders!
-    }
+    if (!cfg.isRunning) return; // Standby: heartbeat only, never place orders.
 
-    const enabledPairs = Array.isArray(settings.enabled_pairs)
-      ? settings.enabled_pairs
-      : ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
+    const { data: openRows } = await supabase.from('trades').select('*').eq('status', 'OPEN');
+    const activeTrades = (openRows || []).filter((row) => tradeModeOf(row) === cfg.mode);
 
-    const { data: openTrades } = await supabase
-      .from('trades')
-      .select('*')
-      .eq('status', 'OPEN');
-
-    const activeTrades = openTrades || [];
     const symbolsToFetch = Array.from(
-      new Set([...enabledPairs, ...activeTrades.map((t) => t.pair)])
+      new Set([...cfg.pairs, ...activeTrades.map((t) => t.pair)].filter(Boolean))
     );
-    const prices = await fetchBinancePrices(symbolsToFetch, useTestnet);
+    const prices = await fetchBinancePrices(symbolsToFetch, cfg.useTestnet);
 
-    // 2. Refresh open trades PnL
+    // 2. Refresh open-trade PnL for this workspace's positions only.
     for (const tr of activeTrades) {
       const livePx = prices[tr.pair];
       if (!livePx) continue;
-      const profitUsdt = Number(((livePx - tr.entry_price) * tr.quantity).toFixed(2));
-      const profitPct = Number(((profitUsdt / Math.max(0.01, tr.invested_usdt)) * 100).toFixed(2));
+      const qty = Number(tr.quantity || 0);
+      const profitUsdt = Number(((livePx - Number(tr.entry_price)) * qty).toFixed(2));
+      const profitPct = Number(
+        ((profitUsdt / Math.max(0.01, Number(tr.invested_usdt))) * 100).toFixed(2)
+      );
       await supabase
         .from('trades')
-        .update({
-          current_price: livePx,
-          profit_usdt: profitUsdt,
-          profit_pct: profitPct,
-        })
+        .update({ current_price: livePx, profit_usdt: profitUsdt, profit_pct: profitPct })
         .eq('id', tr.id);
       tr.current_price = livePx;
       tr.profit_usdt = profitUsdt;
       tr.profit_pct = profitPct;
     }
 
-    const lotRequested = Math.max(1, Number(settings.amount_per_trade || 10));
-    const lot = apiKey && apiSecret ? Math.max(lotRequested, BINANCE_MIN_ORDER_USDT) : lotRequested;
-    if (lot > lotRequested) {
-      await warnThrottled(
-        'lot-raised',
-        `Lot size raised from $${lotRequested.toFixed(2)} to $${lot.toFixed(2)} — Binance Spot rejects orders under $5 MIN_NOTIONAL (this caused 'Filter failure: NOTIONAL').`
-      );
-    }
-    const tpPct = Number(settings.take_profit_pct || 2.4);
-    const dcaEnabled = settings.dca_enabled !== false;
-    const dcaStepPct = Math.max(0.2, Number(settings.dca_step_pct || 1.5));
-    const dcaMaxBuys = Math.max(1, Number(settings.dca_max_buys || 12));
-    const zeroLoss = Boolean(
-      settings.zero_loss_shield ?? settings.zero_loss_mode ?? settings.sell_only_in_profit ?? true
-    );
-    const stopLossEnabled = !zeroLoss && Boolean(settings.stop_loss_enabled);
-    const stopLossPct = Math.abs(Number(settings.stop_loss_pct || 1.5));
-    const maxPerPair = Number(settings.max_amount_per_pair || 500);
-    const maxOpenTrades = Math.max(1, Number(settings.max_open_trades || 5));
-
-    // 3. Evaluate Batch Sell-All (Fee-Aware Zero-Loss Shield) or DCA Re-Buy per pair
-    for (const symbol of enabledPairs) {
+    // 3. Strategy: batch sell-all (fee-aware zero-loss), DCA re-buy, fresh entries.
+    for (const symbol of cfg.pairs) {
       const livePx = prices[symbol];
       if (!livePx) continue;
       const pairOpen = activeTrades.filter((t) => t.pair === symbol);
 
       if (pairOpen.length > 0) {
-        const totalInvested = pairOpen.reduce((s, t) => s + Number(t.invested_usdt), 0);
-        const totalPnl = pairOpen.reduce((s, t) => s + Number(t.profit_usdt), 0);
+        const totalInvested = pairOpen.reduce((s, t) => s + Number(t.invested_usdt || 0), 0);
+        const totalPnl = pairOpen.reduce((s, t) => s + Number(t.profit_usdt || 0), 0);
         const aggPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
         const estimatedFeesUsdt = totalInvested * (BINANCE_ROUND_TRIP_FEE_PCT / 100);
         const netPnlAfterFees = totalPnl - estimatedFeesUsdt;
-        const requiredTpWithFees = zeroLoss ? tpPct + BINANCE_ROUND_TRIP_FEE_PCT : tpPct;
+        const requiredTpWithFees = cfg.zeroLoss ? cfg.tpPct + BINANCE_ROUND_TRIP_FEE_PCT : cfg.tpPct;
 
-        // STRICT ZERO-LOSS CHECK: Never sell unless gross PnL covers Binance 0.2% round-trip fees + net profit > 0
         const takeProfitTriggered =
-          aggPct >= requiredTpWithFees && (!zeroLoss || netPnlAfterFees > 0);
-
-        const stopLossTriggered =
-          stopLossEnabled && !zeroLoss && aggPct <= -stopLossPct;
+          aggPct >= requiredTpWithFees && (!cfg.zeroLoss || netPnlAfterFees > 0);
+        const stopLossTriggered = cfg.stopLossEnabled && !cfg.zeroLoss && aggPct <= -cfg.stopLossPct;
 
         if (takeProfitTriggered || stopLossTriggered) {
+          const closedAt = new Date().toISOString();
+          let closedCount = 0;
           for (const tr of pairOpen) {
-            if (apiKey && apiSecret) {
+            if (cfg.mode === 'live') {
               try {
-                await placeBinanceMarketOrder(symbol, 'SELL', 0, tr.quantity, apiKey, apiSecret, useTestnet);
+                await placeBinanceMarketOrder(
+                  symbol,
+                  'SELL',
+                  0,
+                  Number(tr.quantity),
+                  cfg.apiKey,
+                  cfg.apiSecret,
+                  cfg.useTestnet
+                );
               } catch (sellErr) {
                 await warnThrottled(
                   `sell-failed-${symbol}`,
                   `LIVE SELL REJECTED ${symbol}: ${sellErr.message} — position kept open, next cycle will retry.`,
-                  symbol
+                  symbol,
+                  cfg
                 );
                 continue;
               }
             }
-            await supabase
+            const { error: closeErr } = await supabase
               .from('trades')
               .update({
                 status: 'CLOSED',
                 exit_price: livePx,
-                closed_at: new Date().toISOString(),
+                profit_usdt: Number((livePx - Number(tr.entry_price)) * Number(tr.quantity || 0)),
+                closed_at: closedAt,
               })
               .eq('id', tr.id);
+            if (closeErr) {
+              console.error(`[CLOSE ERROR] ${closeErr.message}`);
+              continue;
+            }
+            closedCount += 1;
           }
-          const tag = takeProfitTriggered ? 'BATCH SELL ALL' : 'STOP-LOSS EXIT';
-          const msg = `${tag} ${symbol} (${pairOpen.length} orders) @ $${livePx} | Net PnL ${
-            netPnlAfterFees >= 0 ? '+' : ''
-          }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`;
-          await appendLog('TRADE', msg, symbol);
-          if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`, telegramToken, telegramChatId);
+
+          if (closedCount > 0) {
+            const proceeds = totalInvested + netPnlAfterFees;
+            if (cfg.mode === 'virtual') {
+              virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance + proceeds, cfg);
+            } else {
+              liveSpot = Math.max(0, liveSpot + proceeds);
+            }
+            const tag = takeProfitTriggered ? 'BATCH SELL ALL' : 'STOP-LOSS EXIT';
+            const msg = `${tag} ${symbol} (${closedCount} orders) @ $${livePx} | Net PnL ${
+              netPnlAfterFees >= 0 ? '+' : ''
+            }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`;
+            await appendLog('TRADE', `[${label}] ${msg}`, symbol);
+            await sendTradeTelegram(cfg, {
+              title: tag,
+              symbol,
+              side: 'SELL',
+              price: livePx,
+              amountUsd: totalInvested,
+              pnlUsdt: netPnlAfterFees,
+              pnlPct: aggPct,
+              balanceUsd: cfg.mode === 'live' ? liveSpot : virtualBalance,
+              note: takeProfitTriggered
+                ? cfg.zeroLoss
+                  ? 'Zero-Loss Shield: exit cleared the 0.2% round-trip fee.'
+                  : undefined
+                : 'Circuit breaker: stop-loss exit executed.',
+            });
+          }
           continue;
         }
 
-        // DCA Re-Buy when price dips below lowest open entry
-        if (dcaEnabled && pairOpen.length < dcaMaxBuys) {
+        // DCA re-buy on a dip below the lowest open entry.
+        if (cfg.dcaEnabled && pairOpen.length < cfg.dcaMaxBuys) {
           const lowestEntry = Math.min(...pairOpen.map((t) => Number(t.entry_price)));
           const dropPct = ((lowestEntry - livePx) / lowestEntry) * 100;
-          if (dropPct >= dcaStepPct && totalInvested + lot <= maxPerPair) {
-            let filledQty = Number((lot / livePx).toFixed(5));
-            let orderNotional = lot;
-            if (apiKey && apiSecret) {
+          if (dropPct >= cfg.dcaStepPct && totalInvested + cfg.lotRequested <= cfg.maxPerPair) {
+            let row = null;
+            if (cfg.mode === 'live') {
               const buy = await buyWithGuards(
                 symbol,
                 'DCA',
-                lot,
+                cfg.lotRequested,
                 livePx,
-                apiKey,
-                apiSecret,
-                useTestnet,
-                tradeableUsdt
+                cfg.apiKey,
+                cfg.apiSecret,
+                cfg.useTestnet,
+                liveSpot,
+                cfg
               );
               if (!buy) continue;
-              filledQty = buy.filledQty;
-              orderNotional = buy.notional;
-              tradeableUsdt = Math.max(0, Number((tradeableUsdt - orderNotional).toFixed(2)));
+              row = buildTradeRow({
+                mode: 'live',
+                symbol,
+                price: livePx,
+                quantity: buy.filledQty,
+                notional: buy.notional,
+                tpPct: cfg.tpPct,
+                zeroLoss: cfg.zeroLoss,
+                stopLossPct: cfg.stopLossPct,
+              });
+              if (!(await insertTradeWithMode(row, 'live'))) continue;
+              liveSpot = Math.max(0, liveSpot - buy.notional);
+            } else {
+              if (virtualBalance < cfg.lotRequested) {
+                await warnThrottled(
+                  `virtual-funds-${symbol}`,
+                  `DEMO ${symbol} DCA skipped — virtual balance ${money(
+                    virtualBalance
+                  )} is below the ${money(cfg.lotRequested)} lot.`,
+                  symbol,
+                  cfg
+                );
+                continue;
+              }
+              row = buildTradeRow({
+                mode: 'virtual',
+                symbol,
+                price: livePx,
+                quantity: Number((cfg.lotRequested / livePx).toFixed(8)),
+                notional: cfg.lotRequested,
+                tpPct: cfg.tpPct,
+                zeroLoss: cfg.zeroLoss,
+                stopLossPct: cfg.stopLossPct,
+              });
+              if (!(await insertTradeWithMode(row, 'virtual'))) continue;
+              virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - cfg.lotRequested, cfg);
             }
-            const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
-            await supabase.from('trades').insert({
-              id,
-              pair: symbol,
+            activeTrades.push(row);
+            const msg = `DCA RE-BUY #${pairOpen.length + 1} ${symbol} @ $${livePx} (-${dropPct.toFixed(
+              2
+            )}% dip) | ${money(row.invested_usdt)} USDT`;
+            await appendLog('TRADE', `[${label}] ${msg}`, symbol);
+            await sendTradeTelegram(cfg, {
+              title: `DCA RE-BUY #${pairOpen.length + 1}`,
+              symbol,
               side: 'BUY',
-              status: 'OPEN',
-              entry_price: livePx,
-              current_price: livePx,
-              quantity: filledQty,
-              invested_usdt: orderNotional,
-              profit_usdt: 0,
-              profit_pct: 0,
-              take_profit_price: Number(
-                (livePx * (1 + (tpPct + (zeroLoss ? BINANCE_ROUND_TRIP_FEE_PCT : 0)) / 100)).toFixed(4)
-              ),
-              opened_at: new Date().toISOString(),
+              price: livePx,
+              amountUsd: row.invested_usdt,
+              balanceUsd: cfg.mode === 'live' ? liveSpot : virtualBalance,
+              note: `Dip: -${dropPct.toFixed(2)}% vs lowest entry`,
             });
-            const msg = `DCA RE-BUY #${pairOpen.length + 1} ${symbol} @ $${livePx} (-${dropPct.toFixed(2)}% dip) | $${orderNotional.toFixed(2)} USDT`;
-            await appendLog('TRADE', msg, symbol);
-            if (settings.telegram_enabled) await sendTelegram(`<b>[AEGIS LIVE]</b> ${msg}`, telegramToken, telegramChatId);
           }
         }
-      } else if (activeTrades.length < maxOpenTrades) {
-        // Real-Time Market Data Analysis (Volume Spike & Momentum check)
+      } else if (activeTrades.length < cfg.maxOpenTrades) {
+        if (cfg.mode === 'live' && !cfg.hasCredentials) {
+          await warnThrottled(
+            'live-missing-keys',
+            'LIVE mode is ON but no Binance API key/secret is configured — no orders are sent and no phantom trades are recorded.',
+            null,
+            cfg
+          );
+          return;
+        }
+
         let ticker24h = null;
         try {
-          ticker24h = await fetchPublicWithFallback(`/api/v3/ticker/24hr?symbol=${symbol}`, useTestnet);
+          ticker24h = await fetchPublicWithFallback(
+            `/api/v3/ticker/24hr?symbol=${symbol}`,
+            cfg.useTestnet
+          );
         } catch {}
 
         const priceChangePercent = ticker24h ? Number(ticker24h.priceChangePercent || 0) : 0;
         const quoteVolume = ticker24h ? Number(ticker24h.quoteVolume || 0) : 100000;
-        
-        const hasHealthyVolume = quoteVolume > 200000; // > $200k volume
-        const favorableMomentum = priceChangePercent > -5.0; // Avoid catastrophic freefall
+        const hasHealthyVolume = quoteVolume > 200000;
+        const favorableMomentum = priceChangePercent > -5.0;
 
         if (hasHealthyVolume && favorableMomentum) {
-          let filledQty = Number((lot / livePx).toFixed(5));
-          let orderNotional = lot;
-          if (apiKey && apiSecret) {
+          let row = null;
+          if (cfg.mode === 'live') {
             const buy = await buyWithGuards(
               symbol,
               'ENTRY',
-              lot,
+              cfg.lotRequested,
               livePx,
-              apiKey,
-              apiSecret,
-              useTestnet,
-              tradeableUsdt
+              cfg.apiKey,
+              cfg.apiSecret,
+              cfg.useTestnet,
+              liveSpot,
+              cfg
             );
             if (!buy) continue;
-            filledQty = buy.filledQty;
-            orderNotional = buy.notional;
-            tradeableUsdt = Math.max(0, Number((tradeableUsdt - orderNotional).toFixed(2)));
+            row = buildTradeRow({
+              mode: 'live',
+              symbol,
+              price: livePx,
+              quantity: buy.filledQty,
+              notional: buy.notional,
+              tpPct: cfg.tpPct,
+              zeroLoss: cfg.zeroLoss,
+              stopLossPct: cfg.stopLossPct,
+            });
+            if (!(await insertTradeWithMode(row, 'live'))) continue;
+            liveSpot = Math.max(0, liveSpot - buy.notional);
+          } else {
+            if (virtualBalance < cfg.lotRequested) {
+              await warnThrottled(
+                `virtual-funds-${symbol}`,
+                `DEMO ${symbol} entry skipped — virtual balance ${money(
+                  virtualBalance
+                )} is below the ${money(cfg.lotRequested)} lot.`,
+                symbol,
+                cfg
+              );
+              continue;
+            }
+            row = buildTradeRow({
+              mode: 'virtual',
+              symbol,
+              price: livePx,
+              quantity: Number((cfg.lotRequested / livePx).toFixed(8)),
+              notional: cfg.lotRequested,
+              tpPct: cfg.tpPct,
+              zeroLoss: cfg.zeroLoss,
+              stopLossPct: cfg.stopLossPct,
+            });
+            if (!(await insertTradeWithMode(row, 'virtual'))) continue;
+            virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - cfg.lotRequested, cfg);
           }
-          const id = `ORD-${Date.now()}-${Math.floor(Math.random() * 999)}`;
-          await supabase.from('trades').insert({
-            id,
-            pair: symbol,
+
+          activeTrades.push(row);
+          const msg = `ENTRY BUY ${symbol} @ $${livePx} | ${money(
+            row.invested_usdt
+          )} USDT | 24h ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(
+            2
+          )}% | Vol $${Math.round(quoteVolume).toLocaleString()}`;
+          await appendLog('TRADE', `[${label}] ${msg}`, symbol);
+          await sendTradeTelegram(cfg, {
+            title: cfg.mode === 'live' ? 'ENTRY BUY' : 'PAPER ENTRY BUY',
+            symbol,
             side: 'BUY',
-            status: 'OPEN',
-            entry_price: livePx,
-            current_price: livePx,
-            quantity: filledQty,
-            invested_usdt: orderNotional,
-            profit_usdt: 0,
-            profit_pct: 0,
-            take_profit_price: Number(
-              (livePx * (1 + (tpPct + (zeroLoss ? BINANCE_ROUND_TRIP_FEE_PCT : 0)) / 100)).toFixed(4)
-            ),
-            opened_at: new Date().toISOString(),
+            price: livePx,
+            amountUsd: row.invested_usdt,
+            balanceUsd: cfg.mode === 'live' ? liveSpot : virtualBalance,
+            note: `24h ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}% · ${
+              cfg.zeroLoss ? 'Zero-Loss Shield ON' : 'Standard TP/SL'
+            }`,
           });
-          activeTrades.push({ pair: symbol });
-          const detailedMsg = `🚀 <b>AEGIS LIVE ENTRY BUY</b>\nPair: <b>${symbol}</b>\nPrice: $${livePx}\nInvested: $${orderNotional.toFixed(2)} USDT\n24h Change: ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%\nVolume: $${Math.round(quoteVolume).toLocaleString()}\nMode: ${zeroLoss ? 'Zero-Loss Shield ON' : 'Standard'}`;
-          await appendLog('TRADE', detailedMsg, symbol);
-          if (settings.telegram_enabled) await sendTelegram(detailedMsg, telegramToken, telegramChatId);
         }
       }
     }
@@ -803,7 +1101,9 @@ async function runCycle() {
 }
 
 async function startWorker() {
-  console.log('[AEGIS WORKER] Started (Continuous Balance Sync + Trading Engine). Polling every 15s...');
+  console.log(
+    '[AEGIS WORKER] Started — 24/7 engine for LIVE + DEMO/VIRTUAL modes. Polling Supabase settings every 15s...'
+  );
   await logServerPublicIp();
   await runCycle();
   setInterval(runCycle, 15_000);

@@ -112,7 +112,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     onSaveTelegram(tgDraft);
     onSaveBinance(bnDraft);
     await onSave({
-      amount_per_trade: Math.max(1, draft.amount_per_trade),
+      amount_per_trade: Math.max(minLot, draft.amount_per_trade),
       take_profit_pct: draft.take_profit_pct,
       stop_loss_enabled: draft.zero_loss_mode ? false : draft.stop_loss_enabled,
       stop_loss_pct: draft.stop_loss_pct,
@@ -216,6 +216,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   // The portfolio total includes coins and Funding/Earn; only Spot USDT can be spent.
   const tradeableUsdt = binanceAccount?.usdtFree ?? 0;
   const canFundOrders = Boolean(binanceAccount?.canTrade);
+  // Binance Spot rejects any order below $5 MIN_NOTIONAL, so LIVE has a real floor.
+  const minLot = workspace === 'LIVE' ? 5.5 : 1;
+  const lotPresets = LOT_PRESETS.filter((amt) => amt >= minLot);
 
   return (
     <div className="space-y-4">
@@ -630,14 +633,14 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   <span className="text-slate-500">$</span>
                   <input
                     type="number"
-                    min={1}
+                    min={minLot}
                     max={5000}
                     step={1}
                     value={draft.amount_per_trade}
                     onChange={(e) =>
                       setDraft((p) => ({
                         ...p,
-                        amount_per_trade: Math.max(1, Number(e.target.value) || 1),
+                        amount_per_trade: Math.max(minLot, Number(e.target.value) || minLot),
                       }))
                     }
                     className="w-20 rounded border border-slate-700 bg-[#090d16] px-2 py-1 text-right font-mono-tech text-xs font-bold text-cyan-300 focus:border-cyan-400 focus:outline-none"
@@ -646,17 +649,17 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               </div>
               <input
                 type="range"
-                min={1}
+                min={minLot}
                 max={1000}
                 step={1}
-                value={Math.min(1000, draft.amount_per_trade)}
+                value={Math.min(1000, Math.max(minLot, draft.amount_per_trade))}
                 onChange={(e) =>
                   setDraft((p) => ({ ...p, amount_per_trade: Number(e.target.value) }))
                 }
                 className="w-full accent-cyan-400"
               />
               <div className="mt-2.5 flex flex-wrap gap-1.5">
-                {LOT_PRESETS.map((amt) => (
+                {lotPresets.map((amt) => (
                   <button
                     key={amt}
                     type="button"
@@ -674,6 +677,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   </button>
                 ))}
               </div>
+              <p
+                className={`mt-2 font-mono-tech text-[10px] leading-relaxed ${
+                  workspace === 'LIVE' ? 'text-amber-300/90' : 'text-slate-500'
+                }`}
+              >
+                {t.liveLotMinHint}
+              </p>
             </div>
 
             {/* Take Profit % */}

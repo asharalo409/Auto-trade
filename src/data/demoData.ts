@@ -31,6 +31,9 @@ export const SUPABASE_SQL_SCHEMA = `-- 1. SETTINGS TABLE
 create table if not exists public.settings (
   id bigint primary key generated always as identity,
   bot_enabled boolean default false,
+  is_running boolean default false,
+  trading_mode text default 'live',
+  virtual_balance numeric default 10000,
   amount_per_trade numeric default 10,
   take_profit_pct numeric default 2.4,
   stop_loss_enabled boolean default false,
@@ -48,6 +51,8 @@ create table if not exists public.settings (
   mode text default 'LIVE',
   enabled_pairs jsonb default '["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT"]'::jsonb,
   telegram_enabled boolean default false,
+  telegram_bot_token text,
+  telegram_chat_id text,
   binance_api_key text,
   binance_api_secret text,
   use_testnet boolean default false,
@@ -72,7 +77,8 @@ create table if not exists public.trades (
   take_profit_price numeric,
   stop_loss_price numeric,
   opened_at timestamptz default now(),
-  closed_at timestamptz
+  closed_at timestamptz,
+  mode text default 'live'
 );
 
 -- 3. LOGS & ENGINE_LOGS TABLES
@@ -106,7 +112,15 @@ create policy "Auth users full engine_logs" on public.engine_logs for all to aut
 
 insert into public.settings (bot_enabled, mode, zero_loss_mode, sell_only_in_profit)
 select false, 'LIVE', true, true
-where not exists (select 1 from public.settings);`;
+where not exists (select 1 from public.settings);
+
+-- 5. UPGRADE FOR 24/7 WORKER (safe to re-run on an existing project)
+alter table public.settings add column if not exists is_running boolean default false;
+alter table public.settings add column if not exists trading_mode text default 'live';
+alter table public.settings add column if not exists virtual_balance numeric default 10000;
+alter table public.settings add column if not exists telegram_bot_token text;
+alter table public.settings add column if not exists telegram_chat_id text;
+alter table public.trades add column if not exists mode text default 'live';`;
 
 export const INITIAL_DEMO_SETTINGS: BotSettings = {
   id: 1,

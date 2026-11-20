@@ -112,10 +112,21 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
     row.zero_loss_shield ?? row.zero_loss_mode ?? row.sell_only_in_profit ?? fallback.zero_loss_mode
   );
 
+  // `telegram_enabled` is null on rows created before the column existed. The worker
+  // treats null as "enabled" (`settings.telegram_enabled !== false`), so the terminal
+  // must agree — otherwise it shows MUTED while the server keeps pushing alerts.
+  const telegramRaw = row.telegram_enabled;
+  const telegramEnabled =
+    telegramRaw === null || telegramRaw === undefined
+      ? true
+      : telegramRaw === 'false' || telegramRaw === '0' || telegramRaw === 0
+        ? false
+        : Boolean(telegramRaw);
+
   return {
     ...fallback,
     id: (row.id as number | string) ?? fallback.id,
-    bot_enabled: Boolean(row.bot_enabled),
+    bot_enabled: Boolean(row.is_running ?? row.bot_enabled),
     amount_per_trade: Math.max(1, Number(row.amount_per_trade ?? fallback.amount_per_trade)),
     take_profit_pct: Number(row.take_profit_pct ?? fallback.take_profit_pct),
     stop_loss_enabled: zeroLossResolved
@@ -135,7 +146,7 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
     daily_loss_limit: Number(row.daily_loss_limit ?? fallback.daily_loss_limit),
     mode: ((row.mode ?? row.trading_mode ?? fallback.mode) as TradingMode),
     enabled_pairs,
-    telegram_enabled: Boolean(row.telegram_enabled ?? fallback.telegram_enabled),
+    telegram_enabled: telegramEnabled,
     last_heartbeat: String(
       row.last_heartbeat ?? row.heartbeat_at ?? row.updated_at ?? new Date().toISOString()
     ),
@@ -162,6 +173,17 @@ function normalizeTrade(row: Record<string, unknown>): Trade {
   const status = (['OPEN', 'CLOSED', 'CANCELLED'].includes(rawStatus)
     ? rawStatus
     : 'OPEN') as Trade['status'];
+  // Rows written by the 24/7 worker carry their workspace. Older rows have no
+  // `mode`, so the VDEMO- id prefix keeps paper trades out of the LIVE ledger.
+  const rawMode = String(row.mode ?? row.trading_mode ?? '').trim().toLowerCase();
+  const tradeMode: TradingMode =
+    rawMode === 'live'
+      ? 'LIVE'
+      : rawMode === 'virtual'
+        ? 'DEMO'
+        : String(row.id ?? '').startsWith('VDEMO-')
+          ? 'DEMO'
+          : 'LIVE';
 
   return {
     id: String(row.id ?? Math.random().toString(36).slice(2, 8)),
@@ -179,6 +201,7 @@ function normalizeTrade(row: Record<string, unknown>): Trade {
     stop_loss_price: Number(row.stop_loss_price ?? entry * 0.985),
     opened_at: String(row.opened_at ?? row.created_at ?? new Date().toISOString()),
     closed_at: row.closed_at ? String(row.closed_at) : null,
+    mode: tradeMode,
   };
 }
 
@@ -355,6 +378,16 @@ export function useTradingTerminal() {
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
   const logCycleRef = useRef(0);
+  const hasHydratedRef = useRef(false);
+  const lastHydratedAtRef = useRef<number>(Date.now());
+  // The real settings row id, learned from Supabase. Before hydration both workspaces
+  // still carry the hardcoded mock ids (1 for DEMO, 2 for LIVE), so writing with
+  // `settings.id` could target a non-existent row — or another row entirely — right
+  // after a workspace switch.
+  const settingsRowIdRef = useRef<number | string | null>(null);
+  // Set when the operator picks a workspace by hand, so a slow first hydration can
+  // never yank the view back to the persisted mode.
+  const workspaceTouchedRef = useRef(false);
   const marketPairsRef = useRef<PairMarketData[]>(marketPairs);
   const demoTradesRef = useRef<Trade[]>(demoTrades);
   const liveTradesRef = useRef<Trade[]>(liveTrades);
@@ -414,6 +447,31 @@ export function useTradingTerminal() {
   useEffect(() => {
     saveJson(STORAGE_TG_KEY, telegramConfig);
   }, [telegramConfig]);
+
+  // The worker cannot read localStorage, so Telegram credentials must also live in
+  // the Supabase settings row for server-side push notifications. Nothing is written
+  // before the row id is known, and blank local fields never overwrite credentials
+  // that another browser already stored on the server.
+  useEffect(() => {
+    if (!supabase || isDemoMode || !isAuthenticated) return;
+    const rowId = settingsRowIdRef.current;
+    if (rowId === null) return;
+    const timeout = window.setTimeout(() => {
+      const patch: Record<string, unknown> = { telegram_enabled: settings.telegram_enabled };
+      const botToken = telegramConfig.bot_token.trim();
+      const chatId = telegramConfig.chat_id.trim();
+      if (botToken) patch.telegram_bot_token = botToken;
+      if (chatId) patch.telegram_chat_id = chatId;
+      void supabase!
+        .from('settings')
+        .update(patch)
+        .eq('id', rowId)
+        .then(({ error }) => {
+          if (error) console.warn('Telegram settings sync warning:', error.message);
+        });
+    }, 700);
+    return () => window.clearTimeout(timeout);
+  }, [isAuthenticated, isDemoMode, settings.id, settings.telegram_enabled, telegramConfig]);
 
   useEffect(() => {
     saveJson(STORAGE_BN_KEY, binanceConfig);
@@ -695,11 +753,11 @@ export function useTradingTerminal() {
       if (settingsRes.error && !settingsMissing) throw settingsRes.error;
       if (tradesRes.error && !tradesMissing) throw tradesRes.error;
 
-      if (settingsRes.data) {
-        const normalized = normalizeSettings(
-          settingsRes.data as Record<string, unknown>,
-          INITIAL_LIVE_SETTINGS
-        );
+      const settingsRow = (settingsRes.data ?? null) as Record<string, unknown> | null;
+      if (settingsRow) {
+        const rowId = settingsRow.id as number | string | undefined;
+        if (rowId !== undefined && rowId !== null) settingsRowIdRef.current = rowId;
+        const normalized = normalizeSettings(settingsRow, INITIAL_LIVE_SETTINGS);
         setLiveSettings((prev) => ({
           ...normalized,
           sound_enabled: prev.sound_enabled,
@@ -709,13 +767,61 @@ export function useTradingTerminal() {
           // Never let stale Supabase balance overwrite verified live Binance balance
           balance_usdt: binanceAccountRef.current?.connected ? prev.balance_usdt : 0,
         }));
-        if (normalized.mode === 'LIVE') {
-          setActiveWorkspace('LIVE');
+
+        // The DEMO workspace mirrors the worker's virtual configuration so the
+        // paper account shown here is the one actually trading on the server.
+        const virtualBalance = Number(settingsRow.virtual_balance ?? settingsRow.demo_balance);
+        setDemoSettings((prev) => ({
+          ...normalizeSettings(settingsRow, prev),
+          mode: 'DEMO',
+          sound_enabled: prev.sound_enabled,
+          theme: prev.theme,
+          core_visual: prev.core_visual,
+          candle_style: prev.candle_style,
+          balance_usdt: Number.isFinite(virtualBalance) ? virtualBalance : prev.balance_usdt,
+        }));
+
+        // Only follow the persisted workspace on the first load, never while the
+        // operator is actively looking at the other workspace.
+        if (!hasHydratedRef.current && !workspaceTouchedRef.current) {
+          const declared = String(settingsRow.trading_mode ?? settingsRow.mode ?? '')
+            .trim()
+            .toLowerCase();
+          if (declared === 'live') setActiveWorkspace('LIVE');
+          else if (declared === 'virtual' || declared === 'demo') setActiveWorkspace('DEMO');
         }
       }
+
       if (tradesRes.data) {
-        setLiveTrades((tradesRes.data as Record<string, unknown>[]).map(normalizeTrade));
+        const rows = (tradesRes.data as Record<string, unknown>[]).map(normalizeTrade);
+        // A successful-but-empty payload (fresh project, RLS hiding every row, lag right
+        // after a write) must never erase history the terminal already holds: nothing in
+        // this app deletes trades, so "no rows" means "unknown", not "empty account".
+        if (rows.length === 0) {
+          console.debug(
+            '[useTradingTerminal] trades fetch returned no rows; keeping local trade history'
+          );
+        } else {
+          const closedSince = (t: Trade) =>
+            new Date(t.closed_at ?? t.opened_at).getTime() > lastHydratedAtRef.current;
+          const missed = rows.filter(closedSince);
+          setLiveTrades(rows.filter((t) => t.mode !== 'DEMO'));
+          setDemoTrades(rows.filter((t) => t.mode === 'DEMO'));
+          if (missed.length > 0 && hasHydratedRef.current) {
+            const summary: LogEntry = {
+              id: `catchup-${Date.now()}`,
+              level: 'INFO',
+              pair: null,
+              message: `CATCH-UP: ${missed.length} trade event(s) executed while the terminal was closed were restored from Supabase.`,
+              created_at: new Date().toISOString(),
+            };
+            setLiveLogs((prev) => mergeAndDedupeLogs([...prev, summary]));
+            setDemoLogs((prev) => mergeAndDedupeLogs([...prev, summary]));
+          }
+        }
       }
+      lastHydratedAtRef.current = Date.now();
+      hasHydratedRef.current = true;
 
       const combinedLogs: LogEntry[] = [
         ...(logsRes.data
@@ -728,7 +834,11 @@ export function useTradingTerminal() {
           : []),
       ];
       if (combinedLogs.length > 0) {
-        setLiveLogs(mergeAndDedupeLogs(combinedLogs));
+        const demoOnly = combinedLogs.filter((l) => l.message.startsWith('[DEMO]'));
+        setLiveLogs(
+          mergeAndDedupeLogs(combinedLogs.filter((l) => !l.message.startsWith('[DEMO]')))
+        );
+        if (demoOnly.length > 0) setDemoLogs(mergeAndDedupeLogs(demoOnly));
       }
     } catch (err) {
       console.error('Supabase fetch error:', err);
@@ -745,7 +855,9 @@ export function useTradingTerminal() {
     const handleRealtimeLog = (source: string) => (payload: { new?: unknown }) => {
       if (payload.new && typeof payload.new === 'object') {
         const entry = normalizeLog(payload.new as Record<string, unknown>, source);
-        setLiveLogs((prev) => {
+        // The worker tags paper-engine lines with [DEMO]; keep them out of the LIVE feed.
+        const setter = entry.message.startsWith('[DEMO]') ? setDemoLogs : setLiveLogs;
+        setter((prev) => {
           const filtered = prev.filter((l) => l.id !== entry.id);
           return mergeAndDedupeLogs([...filtered, entry]);
         });
@@ -759,11 +871,25 @@ export function useTradingTerminal() {
         { event: '*', schema: 'public', table: 'settings' },
         (payload) => {
           if (payload.new && typeof payload.new === 'object') {
+            const row = payload.new as Record<string, unknown>;
+            const rowId = row.id as number | string | undefined;
+            if (rowId !== undefined && rowId !== null) settingsRowIdRef.current = rowId;
             setLiveSettings((prev) => {
-              const next = normalizeSettings(payload.new as Record<string, unknown>, prev);
+              const next = normalizeSettings(row, prev);
               return {
                 ...next,
                 balance_usdt: binanceAccountRef.current?.connected ? prev.balance_usdt : 0,
+              };
+            });
+            // Both workspaces are projections of the same row, so DEMO must follow the
+            // worker's writes too (virtual balance, lot, run state) instead of waiting
+            // for the next focus/visibility refetch.
+            setDemoSettings((prev) => {
+              const virtualBalance = Number(row.virtual_balance ?? row.demo_balance);
+              return {
+                ...normalizeSettings(row, prev),
+                mode: 'DEMO',
+                balance_usdt: Number.isFinite(virtualBalance) ? virtualBalance : prev.balance_usdt,
               };
             });
           }
@@ -775,13 +901,17 @@ export function useTradingTerminal() {
         (payload) => {
           if (payload.eventType === 'INSERT' && payload.new) {
             const incoming = normalizeTrade(payload.new as Record<string, unknown>);
-            setLiveTrades((prev) => [incoming, ...prev.filter((t) => t.id !== incoming.id)]);
+            // Route by mode: a VDEMO- paper fill must never surface in the LIVE ledger.
+            const setter = incoming.mode === 'DEMO' ? setDemoTrades : setLiveTrades;
+            setter((prev) => [incoming, ...prev.filter((t) => t.id !== incoming.id)]);
           } else if (payload.eventType === 'UPDATE' && payload.new) {
             const updated = normalizeTrade(payload.new as Record<string, unknown>);
-            setLiveTrades((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+            const setter = updated.mode === 'DEMO' ? setDemoTrades : setLiveTrades;
+            setter((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
           } else if (payload.eventType === 'DELETE' && payload.old) {
             const oldId = String((payload.old as Record<string, unknown>).id);
             setLiveTrades((prev) => prev.filter((t) => t.id !== oldId));
+            setDemoTrades((prev) => prev.filter((t) => t.id !== oldId));
           }
         }
       )
@@ -799,6 +929,23 @@ export function useTradingTerminal() {
 
     return () => {
       supabase?.removeChannel(channel);
+    };
+  }, [fetchSupabaseData, isAuthenticated, isDemoMode]);
+
+  // Catch-up hydration: on reopen/focus/network recovery, immediately pull every
+  // trade and log the 24/7 worker produced while this tab was closed.
+  useEffect(() => {
+    if (!supabase || isDemoMode || !isAuthenticated) return;
+    const hydrate = () => {
+      if (!document.hidden) void fetchSupabaseData();
+    };
+    document.addEventListener('visibilitychange', hydrate);
+    window.addEventListener('focus', hydrate);
+    window.addEventListener('online', hydrate);
+    return () => {
+      document.removeEventListener('visibilitychange', hydrate);
+      window.removeEventListener('focus', hydrate);
+      window.removeEventListener('online', hydrate);
     };
   }, [fetchSupabaseData, isAuthenticated, isDemoMode]);
 
@@ -939,7 +1086,11 @@ export function useTradingTerminal() {
       if (logCycleRef.current % 2 === 0) {
         const ws: TradingMode = activeWorkspace;
         const activeCfg = ws === 'DEMO' ? demoSettings : liveSettings;
-        if (activeCfg.bot_enabled && (ws === 'DEMO' || isDemoMode)) {
+        // With Supabase connected the 24/7 worker owns execution; a second execute
+        // loop in this tab would double every order. Local simulation is only for
+        // the offline/guest demo.
+        const workerOwnsExecution = Boolean(supabase && isAuthenticated && !isDemoMode);
+        if (activeCfg.bot_enabled && !workerOwnsExecution && (ws === 'DEMO' || isDemoMode)) {
           const currentTrades = ws === 'DEMO' ? demoTradesRef.current : liveTradesRef.current;
           const setTargetTrades = ws === 'DEMO' ? setDemoTrades : setLiveTrades;
           let nextTrades = [...currentTrades];
@@ -1143,7 +1294,16 @@ export function useTradingTerminal() {
     }, 2800);
 
     return () => window.clearInterval(interval);
-  }, [activeWorkspace, appendLog, binanceFeedLive, demoSettings, isDemoMode, liveSettings, notifyTelegramIfConfigured]);
+  }, [
+    activeWorkspace,
+    appendLog,
+    binanceFeedLive,
+    demoSettings,
+    isAuthenticated,
+    isDemoMode,
+    liveSettings,
+    notifyTelegramIfConfigured,
+  ]);
 
   const botStatus: BotStatus = useMemo(() => {
     const hbMs = new Date(settings.last_heartbeat).getTime();
@@ -1266,12 +1426,15 @@ export function useTradingTerminal() {
 
   const switchWorkspace = useCallback((mode: TradingMode) => {
     audioSynth.playToggle(mode === 'LIVE');
+    workspaceTouchedRef.current = true;
     setActiveWorkspace(mode);
     saveJson(STORAGE_WORKSPACE_KEY, mode);
-    if (supabase && !isDemoMode) {
-      supabase.from('settings').update({ mode }).eq('id', settings.id).then(() => {});
-    }
-  }, [isDemoMode, settings.id]);
+    // Switching tabs is a view action: it must not rewrite the worker's run state.
+    // Writing only the legacy `mode` column here left `trading_mode` pointing at the
+    // other workspace (UI showing DEMO while the worker kept trading LIVE, then the
+    // view flipping back on reload because hydration prefers `trading_mode`). The
+    // worker's mode changes only through an explicit Start/Stop on this workspace.
+  }, []);
 
   const updateSettings = useCallback(
     async (patch: Partial<BotSettings>) => {
@@ -1337,7 +1500,23 @@ export function useTradingTerminal() {
         setLiveSettings((p) => ({ ...p, ...uiSync }));
       }
 
-      if (activeWorkspace === 'LIVE' && !isDemoMode && supabase) {
+      // The Render worker is the only executor once Supabase is connected, so both
+      // workspaces persist their run state (is_running + trading_mode) for it.
+      if (!isDemoMode && isAuthenticated && supabase) {
+        const targetId = settingsRowIdRef.current ?? next.id;
+        // Run state belongs to the worker: persist it only when the operator actually
+        // starts or stops this workspace. Writing it on every unrelated save meant a
+        // theme toggle on the DEMO tab could flip `trading_mode` and stop LIVE trading.
+        const runStateTouched = patch.bot_enabled !== undefined;
+        const runStatePayload = runStateTouched
+          ? {
+              is_running: next.bot_enabled,
+              trading_mode: activeWorkspace === 'LIVE' ? 'live' : 'virtual',
+              mode: activeWorkspace,
+            }
+          : {};
+        const telegramToken = telegramConfig.bot_token.trim();
+        const telegramChatId = telegramConfig.chat_id.trim();
         const corePayload = {
           bot_enabled: next.bot_enabled,
           amount_per_trade: next.amount_per_trade,
@@ -1348,12 +1527,14 @@ export function useTradingTerminal() {
           max_open_trades: next.max_open_trades,
           max_amount_per_pair: next.max_amount_per_pair,
           daily_loss_limit: next.daily_loss_limit,
-          mode: next.mode,
           enabled_pairs: next.enabled_pairs,
           telegram_enabled: next.telegram_enabled,
         };
         const extendedPayload = {
           ...corePayload,
+          ...runStatePayload,
+          ...(telegramToken ? { telegram_bot_token: telegramToken } : {}),
+          ...(telegramChatId ? { telegram_chat_id: telegramChatId } : {}),
           zero_loss_mode: next.zero_loss_mode,
           zero_loss_shield: next.zero_loss_mode,
           dca_enabled: next.dca_enabled,
@@ -1366,13 +1547,16 @@ export function useTradingTerminal() {
           const { error } = await supabase
             .from('settings')
             .update(extendedPayload)
-            .eq('id', next.id);
+            .eq('id', targetId);
           if (error) {
             if (error.code === 'PGRST204' || error.code === '42703' || error.code === '42P01') {
+              // Pre-upgrade schema: keep the run state (the worker can still read
+              // `is_running`/`mode`) and drop only the newer columns.
+              const retryPayload = { ...corePayload, ...runStatePayload };
               const { error: retryErr } = await supabase
                 .from('settings')
-                .update(corePayload)
-                .eq('id', next.id);
+                .update(retryPayload)
+                .eq('id', targetId);
               if (retryErr && retryErr.code !== 'PGRST204' && retryErr.code !== '42703' && retryErr.code !== '42P01') {
                 console.warn('Supabase settings table/columns not ready yet. Please run the provided SQL setup script in Supabase.');
               }
@@ -1388,7 +1572,7 @@ export function useTradingTerminal() {
       }
       setSavingSettings(false);
     },
-    [activeWorkspace, demoSettings, isDemoMode, liveSettings]
+    [activeWorkspace, demoSettings, isAuthenticated, isDemoMode, liveSettings, telegramConfig]
   );
 
   const placeQuickTrade = useCallback(
@@ -1624,7 +1808,8 @@ export function useTradingTerminal() {
         setLiveTrades(updater);
       }
 
-      if (activeWorkspace === 'LIVE' && !isDemoMode && supabase) {
+      // DEMO positions are worker-owned paper trades too, so persist both modes.
+      if (!isDemoMode && isAuthenticated && supabase) {
         try {
           await supabase
             .from('trades')
@@ -1661,6 +1846,7 @@ export function useTradingTerminal() {
     [
       activeWorkspace,
       appendLog,
+      isAuthenticated,
       isDemoMode,
       notifyTelegramIfConfigured,
       settings.zero_loss_mode,
@@ -1673,6 +1859,13 @@ export function useTradingTerminal() {
       audioSynth.playToggle(true);
       setDemoSettings((prev) => ({ ...prev, balance_usdt: amount }));
       setDemoTrades(INITIAL_DEMO_TRADES);
+      if (supabase && isAuthenticated && !isDemoMode) {
+        supabase
+          .from('settings')
+          .update({ virtual_balance: amount })
+          .eq('id', settingsRowIdRef.current ?? demoSettings.id)
+          .then(() => {});
+      }
       appendLog('DEMO', {
         id: createUniqueId('LOG'),
         level: 'INFO',
@@ -1681,7 +1874,7 @@ export function useTradingTerminal() {
         created_at: new Date().toISOString(),
       });
     },
-    [appendLog]
+    [appendLog, demoSettings.id, isAuthenticated, isDemoMode]
   );
 
   const refreshBinanceBalance = useCallback(

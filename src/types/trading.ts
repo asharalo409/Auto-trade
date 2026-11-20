@@ -142,6 +142,8 @@ export interface Trade {
   stop_loss_price: number;
   opened_at: string;
   closed_at?: string | null;
+  /** Workspace the trade belongs to; set by the 24/7 worker (live vs virtual). */
+  mode?: TradingMode;
 }
 
 export interface LogEntry {
