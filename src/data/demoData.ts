@@ -188,7 +188,8 @@ create table if not exists public.users (
   full_name text,
   avatar_url text,
   password_hash text,
-  telegram_chat_id text unique,
+  -- NOT unique: a rejected/incomplete registration must never block a retry.
+  telegram_chat_id text,
   telegram_username text,
   approval_status text not null default 'pending'
     check (approval_status in ('pending', 'approved', 'rejected')),
@@ -217,6 +218,10 @@ alter table public.users enable row level security;
 -- password_hash stays reserved and is never written by the app.
 alter table public.users add column if not exists avatar_url text;
 alter table public.users add column if not exists password_hash text;
+-- Older projects shipped a UNIQUE (telegram_chat_id) that made every signup retry
+-- fail with "Database error saving new user". Keep it indexed for lookups only.
+alter table public.users drop constraint if exists users_telegram_chat_id_key;
+create index if not exists users_telegram_chat_id_idx on public.users (telegram_chat_id);
 
 -- SECURITY DEFINER so policies can check admin without recursing into RLS.
 create or replace function public.is_admin()
@@ -256,21 +261,64 @@ drop trigger if exists guard_user_privileges on public.users;
 create trigger guard_user_privileges before update on public.users
   for each row execute function public.guard_user_privileges();
 
--- Every Supabase Auth sign-up creates a PENDING profile automatically.
+-- Every Supabase Auth sign-up creates a PENDING profile automatically. Stale
+-- rejected/incomplete rows for the same email or Telegram chat id are cleaned
+-- first, and the profile is upserted so a retry can never fail the auth insert.
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_email text := nullif(btrim(coalesce(new.email, new.raw_user_meta_data->>'email', '')), '');
+  v_chat  text := nullif(btrim(coalesce(new.raw_user_meta_data->>'telegram_chat_id', '')), '');
+  v_user  text := nullif(btrim(coalesce(new.raw_user_meta_data->>'telegram_username', '')), '');
 begin
-  insert into public.users (id, email, full_name, avatar_url, telegram_chat_id, telegram_username, approval_status)
-  values (
-    new.id,
-    coalesce(new.email, ''),
-    coalesce(new.raw_user_meta_data->>'full_name', ''),
-    nullif(new.raw_user_meta_data->>'avatar_url', ''),
-    nullif(new.raw_user_meta_data->>'telegram_chat_id', ''),
-    nullif(new.raw_user_meta_data->>'telegram_username', ''),
-    'pending'
-  )
-  on conflict (id) do nothing;
+  if v_chat is not null and v_chat !~ '^-?[0-9]{4,20}$' then
+    v_user := coalesce(v_user, nullif(ltrim(v_chat, '@'), ''));
+    v_chat := null;
+  end if;
+
+  delete from public.users u
+   where u.id <> new.id
+     and coalesce(u.is_admin, false) = false
+     and u.approval_status in ('pending', 'rejected')
+     and (
+       (v_email is not null and lower(btrim(u.email)) = lower(v_email))
+       or (v_chat is not null and btrim(coalesce(u.telegram_chat_id, '')) = v_chat)
+     );
+
+  if v_chat is not null then
+    update public.users u set telegram_chat_id = null
+     where u.id <> new.id and btrim(coalesce(u.telegram_chat_id, '')) = v_chat;
+  end if;
+
+  if v_email is not null then
+    update public.users u
+       set email = 'orphan+' || u.id::text || '@aegis.local'
+     where u.id <> new.id and lower(btrim(u.email)) = lower(v_email);
+  end if;
+
+  begin
+    insert into public.users (id, email, full_name, avatar_url, telegram_chat_id, telegram_username, approval_status)
+    values (
+      new.id,
+      coalesce(v_email, ''),
+      coalesce(new.raw_user_meta_data->>'full_name', ''),
+      nullif(new.raw_user_meta_data->>'avatar_url', ''),
+      v_chat,
+      v_user,
+      'pending'
+    )
+    on conflict (id) do update
+      set email = coalesce(nullif(excluded.email, ''), public.users.email),
+          full_name = coalesce(nullif(excluded.full_name, ''), public.users.full_name),
+          avatar_url = coalesce(excluded.avatar_url, public.users.avatar_url),
+          telegram_chat_id = coalesce(excluded.telegram_chat_id, public.users.telegram_chat_id),
+          telegram_username = coalesce(excluded.telegram_username, public.users.telegram_username),
+          updated_at = now();
+  exception
+    when others then
+      raise warning 'handle_new_user: profile upsert failed for % (%): % (%)', new.id, v_email, sqlerrm, sqlstate;
+  end;
+
   return new;
 end; $$;
 

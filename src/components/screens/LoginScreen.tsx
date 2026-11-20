@@ -447,7 +447,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           {error && (
             <div className="flex items-start gap-2 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
               <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
-              <span>{error}</span>
+              <span className="whitespace-pre-line break-words">{error}</span>
             </div>
           )}
 

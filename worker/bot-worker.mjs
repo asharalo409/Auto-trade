@@ -3433,7 +3433,8 @@ async function handleTelegramCallback(callbackQuery, token) {
     return;
   }
   const cfg = await buildUserCfg(settings);
-  cfg.telegramChatId = String(account.telegram_chat_id || cfg.telegramChatId || incomingChatId);
+  // The tapper's own chat only — never a chat copied from another workspace row.
+  cfg.telegramChatId = String(account.telegram_chat_id || incomingChatId);
   const chatId = cfg.telegramChatId;
   if (!chatId) {
     await answerCallbackQuery(token, id, 'No private chat linked to this workspace', true);

@@ -17,6 +17,7 @@ import { audioSynth } from '../lib/audioSynth';
 import { fetchBinance24hrTickers, openBinanceStream } from '../lib/binanceMarket';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { dispatchTelegramAlert } from '../lib/telegram';
+import { describeAuthError } from '../lib/authErrors';
 import { resolveWorkspaceIdentity } from '../lib/userIdentity';
 import { MIN_TRADEABLE_USDT } from '../lib/tradeLimits';
 import { getTimeBasedTheme } from '../lib/themes';
@@ -1016,13 +1017,15 @@ export function useTradingTerminal() {
         if (!row) {
           // Trigger-less project: create the pending profile from this session.
           const me = identityRef.current;
+          const rawChat = String(me.chatId ?? '').trim();
           const { data: created, error: insertErr } = await supabase
             .from('users')
             .insert({
               id: authUser.id,
-              email: authUser.email ?? me.username ?? '',
+              email: (authUser.email ?? '').trim(),
               full_name: me.displayName,
-              telegram_chat_id: me.chatId,
+              // Telegram chat ids are numeric; a @username never belongs here.
+              telegram_chat_id: /^-?\d{4,20}$/.test(rawChat) ? rawChat : null,
               telegram_username: me.username,
               approval_status: 'pending',
             })
@@ -1030,9 +1033,35 @@ export function useTradingTerminal() {
             .maybeSingle();
           if (insertErr) {
             console.warn('[useTradingTerminal] account provisioning failed:', insertErr.message);
-            return null;
+            // The signup trigger (or another tab) may have created the row first.
+            const { data: retried } = await supabase
+              .from('users')
+              .select('*')
+              .eq('id', authUser.id)
+              .maybeSingle();
+            if (!retried) return null;
+            row = retried as Record<string, unknown>;
+          } else {
+            row = created as Record<string, unknown> | null;
           }
-          row = created as Record<string, unknown> | null;
+        }
+
+        // Keep the profile email in step with the verified auth email.
+        const verifiedEmail = (authUser.email ?? '').trim();
+        if (
+          row &&
+          verifiedEmail &&
+          String(row.email || '').toLowerCase() !== verifiedEmail.toLowerCase()
+        ) {
+          const { error: emailErr } = await supabase
+            .from('users')
+            .update({ email: verifiedEmail })
+            .eq('id', authUser.id);
+          if (emailErr) {
+            console.warn('[useTradingTerminal] profile email repair failed:', emailErr.message);
+          } else {
+            row = { ...row, email: verifiedEmail };
+          }
         }
 
         const profile = row ? normalizeAccount(row) : null;
@@ -3577,7 +3606,19 @@ export function useTradingTerminal() {
       setIsAuthenticated(true);
       return { error: null };
     }
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+    });
+    if (error) {
+      console.error('[useTradingTerminal] signIn failed:', {
+        email: email.trim(),
+        message: error.message,
+        code: (error as { code?: string }).code ?? null,
+        status: (error as { status?: number }).status ?? null,
+      });
+      return { error: describeAuthError(error.message, 'signin') };
+    }
     if (!error && data.session) {
       accessTokenRef.current = data.session.access_token;
       setIsDemoMode(false);
@@ -3606,21 +3647,34 @@ export function useTradingTerminal() {
         return { error: null, message: 'Preview mode active — connect Supabase keys to register real operator account.' };
       }
       const me = identityRef.current;
+      const rawChat = String(profile?.telegramChatId ?? me.chatId ?? '').trim();
+      // Telegram chat ids are numeric; an @username typed in that field must not
+      // become the alert recipient (the trigger also normalizes this).
+      const chatId = /^-?\d{4,20}$/.test(rawChat) ? rawChat : '';
+      const chatHandle = String(
+        profile?.telegramUsername ?? me.username ?? (chatId ? '' : rawChat.replace(/^@+/, ''))
+      ).trim();
       const { data, error } = await supabase.auth.signUp({
-        email,
+        email: email.trim(),
         password,
         options: {
           // Read by the `handle_new_user` trigger to create the pending profile.
           data: {
             full_name: profile?.fullName?.trim() || me.displayName,
             avatar_url: String(profile?.avatarUrl ?? me.photoUrl ?? '').trim(),
-            telegram_chat_id: String(profile?.telegramChatId ?? me.chatId ?? '').trim(),
-            telegram_username: String(profile?.telegramUsername ?? me.username ?? '').trim(),
+            telegram_chat_id: chatId,
+            telegram_username: chatHandle,
           },
         },
       });
       if (error) {
-        return { error: error.message };
+        console.error('[useTradingTerminal] signUp failed:', {
+          email: email.trim(),
+          message: error.message,
+          code: (error as { code?: string }).code ?? null,
+          status: (error as { status?: number }).status ?? null,
+        });
+        return { error: describeAuthError(error.message, 'signup') };
       }
       if (data.session) {
         accessTokenRef.current = data.session.access_token;
