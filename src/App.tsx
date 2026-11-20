@@ -28,6 +28,7 @@ import { PerformanceScreen } from './components/screens/PerformanceScreen';
 import { RiskPanel } from './components/screens/RiskPanel';
 import { SettingsPanel } from './components/screens/SettingsPanel';
 import { TradesScreen } from './components/screens/TradesScreen';
+import { AccountProfileBadge } from './components/ui/AccountProfileBadge';
 import { AudioStatusPill } from './components/ui/AudioStatusPill';
 import { BootSequence } from './components/ui/BootSequence';
 import { NeonButton } from './components/ui/MotionPrimitives';
@@ -264,7 +265,21 @@ export default function App() {
             <span className="font-display text-lg font-bold tracking-widest text-white uppercase whitespace-nowrap sm:text-xl">
               {t.brandTitle}
             </span>
-            <TelegramProfileBadge />
+            {terminal.account ? (
+              <AccountProfileBadge
+                name={terminal.account.full_name || terminal.account.email}
+                avatarUrl={terminal.account.avatar_url}
+                subtitle={
+                  terminal.account.is_admin
+                    ? 'Administrator'
+                    : terminal.account.approval_status === 'approved'
+                      ? 'Aegis Trader'
+                      : terminal.account.approval_status
+                }
+              />
+            ) : (
+              <TelegramProfileBadge />
+            )}
             {terminal.isAuthenticated && (
               <button
                 type="button"
@@ -652,6 +667,8 @@ export default function App() {
                   onSaveBinance={terminal.setBinanceConfig}
                   onVerifyBinance={terminal.verifyBinanceCredentials}
                   workspaceUser={terminal.workspaceUser}
+                  account={terminal.account}
+                  onUpdateProfile={terminal.updateUserProfile}
                   apiKeyStatus={terminal.apiKeyStatus}
                   onSaveUserBinanceKeys={terminal.saveUserBinanceKeys}
                   onTestUserBinance={terminal.testUserBinanceConnection}

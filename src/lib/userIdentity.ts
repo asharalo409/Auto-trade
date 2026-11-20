@@ -14,6 +14,8 @@ export interface WorkspaceIdentity {
   telegramId: number | null;
   displayName: string;
   username: string | null;
+  /** Telegram profile photo, used as the default avatar before upload. */
+  photoUrl: string | null;
   /** Private chat id used by the worker for alerts (the user id in DM). */
   chatId: string | null;
   /** Raw signed payload; the worker verifies it before trusting the id. */
@@ -43,6 +45,7 @@ export function resolveWorkspaceIdentity(): WorkspaceIdentity {
       telegramId: id,
       displayName: name,
       username: user?.username ?? null,
+      photoUrl: String(user?.photo_url || '').trim() || null,
       chatId: String(id),
       initData,
       isTelegram: true,
@@ -54,6 +57,7 @@ export function resolveWorkspaceIdentity(): WorkspaceIdentity {
     telegramId: null,
     displayName: 'Web Guest',
     username: null,
+    photoUrl: null,
     chatId: null,
     initData,
     isTelegram: false,

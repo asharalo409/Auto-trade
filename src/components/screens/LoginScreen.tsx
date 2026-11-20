@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { CheckCircle2, Lock, Play, ShieldAlert, Terminal, UserPlus } from 'lucide-react';
+import { Camera, CheckCircle2, Lock, Play, ShieldAlert, Terminal, UserPlus } from 'lucide-react';
 import { audioSynth } from '../../lib/audioSynth';
+import { avatarInitials, fileToAvatarDataUrl } from '../../lib/avatar';
 import { checkEmailWithApyhub } from '../../lib/emailValidation';
 import { resolveWorkspaceIdentity } from '../../lib/userIdentity';
 import { NeonButton } from '../ui/MotionPrimitives';
@@ -15,6 +16,7 @@ interface LoginScreenProps {
     password: string,
     profile?: {
       fullName?: string;
+      avatarUrl?: string | null;
       telegramChatId?: string | null;
       telegramUsername?: string | null;
     }
@@ -43,7 +45,21 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [confirmPassword, setConfirmPassword] = useState('');
   const [fullName, setFullName] = useState(telegramIdentity.displayName === 'Web Guest' ? '' : telegramIdentity.displayName);
   const [telegramChatId, setTelegramChatId] = useState(telegramIdentity.chatId ?? '');
+  const [avatarUrl, setAvatarUrl] = useState(telegramIdentity.photoUrl ?? '');
+  const [avatarError, setAvatarError] = useState<string | null>(null);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const telegramUsername = telegramIdentity.username;
+
+  const handleAvatarFile = async (file: File | null) => {
+    if (!file) return;
+    setAvatarError(null);
+    try {
+      // 160x160 WebP/JPEG data URL — small enough to store on the users row.
+      setAvatarUrl(await fileToAvatarDataUrl(file));
+    } catch (err) {
+      setAvatarError(err instanceof Error ? err.message : 'Could not process that image');
+    }
+  };
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
@@ -88,6 +104,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       }
       const res = await onSignUp(email.trim(), password, {
         fullName: fullName.trim(),
+        avatarUrl: avatarUrl.trim() || null,
         telegramChatId: telegramChatId.trim() || null,
         telegramUsername,
       });
@@ -201,6 +218,65 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         )}
 
         <form onSubmit={handleSubmit} className="space-y-3.5">
+          {authMode === 'SIGNUP' && (
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => avatarInputRef.current?.click()}
+                className="group relative h-16 w-16 shrink-0 cursor-pointer overflow-hidden rounded-full border border-emerald-400/40 bg-[#05060a]"
+                aria-label="Upload profile photo"
+              >
+                {avatarUrl ? (
+                  <img
+                    src={avatarUrl}
+                    alt="Profile preview"
+                    className="h-full w-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <span className="flex h-full w-full items-center justify-center bg-gradient-to-br from-emerald-300 to-teal-700 font-display text-lg font-black text-[#04120c]">
+                    {avatarInitials(fullName || email || 'A')}
+                  </span>
+                )}
+                <span className="absolute inset-0 flex items-center justify-center bg-black/45 opacity-0 transition-opacity group-hover:opacity-100">
+                  <Camera className="h-5 w-5 text-emerald-200" />
+                </span>
+              </button>
+              <div className="min-w-0">
+                <div className="font-mono-tech text-[11px] tracking-wider text-slate-300 uppercase">
+                  Profile Photo
+                </div>
+                <button
+                  type="button"
+                  onClick={() => avatarInputRef.current?.click()}
+                  className="mt-1 flex items-center gap-1.5 rounded border border-slate-700 px-2 py-1 font-mono-tech text-[10px] text-slate-200 hover:border-emerald-400/60 hover:text-emerald-300"
+                >
+                  <Camera className="h-3.5 w-3.5" />
+                  {avatarUrl ? 'Change photo' : 'Choose photo'}
+                </button>
+                <p className="mt-1 font-mono-tech text-[9px] text-slate-500">
+                  Auto-compressed to 160×160. {telegramIdentity.photoUrl ? 'Telegram photo pre-filled.' : 'Optional.'}
+                </p>
+              </div>
+              <input
+                ref={avatarInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(event) => {
+                  void handleAvatarFile(event.target.files?.[0] ?? null);
+                  event.target.value = '';
+                }}
+              />
+            </div>
+          )}
+
+          {authMode === 'SIGNUP' && avatarError && (
+            <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-2.5 py-2 text-[11px] text-rose-200">
+              {avatarError}
+            </p>
+          )}
+
           {authMode === 'SIGNUP' && (
             <div>
               <label

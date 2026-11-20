@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
+  Camera,
   Check,
   Clock,
   Copy,
@@ -22,8 +23,10 @@ import {
 } from 'lucide-react';
 import { BDT_PER_USD, SUPABASE_SQL_SCHEMA, SUPPORTED_PAIRS } from '../../data/demoData';
 import { audioSynth } from '../../lib/audioSynth';
+import { avatarInitials, fileToAvatarDataUrl } from '../../lib/avatar';
 import { getTimeBasedTheme, TERMINAL_THEMES } from '../../lib/themes';
 import {
+  AccountProfile,
   BackgroundPresetId,
   BinanceAccountSummary,
   BinanceConfig,
@@ -61,6 +64,11 @@ interface SettingsPanelProps {
   onSaveBinance: (cfg: BinanceConfig) => void;
   onVerifyBinance: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
   workspaceUser: WorkspaceUser;
+  account: AccountProfile | null;
+  onUpdateProfile: (patch: {
+    full_name?: string;
+    avatar_url?: string | null;
+  }) => Promise<{ ok: boolean; detail: string }>;
   apiKeyStatus: UserApiKeyStatus;
   onSaveUserBinanceKeys: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
   onTestUserBinance: () => Promise<{ ok: boolean; detail: string }>;
@@ -91,6 +99,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   onSaveBinance,
   onVerifyBinance,
   workspaceUser,
+  account,
+  onUpdateProfile,
   apiKeyStatus,
   onSaveUserBinanceKeys,
   onTestUserBinance,
@@ -108,6 +118,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [tgFeedback, setTgFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [bnFeedback, setBnFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [vaultFeedback, setVaultFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const [profileName, setProfileName] = useState(account?.full_name ?? '');
+  const [profileAvatar, setProfileAvatar] = useState(account?.avatar_url ?? '');
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileFeedback, setProfileFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const profileFileRef = useRef<HTMLInputElement | null>(null);
   const [savingVault, setSavingVault] = useState(false);
   const [testingVault, setTestingVault] = useState(false);
   const [testingTg, setTestingTg] = useState(false);
@@ -129,6 +144,36 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   useEffect(() => {
     setBnDraft(binanceConfig);
   }, [binanceConfig]);
+
+  useEffect(() => {
+    setProfileName(account?.full_name ?? '');
+    setProfileAvatar(account?.avatar_url ?? '');
+  }, [account?.id, account?.full_name, account?.avatar_url]);
+
+  const handleProfilePhoto = async (file: File | null) => {
+    if (!file) return;
+    setProfileFeedback(null);
+    try {
+      setProfileAvatar(await fileToAvatarDataUrl(file));
+    } catch (err) {
+      setProfileFeedback({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Could not process that image',
+      });
+    }
+  };
+
+  const handleSaveProfile = async () => {
+    audioSynth.playClick();
+    setProfileSaving(true);
+    setProfileFeedback(null);
+    const res = await onUpdateProfile({
+      full_name: profileName,
+      avatar_url: profileAvatar || null,
+    });
+    setProfileSaving(false);
+    setProfileFeedback({ ok: res.ok, text: res.detail });
+  };
 
   const handleSave = async () => {
     onSaveTelegram(tgDraft);
@@ -269,6 +314,127 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
 
   return (
     <div className="space-y-4">
+      {/* Section 0: My Profile — full name + circular photo (used on cards & board) */}
+      {account && (
+        <TerminalPanel
+          accent="emerald"
+          title="MY PROFILE"
+          subtitle="Shown on your PnL cards, the header and the traders leaderboard"
+          rightSlot={
+            <NeonButton
+              type="button"
+              variant={profileFeedback?.ok ? 'emerald' : 'cyan'}
+              onClick={() => void handleSaveProfile()}
+              disabled={profileSaving}
+              className="min-h-[34px] px-3 py-1 text-[11px]"
+            >
+              {profileFeedback?.ok ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
+              {profileSaving ? 'SAVING...' : profileFeedback?.ok ? 'SAVED' : 'SAVE PROFILE'}
+            </NeonButton>
+          }
+        >
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => profileFileRef.current?.click()}
+                className="group relative h-20 w-20 shrink-0 cursor-pointer overflow-hidden rounded-full border border-emerald-400/45 bg-[#05070d]"
+                aria-label="Change profile photo"
+              >
+                {profileAvatar ? (
+                  <img
+                    src={profileAvatar}
+                    alt={profileName || 'Profile photo'}
+                    className="h-full w-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <span className="flex h-full w-full items-center justify-center bg-gradient-to-br from-emerald-300 to-teal-700 font-display text-xl font-black text-[#04120c]">
+                    {avatarInitials(profileName || account.email)}
+                  </span>
+                )}
+                <span className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 transition-opacity group-hover:opacity-100">
+                  <Camera className="h-6 w-6 text-emerald-200" />
+                </span>
+              </button>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => profileFileRef.current?.click()}
+                  className="flex items-center gap-1.5 rounded border border-slate-700 px-2.5 py-1 font-mono-tech text-[10px] text-slate-200 hover:border-emerald-400/60 hover:text-emerald-300"
+                >
+                  <Camera className="h-3.5 w-3.5" />
+                  {profileAvatar ? 'CHANGE PHOTO' : 'UPLOAD PHOTO'}
+                </button>
+                <p className="mt-1 max-w-[170px] font-mono-tech text-[9px] leading-relaxed text-slate-500">
+                  Auto-resized to 160×160. JPG, PNG or WebP.
+                </p>
+              </div>
+              <input
+                ref={profileFileRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(event) => {
+                  void handleProfilePhoto(event.target.files?.[0] ?? null);
+                  event.target.value = '';
+                }}
+              />
+            </div>
+
+            <div className="flex-1 space-y-2">
+              <div>
+                <label
+                  htmlFor="profile-full-name"
+                  className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
+                >
+                  Full Name
+                </label>
+                <input
+                  id="profile-full-name"
+                  type="text"
+                  value={profileName}
+                  onChange={(event) => setProfileName(event.target.value)}
+                  placeholder="Your full name"
+                  className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-emerald-400 focus:outline-none"
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-2 font-mono-tech text-[10px] text-slate-500">
+                <span className="rounded border border-slate-700 px-1.5 py-0.5 text-slate-300">
+                  {account.email}
+                </span>
+                <span
+                  className={`rounded border px-1.5 py-0.5 font-bold uppercase ${
+                    account.approval_status === 'approved'
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                      : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                  }`}
+                >
+                  {account.approval_status}
+                </span>
+                {account.telegram_chat_id && (
+                  <span className="rounded border border-slate-700 px-1.5 py-0.5">
+                    TG {account.telegram_chat_id}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {profileFeedback && (
+            <div
+              className={`mt-3 rounded-lg border px-2.5 py-1.5 font-mono-tech text-[11px] ${
+                profileFeedback.ok
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+              }`}
+            >
+              {profileFeedback.text}
+            </div>
+          )}
+        </TerminalPanel>
+      )}
+
       {/* Section 1: Global Sound FX, Auto Time Theme, 7 Premium Themes & 3D Design */}
       <TerminalPanel
         accent="cyan"

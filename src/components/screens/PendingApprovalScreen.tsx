@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { CheckCircle2, Clock3, LogOut, RefreshCw, ShieldX, Send } from 'lucide-react';
+import { avatarInitials } from '../../lib/avatar';
 import { AccountProfile } from '../../types/trading';
 import { NeonButton } from '../ui/MotionPrimitives';
 
@@ -53,6 +54,27 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
             rejected ? 'border-rose-400' : 'border-amber-400'
           }`}
         />
+
+        <div className="mb-4 flex items-center gap-3">
+          {account.avatar_url ? (
+            <img
+              src={account.avatar_url}
+              alt={account.full_name || account.email}
+              referrerPolicy="no-referrer"
+              className="h-16 w-16 shrink-0 rounded-full object-cover ring-2 ring-amber-400/40"
+            />
+          ) : (
+            <span className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-300 to-teal-700 font-display text-xl font-black text-[#04120c]">
+              {avatarInitials(account.full_name || account.email)}
+            </span>
+          )}
+          <div className="min-w-0">
+            <div className="truncate font-display text-lg font-bold text-slate-100">
+              {account.full_name || 'New Trader'}
+            </div>
+            <div className="truncate font-mono-tech text-[11px] text-slate-400">{account.email}</div>
+          </div>
+        </div>
 
         <div className="flex items-start gap-3">
           <span

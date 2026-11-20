@@ -183,6 +183,8 @@ create table if not exists public.users (
   id uuid primary key references auth.users(id) on delete cascade,
   email text unique not null,
   full_name text,
+  avatar_url text,
+  password_hash text,
   telegram_chat_id text unique,
   telegram_username text,
   approval_status text not null default 'pending'
@@ -204,6 +206,12 @@ create table if not exists public.users (
   updated_at timestamptz not null default now()
 );
 alter table public.users enable row level security;
+
+-- Profile photos (compressed 160x160 data URL or Telegram photo_url) and the
+-- password hash slot. Email/password auth is owned by Supabase Auth, so
+-- password_hash stays reserved and is never written by the app.
+alter table public.users add column if not exists avatar_url text;
+alter table public.users add column if not exists password_hash text;
 
 -- SECURITY DEFINER so policies can check admin without recursing into RLS.
 create or replace function public.is_admin()
@@ -247,11 +255,12 @@ create trigger guard_user_privileges before update on public.users
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  insert into public.users (id, email, full_name, telegram_chat_id, telegram_username, approval_status)
+  insert into public.users (id, email, full_name, avatar_url, telegram_chat_id, telegram_username, approval_status)
   values (
     new.id,
     coalesce(new.email, ''),
     coalesce(new.raw_user_meta_data->>'full_name', ''),
+    nullif(new.raw_user_meta_data->>'avatar_url', ''),
     nullif(new.raw_user_meta_data->>'telegram_chat_id', ''),
     nullif(new.raw_user_meta_data->>'telegram_username', ''),
     'pending'
@@ -277,6 +286,7 @@ export const INITIAL_ACCOUNT: AccountProfile = {
   id: '',
   email: '',
   full_name: '',
+  avatar_url: null,
   telegram_chat_id: null,
   telegram_username: null,
   approval_status: 'pending',

@@ -154,6 +154,7 @@ export interface BotSettings {
 export interface LeaderboardEntry {
   telegram_user_id: string;
   name: string;
+  avatar_url: string | null;
   username: string | null;
   mode: 'LIVE' | 'DEMO';
   running: boolean;
@@ -177,6 +178,7 @@ export interface WorkspaceUser {
   telegramUserId: string;
   displayName: string;
   username: string | null;
+  avatarUrl: string | null;
   isTelegram: boolean;
 }
 
@@ -187,6 +189,8 @@ export interface AccountProfile {
   id: string;
   email: string;
   full_name: string;
+  /** Compressed 160x160 data URL, or a Telegram photo URL. */
+  avatar_url: string | null;
   telegram_chat_id: string | null;
   telegram_username: string | null;
   approval_status: ApprovalStatus;
@@ -205,6 +209,7 @@ export interface AdminUserRow {
   id: string;
   email: string;
   full_name: string;
+  avatar_url: string | null;
   telegram_chat_id: string | null;
   telegram_username: string | null;
   approval_status: ApprovalStatus;

@@ -314,6 +314,8 @@ async function ensureWorkspaceForAccount(account) {
         .eq('id', existing.id);
       existing.chat_id = String(account.telegram_chat_id);
     }
+    // Non-persisted handle: lets cfg carry the account's name/avatar for cards.
+    existing.__account = account;
     return existing;
   }
 
@@ -360,6 +362,7 @@ async function ensureWorkspaceForAccount(account) {
     return null;
   }
   console.log(`[USERS] Provisioned workspace ${scope} for ${account.email}.`);
+  if (data) data.__account = account;
   return data || null;
 }
 
@@ -445,14 +448,26 @@ async function notifyAdminOfPendingAccounts() {
       '',
       'Approve to grant access to the terminal and the 24/7 engine.',
     ].join('\n');
-    const ok = await sendTelegram(text, TELEGRAM_BOT_TOKEN, adminChat, {
-      replyMarkup: {
-        inline_keyboard: [
-          [{ text: '✅ Approve User', callback_data: `approve_user:${user.id}` }],
-          [{ text: '❌ Reject User', callback_data: `reject_user:${user.id}` }],
-        ],
-      },
-    });
+    const approvalMarkup = {
+      inline_keyboard: [
+        [{ text: '✅ Approve User', callback_data: `approve_user:${user.id}` }],
+        [{ text: '❌ Reject User', callback_data: `reject_user:${user.id}` }],
+      ],
+    };
+    // Show the applicant's face when they uploaded one.
+    const avatarBuffer = await fetchAvatarBuffer(user.avatar_url);
+    const ok = avatarBuffer
+      ? await sendTelegramPhoto(
+          avatarBuffer,
+          text,
+          TELEGRAM_BOT_TOKEN,
+          adminChat,
+          approvalMarkup,
+          imageMime(avatarBuffer)
+        )
+      : await sendTelegram(text, TELEGRAM_BOT_TOKEN, adminChat, {
+          replyMarkup: approvalMarkup,
+        });
     if (ok) {
       sent += 1;
       await supabase
@@ -569,7 +584,10 @@ async function buildUserCfg(settings) {
   const cfg = resolveTradingConfig(settings);
   cfg.id = settings.id;
   cfg.scope = scopeOf(settings);
-  cfg.displayName = userLabel(settings);
+  cfg.account = settings.__account || null;
+  cfg.displayName = cfg.account?.full_name || userLabel(settings);
+  cfg.avatarUrl = cfg.account?.avatar_url || null;
+  cfg.email = cfg.account?.email || null;
   const stored = await loadUserApiKeys(cfg.scope);
   const ownerScope = !cfg.scope || cfg.scope === DEFAULT_OWNER_SCOPE;
   cfg.apiKey = (
@@ -1051,6 +1069,7 @@ if (PORT > 0) {
             id: row.id,
             email: row.email,
             full_name: row.full_name || '',
+            avatar_url: row.avatar_url || null,
             telegram_chat_id: row.telegram_chat_id || null,
             telegram_username: row.telegram_username || null,
             approval_status: row.approval_status || 'pending',
@@ -1171,7 +1190,39 @@ async function sendTelegram(text, token, chatId, options = {}) {
 }
 
 /** Sends a rendered PNG with an HTML caption (used for the shareable PnL card). */
-async function sendTelegramPhoto(pngBuffer, caption, token, chatId, replyMarkup) {
+/** Sniffs PNG/JPEG/WebP so avatars upload as photos without conversion. */
+function imageMime(buffer) {
+  if (!buffer || buffer.length < 12) return 'image/jpeg';
+  if (buffer[0] === 0x89 && buffer[1] === 0x50) return 'image/png';
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return 'image/jpeg';
+  if (buffer.slice(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return 'image/jpeg';
+}
+
+/** Decodes a data-URL / https avatar into a Buffer for Telegram uploads. */
+async function fetchAvatarBuffer(avatarUrl) {
+  const url = String(avatarUrl || '').trim();
+  if (!url) return null;
+  try {
+    if (url.startsWith('data:')) {
+      const base64 = url.split(',')[1] || '';
+      if (!base64) return null;
+      const buffer = Buffer.from(base64, 'base64');
+      return buffer.length > 0 && buffer.length <= 3_000_000 ? buffer : null;
+    }
+    if (/^https?:/i.test(url)) {
+      const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) return null;
+      const buffer = Buffer.from(await res.arrayBuffer());
+      return buffer.length > 0 && buffer.length <= 3_000_000 ? buffer : null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function sendTelegramPhoto(pngBuffer, caption, token, chatId, replyMarkup, mimeType) {
   const t = (token || TELEGRAM_BOT_TOKEN || '').trim();
   const c = String(chatId || '').trim();
   if (!t || !c || !pngBuffer) return false;
@@ -1181,7 +1232,8 @@ async function sendTelegramPhoto(pngBuffer, caption, token, chatId, replyMarkup)
     form.append('caption', caption);
     form.append('parse_mode', 'HTML');
     if (replyMarkup) form.append('reply_markup', JSON.stringify(replyMarkup));
-    form.append('photo', new Blob([pngBuffer], { type: 'image/png' }), 'aegis-pnl.png');
+    const type = mimeType || imageMime(pngBuffer);
+    form.append('photo', new Blob([pngBuffer], { type }), 'aegis.png');
     const res = await fetch(`https://api.telegram.org/bot${t}/sendPhoto`, {
       method: 'POST',
       body: form,
@@ -1226,16 +1278,21 @@ async function sendPnlCard(cfg, details) {
     entryPrice: details.entryPrice,
     exitPrice: details.exitPrice,
     mode: MODE_LABEL[cfg.mode],
+    traderName: cfg.displayName,
+    traderAvatarUrl: cfg.avatarUrl,
     closedAt: new Date(),
   });
   if (!png) return false;
   const caption = [
     `<b>💰 ${details.symbol} CLOSED IN PROFIT</b>`,
+    cfg.displayName ? `Trader: <b>${cfg.displayName}</b>` : '',
     `Net ${Number(details.pnlUsdt) >= 0 ? '+' : ''}$${Number(details.pnlUsdt).toFixed(2)} USDT · ${
       Number(details.pnlPct) >= 0 ? '+' : ''
     }${Number(details.pnlPct).toFixed(2)}% ROI`,
     `Entry $${Number(details.entryPrice).toFixed(4)} → Exit $${Number(details.exitPrice).toFixed(4)}`,
-  ].join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
   return sendTelegramPhoto(png, caption, cfg.telegramToken, cfg.telegramChatId, tradeAlertMarkup(details.symbol));
 }
 
@@ -2269,6 +2326,7 @@ async function buildLeaderboardRows() {
         return {
           telegram_user_id: scopeForAccount(account.id),
           name: String(account.full_name || account.email || 'Trader'),
+          avatar_url: account.avatar_url || null,
           username:
             String(account.telegram_username || '').replace(/^@/, '') || null,
           mode: String(account.trading_mode || '').toUpperCase() === 'LIVE' ? 'LIVE' : 'DEMO',
@@ -2324,6 +2382,7 @@ async function buildLeaderboardRows() {
       return {
         telegram_user_id: scope,
         name: userLabel(row),
+        avatar_url: row.avatar_url || null,
         username: String(row.telegram_username || '').replace(/^@/, '') || null,
         mode: settingsModeLabel(row) === 'LIVE' ? 'LIVE' : 'DEMO',
         running: isWorkspaceRunning(row),

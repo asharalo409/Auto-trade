@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { BDT_PER_USD } from '../../data/demoData';
+import { avatarInitials } from '../../lib/avatar';
 import { AdminUserRow, ApprovalStatus } from '../../types/trading';
 import { NeonButton } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
@@ -208,7 +209,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   className="rounded-xl border border-slate-800/90 bg-[#05070d] p-3"
                 >
                   <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div className="min-w-0">
+                    {user.avatar_url ? (
+                      <img
+                        src={user.avatar_url}
+                        alt={user.full_name || user.email}
+                        referrerPolicy="no-referrer"
+                        className="h-9 w-9 shrink-0 rounded-full object-cover ring-1 ring-emerald-400/40"
+                      />
+                    ) : (
+                      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-300 to-teal-700 font-display text-[12px] font-black text-[#04120c]">
+                        {avatarInitials(user.full_name || user.email)}
+                      </span>
+                    )}
+                    <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="truncate font-mono-tech text-[12px] font-bold text-slate-100">
                           {user.full_name || user.email}

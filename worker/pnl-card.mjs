@@ -43,6 +43,38 @@ function priceText(value) {
   return `$${n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`;
 }
 
+function initialsOf(name) {
+  const words = String(name || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0) return 'A';
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return `${words[0][0]}${words[words.length - 1][0]}`.toUpperCase();
+}
+
+/** Loads a data-URL or https avatar into a canvas image (null when unusable). */
+async function loadAvatarImage(canvasLib, avatarUrl) {
+  const url = String(avatarUrl || '').trim();
+  if (!url) return null;
+  try {
+    let buffer = null;
+    if (url.startsWith('data:')) {
+      const base64 = url.split(',')[1] || '';
+      if (!base64) return null;
+      buffer = Buffer.from(base64, 'base64');
+    } else if (/^https?:/i.test(url)) {
+      const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) return null;
+      buffer = Buffer.from(await res.arrayBuffer());
+    }
+    if (!buffer || buffer.length === 0 || buffer.length > 3_000_000) return null;
+    return await canvasLib.loadImage(buffer);
+  } catch {
+    return null;
+  }
+}
+
 function roundRect(ctx, x, y, w, h, r) {
   const radius = Math.min(r, w / 2, h / 2);
   ctx.beginPath();
@@ -69,6 +101,8 @@ export async function renderPnlCard({
   entryPrice = 0,
   exitPrice = 0,
   mode = 'LIVE',
+  traderName = '',
+  traderAvatarUrl = null,
   closedAt = new Date(),
 } = {}) {
   const canvasLib = await loadCanvasModule();
@@ -144,6 +178,45 @@ export async function renderPnlCard({
     ctx.fillStyle = mode === 'LIVE' ? '#fda4af' : '#7dd3fc';
     ctx.font = mono(24);
     ctx.fillText(mode === 'LIVE' ? 'LIVE SPOT' : 'DEMO ENGINE', CARD_SIZE - 206, 172);
+
+    // Trader avatar + name, so the card is personal to whoever earned it.
+    const avatar = await loadAvatarImage(canvasLib, traderAvatarUrl);
+    const avatarCx = CARD_SIZE - 176;
+    const avatarCy = 278;
+    const avatarR = 52;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(avatarCx, avatarCy, avatarR, 0, Math.PI * 2);
+    ctx.closePath();
+    if (avatar) {
+      ctx.clip();
+      ctx.drawImage(avatar, avatarCx - avatarR, avatarCy - avatarR, avatarR * 2, avatarR * 2);
+    } else {
+      ctx.fillStyle = 'rgba(16, 185, 129, 0.18)';
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.beginPath();
+    ctx.arc(avatarCx, avatarCy, avatarR, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(245, 199, 106, 0.85)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    if (!avatar) {
+      ctx.fillStyle = '#a7f3d0';
+      ctx.font = head(38);
+      ctx.textAlign = 'center';
+      ctx.fillText(initialsOf(traderName || 'Aegis'), avatarCx, avatarCy + 14);
+    }
+    if (traderName) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = mono(24);
+      const label = String(traderName);
+      ctx.fillText(label.length > 24 ? `${label.slice(0, 23)}…` : label, CARD_SIZE - 112, 486);
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.7)';
+      ctx.font = mono(16);
+      ctx.fillText('VERIFIED TRADER', CARD_SIZE - 112, 508);
+    }
 
     // Pair + side.
     ctx.textAlign = 'left';

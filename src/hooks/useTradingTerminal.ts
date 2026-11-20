@@ -204,6 +204,7 @@ function normalizeAccount(row: Record<string, unknown>): AccountProfile {
     id: String(row.id ?? ''),
     email: String(row.email ?? ''),
     full_name: String(row.full_name ?? ''),
+    avatar_url: row.avatar_url ? String(row.avatar_url) : null,
     telegram_chat_id: row.telegram_chat_id ? String(row.telegram_chat_id) : null,
     telegram_username: row.telegram_username ? String(row.telegram_username) : null,
     approval_status,
@@ -368,6 +369,7 @@ export function useTradingTerminal() {
         displayName: account.full_name || account.email || identity.displayName,
         username: account.telegram_username ?? identity.username,
         chatId: account.telegram_chat_id ?? identity.chatId,
+        photoUrl: account.avatar_url ?? identity.photoUrl,
         isTelegram: Boolean(account.telegram_chat_id),
       };
     }
@@ -380,6 +382,7 @@ export function useTradingTerminal() {
       telegramUserId: activeIdentity.telegramUserId,
       displayName: activeIdentity.displayName,
       username: activeIdentity.username,
+      avatarUrl: activeIdentity.photoUrl,
       isTelegram: activeIdentity.isTelegram,
     }),
     [activeIdentity]
@@ -3248,6 +3251,49 @@ export function useTradingTerminal() {
     if (data.session?.user) await loadAccountProfile(data.session.user);
   }, [loadAccountProfile]);
 
+  /** Edits the signed-in user's own name/photo (RLS restricts it to their row). */
+  const updateUserProfile = useCallback(
+    async (patch: { full_name?: string; avatar_url?: string | null }) => {
+      if (!supabase || !accountRef.current?.id) {
+        return { ok: false, detail: 'Sign in to edit your profile' };
+      }
+      const payload: Record<string, unknown> = {};
+      if (patch.full_name !== undefined) {
+        const name = patch.full_name.trim();
+        if (!name) return { ok: false, detail: 'Full name cannot be empty' };
+        payload.full_name = name;
+      }
+      if (patch.avatar_url !== undefined) {
+        const avatar = String(patch.avatar_url || '').trim();
+        if (
+          avatar &&
+          !/^data:image\/(png|jpeg|webp);base64,/.test(avatar) &&
+          !/^https?:\/\//.test(avatar)
+        ) {
+          return { ok: false, detail: 'Unsupported image format' };
+        }
+        if (avatar.length > 400_000) return { ok: false, detail: 'Image is too large' };
+        payload.avatar_url = avatar || null;
+      }
+      if (Object.keys(payload).length === 0) return { ok: true, detail: 'Nothing to update' };
+
+      const { data, error } = await supabase
+        .from('users')
+        .update(payload)
+        .eq('id', accountRef.current.id)
+        .select('*')
+        .maybeSingle();
+      if (error) return { ok: false, detail: error.message };
+      if (data) {
+        const profile = normalizeAccount(data as Record<string, unknown>);
+        accountRef.current = profile;
+        setAccount(profile);
+      }
+      return { ok: true, detail: 'Profile updated' };
+    },
+    []
+  );
+
   /** Admin panel: every account with aggregates (worker verifies the session). */
   const refreshAdminUsers = useCallback(async () => {
     if (!accessTokenRef.current) return;
@@ -3344,6 +3390,7 @@ export function useTradingTerminal() {
       password: string,
       profile?: {
         fullName?: string;
+        avatarUrl?: string | null;
         telegramChatId?: string | null;
         telegramUsername?: string | null;
       }
@@ -3359,6 +3406,7 @@ export function useTradingTerminal() {
           // Read by the `handle_new_user` trigger to create the pending profile.
           data: {
             full_name: profile?.fullName?.trim() || me.displayName,
+            avatar_url: String(profile?.avatarUrl ?? me.photoUrl ?? '').trim(),
             telegram_chat_id: String(profile?.telegramChatId ?? me.chatId ?? '').trim(),
             telegram_username: String(profile?.telegramUsername ?? me.username ?? '').trim(),
           },
@@ -3467,6 +3515,7 @@ export function useTradingTerminal() {
     accountApproved,
     isAdmin,
     refreshAccount,
+    updateUserProfile,
     adminUsers,
     adminTotals,
     adminLoading,

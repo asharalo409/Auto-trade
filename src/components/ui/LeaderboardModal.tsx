@@ -1,6 +1,7 @@
 import React from 'react';
 import { Crown, RefreshCw, Trophy, X } from 'lucide-react';
 import { BDT_PER_USD } from '../../data/demoData';
+import { avatarInitials } from '../../lib/avatar';
 import { LeaderboardEntry } from '../../types/trading';
 import { NeonButton } from './MotionPrimitives';
 
@@ -125,9 +126,21 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
                         : 'border-slate-800/80 bg-[#05070d]'
                     }`}
                   >
-                    <span className="w-6 shrink-0 text-center font-mono-tech text-[12px] font-bold text-slate-300">
+                    <span className="w-5 shrink-0 text-center font-mono-tech text-[12px] font-bold text-slate-300">
                       {MEDALS[index] ?? index + 1}
                     </span>
+                    {entry.avatar_url ? (
+                      <img
+                        src={entry.avatar_url}
+                        alt={entry.name}
+                        referrerPolicy="no-referrer"
+                        className="h-8 w-8 shrink-0 rounded-full object-cover ring-1 ring-emerald-400/40"
+                      />
+                    ) : (
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-300 to-teal-700 font-display text-[11px] font-black text-[#04120c]">
+                        {avatarInitials(entry.name)}
+                      </span>
+                    )}
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-1.5">
                         <span className="truncate font-mono-tech text-[12px] font-bold text-slate-100">
