@@ -760,6 +760,35 @@ export function useTradingTerminal() {
     }
   }, []);
 
+  /**
+   * STRICT PER-USER ALERT ROUTING — the recipient is the signed-in account's own
+   * `users.telegram_chat_id`. A chat id left in this browser by a previous user (or
+   * a legacy admin configuration) is never reused, so one trader's alerts can never
+   * land in the admin's inbox, not even on a shared browser.
+   */
+  const resolveAlertChatId = useCallback((): string => {
+    if (isAuthenticated) return String(accountRef.current?.telegram_chat_id || '').trim();
+    return String(identityRef.current.chatId || '').trim();
+  }, [isAuthenticated]);
+
+  /** Every trade/status alert goes through here, so the recipient is never guessed. */
+  const deliverTelegramAlert = useCallback(
+    async (cfg: TelegramConfig, text: string) => {
+      const chatId = resolveAlertChatId() || (isAuthenticated ? '' : String(cfg.chat_id || '').trim());
+      if (!chatId) {
+        console.warn(
+          '[Telegram] Alert skipped — no Telegram chat linked to this user (never routed to the admin).'
+        );
+        return {
+          ok: false,
+          detail: 'No Telegram chat linked to your account. Set your own chat ID in Settings → Telegram Alerts.',
+        };
+      }
+      return dispatchTelegramAlert({ ...cfg, chat_id: chatId }, text);
+    },
+    [isAuthenticated, resolveAlertChatId]
+  );
+
   const notifyTelegramIfConfigured = useCallback(
     async (text: string, workspace: TradingMode) => {
       const targetSettings = workspace === 'DEMO' ? demoSettings : liveSettings;
@@ -767,8 +796,8 @@ export function useTradingTerminal() {
         console.debug('[useTradingTerminal] notifyTelegramIfConfigured skipped: telegram_enabled=false', { workspace });
         return;
       }
-      if (!telegramConfig.bot_token.trim() || !telegramConfig.chat_id.trim()) {
-        console.warn('[useTradingTerminal] notifyTelegramIfConfigured skipped: missing bot_token or chat_id', { workspace });
+      if (!telegramConfig.bot_token.trim() || !resolveAlertChatId()) {
+        console.warn('[useTradingTerminal] notifyTelegramIfConfigured skipped: missing bot_token or linked chat', { workspace });
         return;
       }
       const wsBal =
@@ -782,7 +811,7 @@ export function useTradingTerminal() {
         telegramConfig.notify_balance !== false
           ? `\n💰 <b>Balance:</b> $${wsBal.toFixed(2)} (৳${bdtVal.toLocaleString('en-US')})`
           : '';
-      const res = await dispatchTelegramAlert(
+      const res = await deliverTelegramAlert(
         telegramConfig,
         `<b>[AEGIS ${workspace}]</b> ${text}${balanceFooter}`
       );
@@ -790,7 +819,7 @@ export function useTradingTerminal() {
         console.error('[useTradingTerminal] notifyTelegramIfConfigured failed:', res);
       }
     },
-    [demoSettings, liveSettings, telegramConfig]
+    [deliverTelegramAlert, demoSettings, liveSettings, resolveAlertChatId, telegramConfig]
   );
 
   // Sync real Binance Spot public 24h prices via data-api.binance.vision + api1/2/3 fallback + live !miniTicker@arr WebSocket
@@ -2856,7 +2885,8 @@ export function useTradingTerminal() {
     async (cfg: TelegramConfig) => {
       setTelegramConfig(cfg);
       const token = cfg.bot_token.trim();
-      const chatId = cfg.chat_id.trim();
+      // Only the caller's own linked chat may receive this test alert.
+      const chatId = resolveAlertChatId() || (isAuthenticated ? '' : cfg.chat_id.trim());
       console.info('[useTradingTerminal] testTelegramConnection initiated:', {
         workspace: activeWorkspace,
         hasToken: Boolean(token),
@@ -2865,7 +2895,9 @@ export function useTradingTerminal() {
       });
 
       if (!token || !chatId) {
-        const detail = !token ? 'Missing Telegram Bot Token' : 'Missing Telegram Chat ID';
+        const detail = !token
+          ? 'Missing Telegram Bot Token'
+          : 'No Telegram chat linked to your account — add your own chat ID first';
         console.error('[useTradingTerminal] testTelegramConnection aborted:', { detail });
         appendLog(activeWorkspace, {
           id: createUniqueId('LOG'),
@@ -2887,7 +2919,7 @@ export function useTradingTerminal() {
         `⚡ <b>Bot Status:</b> ${botStatus}\n` +
         `🔑 <b>Binance Keys:</b> ${binanceConfig.api_key.trim() ? 'Linked ✓' : 'Not Set'}`;
 
-      const res = await dispatchTelegramAlert(cfg, messageText);
+      const res = await deliverTelegramAlert(cfg, messageText);
       if (res.ok) {
         console.info('[useTradingTerminal] testTelegramConnection succeeded:', res);
       } else {
@@ -2905,7 +2937,17 @@ export function useTradingTerminal() {
       });
       return res;
     },
-    [activeWorkspace, appendLog, binanceConfig.api_key, botStatus, stats.balance, stats.openTradesCount]
+    [
+      activeWorkspace,
+      appendLog,
+      binanceConfig.api_key,
+      botStatus,
+      deliverTelegramAlert,
+      isAuthenticated,
+      resolveAlertChatId,
+      stats.balance,
+      stats.openTradesCount,
+    ]
   );
 
   const sendTelegramBalanceSnapshot = useCallback(
@@ -2965,7 +3007,7 @@ export function useTradingTerminal() {
         syncNote +
         assetsLines;
 
-      const res = await dispatchTelegramAlert(activeTg, payloadText);
+      const res = await deliverTelegramAlert(activeTg, payloadText);
       voiceAnnouncer.unlock();
       voiceAnnouncer.speak(balanceSentence(activeWorkspace, liveUsd));
       if (res.ok) {
@@ -2994,6 +3036,7 @@ export function useTradingTerminal() {
       binanceAccount?.usdtFree,
       binanceConfig,
       botStatus,
+      deliverTelegramAlert,
       refreshBinanceBalance,
       stats.balance,
       stats.openTradesCount,
@@ -3005,7 +3048,7 @@ export function useTradingTerminal() {
   const sendSignalToTelegram = useCallback(
     async (title: string, detail: string, options?: { force?: boolean }) => {
       const token = telegramConfig.bot_token.trim();
-      const chatId = telegramConfig.chat_id.trim();
+      const chatId = resolveAlertChatId() || (isAuthenticated ? '' : telegramConfig.chat_id.trim());
       console.info('[useTradingTerminal] sendSignalToTelegram invoked:', {
         workspace: activeWorkspace,
         telegramEnabled: settings.telegram_enabled,
@@ -3035,7 +3078,7 @@ export function useTradingTerminal() {
           : '';
       const payloadText = `<b>[AEGIS SIGNAL — ${activeWorkspace}]</b>\n${title}\n${detail}${balanceLine}`;
 
-      const res = await dispatchTelegramAlert(telegramConfig, payloadText);
+      const res = await deliverTelegramAlert(telegramConfig, payloadText);
       if (res.ok) {
         console.info('[useTradingTerminal] sendSignalToTelegram succeeded:', res);
       } else {
@@ -3050,7 +3093,16 @@ export function useTradingTerminal() {
       }
       return res;
     },
-    [activeWorkspace, appendLog, settings.telegram_enabled, stats.balance, telegramConfig]
+    [
+      activeWorkspace,
+      appendLog,
+      deliverTelegramAlert,
+      isAuthenticated,
+      resolveAlertChatId,
+      settings.telegram_enabled,
+      stats.balance,
+      telegramConfig,
+    ]
   );
 
   const togglePairAlert = useCallback((symbol: string) => {

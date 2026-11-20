@@ -854,43 +854,40 @@ export default function App() {
         <div className="fixed inset-x-0 bottom-0 z-40 lg:hidden">
           <div className="pointer-events-none absolute inset-x-0 bottom-0 h-36 bg-gradient-to-t from-[#070b10] via-[#070b10]/80 to-transparent" />
           <div className="relative mx-auto w-full max-w-md px-3">
-            {/* Workspace switch pill */}
-            <div className="mb-2 flex justify-center">
-              <div className="flex items-center gap-0.5 rounded-full border border-white/10 bg-[#0a0f16]/90 p-0.5 backdrop-blur-xl">
-                <button
-                  type="button"
-                  onClick={() => handleDockWorkspace('DEMO')}
-                  className={`min-h-[26px] cursor-pointer rounded-full px-3 font-mono-tech text-[9px] font-bold tracking-widest uppercase transition-colors ${
-                    terminal.activeWorkspace === 'DEMO'
-                      ? 'bg-cyan-500/25 text-cyan-200'
-                      : 'text-slate-500 active:text-slate-300'
-                  }`}
-                >
-                  Virtual
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleDockWorkspace('LIVE')}
-                  className={`min-h-[26px] cursor-pointer rounded-full px-3 font-mono-tech text-[9px] font-bold tracking-widest uppercase transition-colors ${
-                    terminal.activeWorkspace === 'LIVE'
-                      ? 'bg-rose-500/30 text-rose-200'
-                      : 'text-slate-500 active:text-rose-300'
-                  }`}
-                >
-                  Live
-                </button>
-              </div>
-            </div>
-
             <nav
               aria-label="Mobile Navigation"
               className="mini-dock relative mb-2 flex flex-col rounded-[26px] border border-white/10 pt-2 backdrop-blur-2xl"
             >
               {/* Distinct engine power control — never squeezed between tabs */}
-              <div className="flex items-center justify-center gap-3 px-4 pb-2">
-                <span className="font-mono-tech text-[9px] font-semibold tracking-[0.18em] text-slate-500 uppercase">
-                  {terminal.activeWorkspace === 'LIVE' ? 'Live Engine' : 'Virtual Engine'}
-                </span>
+              <div className="flex items-center justify-between gap-2 px-3 pb-2">
+                {/* VIRTUAL / LIVE switch sits right beside the power button */}
+                <div
+                  role="group"
+                  aria-label="Trading workspace"
+                  className="flex items-center gap-1 rounded-full border border-white/10 bg-[#0a0f16]/90 p-1 backdrop-blur-xl"
+                >
+                  {(['DEMO', 'LIVE'] as TradingMode[]).map((target) => {
+                    const active = terminal.activeWorkspace === target;
+                    const isLiveMode = target === 'LIVE';
+                    return (
+                      <button
+                        key={target}
+                        type="button"
+                        onClick={() => handleDockWorkspace(target)}
+                        aria-pressed={active}
+                        className={`min-h-[30px] cursor-pointer rounded-full px-2.5 font-mono-tech text-[9px] font-black tracking-widest uppercase transition-all active:scale-95 ${
+                          active
+                            ? isLiveMode
+                              ? 'bg-rose-500/30 text-rose-100 shadow-[0_0_16px_rgba(244,63,94,0.55)] ring-1 ring-rose-300/60'
+                              : 'bg-cyan-400/30 text-cyan-100 shadow-[0_0_16px_rgba(34,211,238,0.55)] ring-1 ring-cyan-300/60'
+                            : 'text-slate-500 active:text-slate-300'
+                        }`}
+                      >
+                        {isLiveMode ? 'Live' : 'Virtual'}
+                      </button>
+                    );
+                  })}
+                </div>
                 <button
                   type="button"
                   onClick={() => void handleEngineToggle()}
@@ -917,7 +914,7 @@ export default function App() {
                   </span>
                 </button>
                 <span
-                  className={`font-mono-tech text-[9px] font-bold tracking-widest uppercase ${
+                  className={`w-[54px] text-right font-mono-tech text-[9px] font-bold tracking-widest uppercase ${
                     engineRunning ? 'text-emerald-300' : 'text-slate-500'
                   }`}
                 >

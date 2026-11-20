@@ -227,16 +227,20 @@ async function fetchAccountById(userId) {
 async function fetchAccountByChat(chatId) {
   const clean = String(chatId || '').trim();
   if (!clean) return null;
+  // A chat can own more than one row (old rejected applications next to a newly
+  // approved registration), so list instead of maybeSingle and pick the row that
+  // actually holds the approval — otherwise /start_bot and every command break.
   const { data, error } = await supabase
     .from(USERS_TABLE)
     .select('*')
     .eq('telegram_chat_id', clean)
-    .maybeSingle();
+    .order('created_at', { ascending: false });
   if (error) {
     if (!isMissingTableError(error)) console.warn('[USERS] chat lookup failed:', error.message);
     return null;
   }
-  return data || null;
+  const rows = Array.isArray(data) ? data : data ? [data] : [];
+  return rows.find((row) => row?.approval_status === 'approved') || rows[0] || null;
 }
 
 let accountsTableAvailable = null;
@@ -306,7 +310,9 @@ async function resolveAdminChatId() {
     .not('telegram_chat_id', 'is', null)
     .limit(1)
     .maybeSingle();
-  return String(data?.telegram_chat_id || TELEGRAM_CHAT_ID || '').trim();
+  // Approvals only. Never fall back to the legacy global TELEGRAM_CHAT_ID here:
+  // that is how a trader's private alerts used to end up in the admin's inbox.
+  return String(data?.telegram_chat_id || '').trim();
 }
 
 /**
@@ -615,11 +621,47 @@ async function buildUserCfg(settings) {
       ? false
       : ENV_TESTNET || Boolean(stored?.useTestnet ?? settings.use_testnet);
   // A signed-in workspace always alerts its own Telegram chat, never the admin's.
+  // For a real account the `users.telegram_chat_id` column is the only source: a
+  // stale settings.chat_id (copied from the old single-tenant admin row) must not
+  // hijack a trader's alerts.
   cfg.telegramChatId = String(
-    cfg.account?.telegram_chat_id || settings.chat_id || settings.telegram_chat_id || ''
+    cfg.account
+      ? cfg.account.telegram_chat_id || ''
+      : settings.chat_id || settings.telegram_chat_id || ''
   ).trim();
+  if (!cfg.telegramChatId) {
+    console.warn(
+      `[TELEGRAM] Workspace ${cfg.scope} has no linked private chat — its alerts are skipped.`
+    );
+  }
   cfg.hasCredentials = Boolean(cfg.apiKey && cfg.apiSecret);
   return cfg;
+}
+
+let cachedServerIp = null;
+let cachedServerIpAt = 0;
+
+/** Resolves (and caches) this worker's public egress IP for Binance IP whitelisting. */
+async function resolveServerPublicIp() {
+  const configured = String(process.env.SERVER_PUBLIC_IP || process.env.PUBLIC_IP || '').trim();
+  if (configured) return configured;
+  if (cachedServerIp && Date.now() - cachedServerIpAt < 10 * 60_000) return cachedServerIp;
+  for (const url of ['https://api.ipify.org?format=json', 'https://ifconfig.me/all.json']) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(4_000) });
+      if (!res.ok) continue;
+      const data = await res.json().catch(() => null);
+      const ip = String(data?.ip || data?.ip_addr || '').trim();
+      if (/^[0-9a-fA-F.:]+$/.test(ip)) {
+        cachedServerIp = ip;
+        cachedServerIpAt = Date.now();
+        return ip;
+      }
+    } catch {
+      /* try the next resolver */
+    }
+  }
+  return cachedServerIp || '';
 }
 
 // Optional CORS HTTP Server & API Endpoints
@@ -659,6 +701,22 @@ if (PORT > 0) {
         return;
       }
 
+      // Public egress IP of this 24/7 worker. Traders whitelist it in Binance under
+      // API Management → "Restrict access to trusted IPs only".
+      if (req.method === 'GET' && pathname === '/api/server-ip') {
+        const ip = await resolveServerPublicIp();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: Boolean(ip),
+            ip: ip || null,
+            service: 'aegis-quant-worker',
+            timestamp: new Date().toISOString(),
+          })
+        );
+        return;
+      }
+
       // Live circuit-breaker state for the terminal's "🛡️ Crash Guard: Active" badge.
       if (req.method === 'GET' && pathname === '/api/guards') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -687,11 +745,56 @@ if (PORT > 0) {
               .replace(/^["']|["']$/g, '')
               .replace(/^bot/i, '')
               .trim();
-            const chatId = String(data.chatId || data.chat_id || '').trim();
+            const requestedChat = String(data.chatId || data.chat_id || '').trim();
             const text = String(data.text || '').trim();
-            if (!rawToken || !chatId || !text) {
+
+            // STRICT PER-USER ROUTING: the recipient is always the CALLER's own
+            // `users.telegram_chat_id`. A client-supplied chat id is ignored for a
+            // signed-in account, and the admin chat is never a delivery fallback.
+            const authUser = await verifyAccessToken(req);
+            let caller = authUser ? await fetchAccountById(authUser.id) : null;
+            if (!caller) {
+              const tgIdentity = verifyTelegramInitData(data.initData || data.init_data);
+              if (tgIdentity) caller = await fetchAccountByChat(tgIdentity.id);
+            }
+            let chatId = '';
+            if (caller) {
+              chatId = String(caller.telegram_chat_id || '').trim();
+              if (!chatId) {
+                console.warn(
+                  `[TELEGRAM] No private chat linked for ${caller.email || caller.id} — alert skipped.`
+                );
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    ok: false,
+                    detail:
+                      'No Telegram chat linked to this account. Add your own chat ID in Settings → Telegram Alerts.',
+                  })
+                );
+                return;
+              }
+            } else {
+              if (!requestedChat) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, detail: 'Missing botToken, chatId or text' }));
+                return;
+              }
+              if (ADMIN_CHAT_ID && requestedChat === ADMIN_CHAT_ID) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    ok: false,
+                    detail: 'Private alerts are only delivered to the signed-in trader\'s own chat.',
+                  })
+                );
+                return;
+              }
+              chatId = requestedChat;
+            }
+            if (!rawToken || !text) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: false, detail: 'Missing botToken, chatId or text' }));
+              res.end(JSON.stringify({ ok: false, detail: 'Missing botToken or text' }));
               return;
             }
             const tgRes = await fetch(`https://api.telegram.org/bot${rawToken}/sendMessage`, {
@@ -1408,7 +1511,13 @@ async function sendTelegram(text, token, chatId, options = {}) {
   const t = (token || TELEGRAM_BOT_TOKEN || '').trim();
   // Never fall back to another workspace's chat: each user is alerted privately.
   const c = String(chatId || '').trim();
-  if (!t || !c) return false;
+  if (!t) return false;
+  if (!c) {
+    console.warn(
+      '[TELEGRAM] Alert skipped — this workspace has no linked telegram_chat_id (never routed to the admin).'
+    );
+    return false;
+  }
   const replyMarkup =
     options.replyMarkup === null ? null : options.replyMarkup || TELEGRAM_OPEN_TERMINAL_MARKUP;
   try {

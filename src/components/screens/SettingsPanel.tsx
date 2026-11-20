@@ -16,6 +16,7 @@ import {
   Palette,
   Save,
   Send,
+  Server,
   ShieldCheck,
   Sun,
   Volume2,
@@ -87,6 +88,12 @@ interface SettingsPanelProps {
 
 const LOT_PRESETS = [1, 5, 10, 25, 50, 100, 250];
 
+/** The 24/7 Render worker publishes its egress IP for Binance whitelisting. */
+const WORKER_URL =
+  (import.meta.env.VITE_WORKER_URL as string | undefined) ||
+  'https://aegis-quant-worker-eu.onrender.com';
+const FALLBACK_SERVER_IP = '74.220.51.139';
+
 export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   t,
   workspace,
@@ -146,6 +153,43 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [copiedSql, setCopiedSql] = useState(false);
   const [showGuideSql, setShowGuideSql] = useState(false);
   const [muted, setMuted] = useState(() => audioSynth.isMuted());
+  const [serverIp, setServerIp] = useState(FALLBACK_SERVER_IP);
+  const [copiedIp, setCopiedIp] = useState(false);
+
+  // Ask the worker for its real public IP; the documented address is the fallback.
+  useEffect(() => {
+    let active = true;
+    const loadServerIp = async () => {
+      try {
+        const res = await fetch(`${WORKER_URL}/api/server-ip`);
+        const data = (await res.json().catch(() => null)) as { ip?: string | null } | null;
+        const ip = String(data?.ip || '').trim();
+        if (active && /^[0-9a-fA-F.:]+$/.test(ip)) setServerIp(ip);
+      } catch {
+        /* keep the documented fallback */
+      }
+    };
+    void loadServerIp();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleCopyServerIp = async () => {
+    audioSynth.playClick();
+    try {
+      await navigator.clipboard.writeText(serverIp);
+    } catch {
+      const el = document.createElement('textarea');
+      el.value = serverIp;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+    }
+    setCopiedIp(true);
+    window.setTimeout(() => setCopiedIp(false), 1800);
+  };
 
   // Sync draft only when switching workspace/settings row or explicit settings update (ignore last_heartbeat ticks)
   useEffect(() => {
@@ -1567,6 +1611,55 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               </div>
             </div>
 
+            {/* 1-click Server IP whitelist box — sits right above the API key input */}
+            <div className="rounded-xl border border-cyan-400/40 bg-gradient-to-r from-cyan-500/10 via-[#05070d]/90 to-emerald-500/10 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 font-mono-tech text-[10px] font-bold tracking-wider text-cyan-300 uppercase">
+                    <Server className="h-3.5 w-3.5" />
+                    <span>24/7 Server IP · whitelist this</span>
+                  </div>
+                  <code className="mt-1 block truncate font-mono-tech text-sm font-bold text-cyan-100">
+                    {serverIp}
+                  </code>
+                </div>
+                <NeonButton
+                  type="button"
+                  variant={copiedIp ? 'emerald' : 'cyan'}
+                  onClick={() => void handleCopyServerIp()}
+                  className="min-h-[34px] px-3 py-1 text-[11px]"
+                >
+                  {copiedIp ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                  <span>{copiedIp ? 'COPIED!' : 'COPY IP'}</span>
+                </NeonButton>
+              </div>
+              <p className="mt-2 font-mono-tech text-[10px] leading-relaxed text-slate-300">
+                Add this Server IP under{' '}
+                <span className="text-cyan-200">“Restrict access to trusted IPs only”</span> in your
+                Binance API Management settings.
+              </p>
+            </div>
+
+            {/* Non-custodial safety notice */}
+            <div className="rounded-xl border border-emerald-400/40 bg-emerald-500/[0.07] p-3">
+              <div className="mb-1.5 flex items-center gap-1.5 font-mono-tech text-[10px] font-bold tracking-wider text-emerald-300 uppercase">
+                <ShieldCheck className="h-4 w-4" />
+                <span>100% Non-Custodial &amp; Safe</span>
+              </div>
+              <ul className="space-y-1 font-mono-tech text-[10px] leading-relaxed text-slate-300">
+                <li>
+                  • Keep <span className="font-bold text-emerald-200">Enable Withdrawals</span> and{' '}
+                  <span className="font-bold text-emerald-200">Universal Transfer</span> OFF on
+                  Binance. Our bot can ONLY place Spot trades inside your account — it can never
+                  withdraw or transfer your funds.
+                </li>
+                <li>
+                  • Enable only <span className="font-bold text-emerald-200">Enable Reading</span>{' '}
+                  and <span className="font-bold text-emerald-200">Enable Spot &amp; Margin Trading</span>.
+                </li>
+              </ul>
+            </div>
+
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label
@@ -1883,6 +1976,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <code className="text-cyan-300">BINANCE_API_SECRET</code>,{' '}
               <code className="text-cyan-300">TELEGRAM_BOT_TOKEN</code>,{' '}
               <code className="text-cyan-300">TELEGRAM_CHAT_ID</code>।
+              <br />
+              Server IP: <code className="text-cyan-300">{serverIp}</code> — Binance API-এ “Restrict
+              access to trusted IPs only”-তে যোগ করুন। Withdrawals ও Universal Transfer বন্ধ রাখুন।
             </p>
           </div>
         </div>
