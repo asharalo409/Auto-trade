@@ -32,6 +32,8 @@ import {
   TelegramConfig,
   ThemeId,
   TradingMode,
+  UserApiKeyStatus,
+  WorkspaceUser,
 } from '../../types/trading';
 import { InfoTip } from '../ui/InfoTip';
 import { NeonButton, SciFiSwitch } from '../ui/MotionPrimitives';
@@ -58,6 +60,10 @@ interface SettingsPanelProps {
   ) => Promise<{ ok: boolean; detail: string }>;
   onSaveBinance: (cfg: BinanceConfig) => void;
   onVerifyBinance: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
+  workspaceUser: WorkspaceUser;
+  apiKeyStatus: UserApiKeyStatus;
+  onSaveUserBinanceKeys: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
+  onTestUserBinance: () => Promise<{ ok: boolean; detail: string }>;
   voiceEnabled: boolean;
   onToggleVoice: (enabled: boolean) => void;
   onTestVoice: () => void;
@@ -84,6 +90,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   onSendBalanceTelegram,
   onSaveBinance,
   onVerifyBinance,
+  workspaceUser,
+  apiKeyStatus,
+  onSaveUserBinanceKeys,
+  onTestUserBinance,
   voiceEnabled,
   onToggleVoice,
   onTestVoice,
@@ -97,6 +107,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [keysSavedToast, setKeysSavedToast] = useState(false);
   const [tgFeedback, setTgFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [bnFeedback, setBnFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const [vaultFeedback, setVaultFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const [savingVault, setSavingVault] = useState(false);
+  const [testingVault, setTestingVault] = useState(false);
   const [testingTg, setTestingTg] = useState(false);
   const [sendingBalTg, setSendingBalTg] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
@@ -204,6 +217,25 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     onSaveBinance(bnDraft);
     const res = await onVerifyBinance(bnDraft);
     setBnFeedback({ ok: res.ok, text: res.detail });
+  };
+
+  const handleSaveVault = async () => {
+    audioSynth.playClick();
+    onSaveBinance(bnDraft);
+    setSavingVault(true);
+    setVaultFeedback(null);
+    const res = await onSaveUserBinanceKeys(bnDraft);
+    setSavingVault(false);
+    setVaultFeedback({ ok: res.ok, text: res.detail });
+  };
+
+  const handleTestVault = async () => {
+    audioSynth.playClick();
+    setTestingVault(true);
+    setVaultFeedback(null);
+    const res = await onTestUserBinance();
+    setTestingVault(false);
+    setVaultFeedback({ ok: res.ok, text: res.detail });
   };
 
   const handleCopySql = async () => {
@@ -1152,6 +1184,90 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         }
       >
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+          {/* Per-user workspace + private Binance key vault */}
+          <div className="space-y-3 rounded-xl border border-amber-500/35 bg-gradient-to-br from-amber-500/[0.08] via-[#05070d]/95 to-emerald-500/[0.06] p-4 lg:col-span-2">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-amber-200">
+                <ShieldCheck className="h-4 w-4" />
+                <span>YOUR WORKSPACE &amp; PRIVATE KEY VAULT</span>
+              </div>
+              <span
+                className={`rounded border px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase ${
+                  apiKeyStatus.linked
+                    ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-300'
+                    : 'border-slate-600 bg-slate-800/60 text-slate-400'
+                }`}
+              >
+                {apiKeyStatus.linked ? 'KEYS LINKED' : 'NO KEYS LINKED'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 gap-2 font-mono-tech text-[11px] sm:grid-cols-3">
+              <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
+                <div className="text-[9px] tracking-wider text-slate-500 uppercase">
+                  Workspace ID
+                </div>
+                <div className="truncate text-slate-100">{workspaceUser.telegramUserId}</div>
+              </div>
+              <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
+                <div className="text-[9px] tracking-wider text-slate-500 uppercase">Trader</div>
+                <div className="truncate text-slate-100">
+                  {workspaceUser.displayName}
+                  {workspaceUser.username ? ` (@${workspaceUser.username})` : ''}
+                </div>
+              </div>
+              <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
+                <div className="text-[9px] tracking-wider text-slate-500 uppercase">
+                  Binance API Key
+                </div>
+                <div className="truncate text-amber-200">
+                  {apiKeyStatus.api_key_masked ?? 'not saved yet'}
+                </div>
+              </div>
+            </div>
+
+            <p className="font-mono-tech text-[10px] leading-relaxed text-slate-400">
+              Every Telegram user owns an isolated workspace: their own mode, risk limits, virtual
+              balance and trade history. The Binance secret is written to the worker's private
+              vault and is never returned to any browser — only this masked preview is.
+            </p>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <NeonButton
+                type="button"
+                variant="amber"
+                disabled={savingVault}
+                onClick={handleSaveVault}
+                className="min-h-[36px] px-3 py-1 text-[11px]"
+              >
+                <KeyRound className="h-3.5 w-3.5" />
+                {savingVault ? 'SAVING TO VAULT...' : 'SAVE KEYS TO MY VAULT'}
+              </NeonButton>
+              <NeonButton
+                type="button"
+                variant="emerald"
+                disabled={testingVault}
+                onClick={handleTestVault}
+                className="min-h-[36px] px-3 py-1 text-[11px]"
+              >
+                <Activity className="h-3.5 w-3.5" />
+                {testingVault ? 'TESTING...' : 'TEST CONNECTION'}
+              </NeonButton>
+            </div>
+
+            {vaultFeedback && (
+              <div
+                className={`rounded-lg border px-2.5 py-1.5 font-mono-tech text-[11px] ${
+                  vaultFeedback.ok
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                    : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                }`}
+              >
+                {vaultFeedback.text}
+              </div>
+            )}
+          </div>
+
           {/* Telegram Bot Integration */}
           <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d]/90 p-4">
             <div className="flex items-center justify-between">

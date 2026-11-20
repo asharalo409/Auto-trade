@@ -127,6 +127,58 @@ alter table public.settings add column if not exists auto_compounding boolean de
 alter table public.settings add column if not exists compound_allocation_pct numeric default 5;
 alter table public.settings add column if not exists multi_timeframe_filter boolean default true;
 alter table public.trades add column if not exists mode text default 'live';
+
+-- 6. MULTI-USER PLATFORM (one isolated workspace per Telegram user)
+alter table public.settings add column if not exists telegram_user_id text;
+alter table public.settings add column if not exists telegram_username text;
+alter table public.settings add column if not exists full_name text;
+alter table public.settings add column if not exists chat_id text;
+alter table public.settings add column if not exists bot_running boolean default false;
+alter table public.settings add column if not exists realized_pnl_usd numeric default 0;
+alter table public.settings add column if not exists total_trades integer default 0;
+alter table public.settings add column if not exists win_trades integer default 0;
+alter table public.settings add column if not exists risk_settings jsonb default '{}'::jsonb;
+alter table public.settings add column if not exists open_positions jsonb default '[]'::jsonb;
+alter table public.settings add column if not exists trade_history jsonb default '[]'::jsonb;
+alter table public.trades add column if not exists telegram_user_id text;
+create unique index if not exists settings_telegram_user_id_key
+  on public.settings (telegram_user_id) where telegram_user_id is not null;
+create index if not exists trades_telegram_user_id_idx
+  on public.trades (telegram_user_id);
+
+-- Per-user Binance API secrets. RLS is enabled with NO client policy, so the anon
+-- key (and therefore any browser) can never read another trader's keys; only the
+-- service-role worker writes and reads them.
+create table if not exists public.user_api_keys (
+  telegram_user_id text primary key,
+  binance_api_key text not null,
+  binance_api_secret text not null,
+  use_testnet boolean default false,
+  updated_at timestamptz default now()
+);
+alter table public.user_api_keys enable row level security;
+
+-- The pre-multi-user single row becomes the owner/guest workspace.
+update public.settings set telegram_user_id = 'guest:owner'
+  where telegram_user_id is null;
+
+-- Move any legacy keys out of the client-readable settings row into the vault,
+-- then blank them so no browser (anon/authenticated) can ever select them again.
+insert into public.user_api_keys (telegram_user_id, binance_api_key, binance_api_secret, use_testnet)
+select coalesce(telegram_user_id, 'guest:owner'), binance_api_key, binance_api_secret, coalesce(use_testnet, false)
+from public.settings
+where binance_api_key is not null and binance_api_secret is not null
+on conflict (telegram_user_id) do nothing;
+update public.settings set binance_api_key = null, binance_api_secret = null
+  where telegram_user_id is not null;
+
+-- Telegram Mini App sign-in uses Supabase anonymous sessions, so the anon role must
+-- be allowed to become an authenticated session (Dashboard → Authentication →
+-- Anonymous sign-ins: ON). Workspace rows are still filtered by telegram_user_id in
+-- every query, and Binance secrets never leave the worker-only vault above.
+
+-- Leaderboard read model is exposed by the worker (/api/leaderboard), which returns
+-- aggregates only: names, mode, win rate and net PnL — no keys, no balances.
 alter table public.trades add column if not exists peak_price numeric;`;
 
 export const INITIAL_DEMO_SETTINGS: BotSettings = {

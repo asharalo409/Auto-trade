@@ -15,6 +15,7 @@ import {
   Settings as SettingsIcon,
   ShieldAlert,
   Terminal,
+  Trophy,
 } from 'lucide-react';
 import { CommandCenter } from './components/screens/CommandCenter';
 import { LiveEngineFeed } from './components/screens/LiveEngineFeed';
@@ -27,6 +28,7 @@ import { TradesScreen } from './components/screens/TradesScreen';
 import { AudioStatusPill } from './components/ui/AudioStatusPill';
 import { BootSequence } from './components/ui/BootSequence';
 import { NeonButton } from './components/ui/MotionPrimitives';
+import { LeaderboardModal } from './components/ui/LeaderboardModal';
 import { TelegramProfileBadge } from './components/ui/TelegramProfileBadge';
 import { TickerBar } from './components/ui/TickerBar';
 import { BDT_PER_USD } from './data/demoData';
@@ -52,6 +54,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('command');
   const [bootComplete, setBootComplete] = useState(false);
   const [pendingLiveConfirm, setPendingLiveConfirm] = useState(false);
+  const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [bgPredator, setBgPredator] = useState<BackgroundPresetId>(() => {
     if (typeof window === 'undefined') return 'tiger';
     try {
@@ -255,6 +258,20 @@ export default function App() {
               {t.brandTitle}
             </span>
             <TelegramProfileBadge />
+            {terminal.isAuthenticated && (
+              <button
+                type="button"
+                onClick={() => {
+                  audioSynth.playClick();
+                  setShowLeaderboard(true);
+                }}
+                title="Community profit leaderboard"
+                className="flex min-h-[30px] cursor-pointer items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider text-amber-200 uppercase hover:border-amber-400/70 hover:text-amber-100"
+              >
+                <Trophy className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Board</span>
+              </button>
+            )}
             <span
               className={`hidden font-mono-tech text-[10px] tracking-widest uppercase xl:inline ${activeTheme.accentText}`}
             >
@@ -609,6 +626,10 @@ export default function App() {
                   onSendBalanceTelegram={terminal.sendTelegramBalanceSnapshot}
                   onSaveBinance={terminal.setBinanceConfig}
                   onVerifyBinance={terminal.verifyBinanceCredentials}
+                  workspaceUser={terminal.workspaceUser}
+                  apiKeyStatus={terminal.apiKeyStatus}
+                  onSaveUserBinanceKeys={terminal.saveUserBinanceKeys}
+                  onTestUserBinance={terminal.testUserBinanceConnection}
                   voiceEnabled={terminal.voiceEnabled}
                   onToggleVoice={terminal.toggleVoice}
                   onTestVoice={terminal.testVoice}
@@ -665,6 +686,16 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Community P&L leaderboard (aggregates only — keys stay private) */}
+      <LeaderboardModal
+        open={showLeaderboard}
+        onClose={() => setShowLeaderboard(false)}
+        entries={terminal.leaderboard}
+        loading={terminal.leaderboardLoading}
+        currentUserId={terminal.workspaceUser.telegramUserId}
+        onRefresh={terminal.refreshLeaderboard}
+      />
 
       {/* Footer + Bottom Ticker */}
       <footer className="relative z-10 mt-auto pb-28 lg:pb-0">

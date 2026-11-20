@@ -27,6 +27,8 @@ export interface TelegramWebApp {
   colorScheme?: 'light' | 'dark';
   HapticFeedback?: TelegramHapticFeedback;
   initDataUnsafe?: { user?: TelegramWebAppUser };
+  /** Raw signed payload used for server-side identity verification. */
+  initData?: string;
 }
 
 export interface TelegramWebAppUser {

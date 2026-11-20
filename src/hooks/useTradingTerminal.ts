@@ -17,6 +17,7 @@ import { audioSynth } from '../lib/audioSynth';
 import { fetchBinance24hrTickers, openBinanceStream } from '../lib/binanceMarket';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { dispatchTelegramAlert } from '../lib/telegram';
+import { resolveWorkspaceIdentity } from '../lib/userIdentity';
 import { MIN_TRADEABLE_USDT } from '../lib/tradeLimits';
 import { getTimeBasedTheme } from '../lib/themes';
 import {
@@ -35,6 +36,7 @@ import {
   CrashGuardState,
   CoreVisualMode,
   EquityPoint,
+  LeaderboardEntry,
   EquityTimeframe,
   LogEntry,
   LogLevel,
@@ -44,6 +46,8 @@ import {
   ThemeId,
   Trade,
   TradingMode,
+  UserApiKeyStatus,
+  WorkspaceUser,
 } from '../types/trading';
 
 const WORKER_URL = import.meta.env.VITE_WORKER_URL || "https://aegis-quant-worker-eu.onrender.com";
@@ -260,6 +264,17 @@ function isMissingSupabaseTableError(error: { code?: string; message?: string } 
   );
 }
 
+function isMissingSupabaseColumnError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  const msg = String(error.message ?? '');
+  return (
+    error.code === '42703' ||
+    error.code === 'PGRST204' ||
+    msg.includes('column') ||
+    msg.includes('schema cache')
+  );
+}
+
 /**
  * Single source of truth for reading an account value out of a balance payload.
  * Portfolio value (Spot + Funding + Earn + coin holdings) must win over USDT-only
@@ -308,6 +323,20 @@ export function useTradingTerminal() {
         candle_style: 'japanese',
       }),
     []
+  );
+
+  // Who owns this workspace: the Telegram user inside the Mini App, otherwise the
+  // single default owner/guest workspace. Every query below is scoped to it.
+  const identity = useMemo(() => resolveWorkspaceIdentity(), []);
+  const identityRef = useRef(identity);
+  const workspaceUser: WorkspaceUser = useMemo(
+    () => ({
+      telegramUserId: identity.telegramUserId,
+      displayName: identity.displayName,
+      username: identity.username,
+      isTelegram: identity.isTelegram,
+    }),
+    [identity]
   );
 
   const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
@@ -402,6 +431,14 @@ export function useTradingTerminal() {
   const [audioReady, setAudioReady] = useState<boolean>(() => voiceAnnouncer.isAudioUnlocked());
   // Flash-crash circuit breaker state, polled from the 24/7 worker (/api/guards).
   const [crashGuards, setCrashGuards] = useState<CrashGuardState[]>([]);
+  // Masked status of THIS user's Binance key vault (secrets stay in the worker).
+  const [apiKeyStatus, setApiKeyStatus] = useState<UserApiKeyStatus>({
+    linked: false,
+    api_key_masked: null,
+    use_testnet: false,
+  });
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(false);
 
   const [alertEnabledPairs, setAlertEnabledPairs] = useState<string[]>(() =>
     loadJson<string[]>(STORAGE_ALERT_PAIRS_KEY, [...SUPPORTED_PAIRS])
@@ -812,15 +849,37 @@ export function useTradingTerminal() {
     }
 
     let mounted = true;
-    supabase.auth.getSession().then(({ data }) => {
-      if (!mounted) return;
-      if (data.session) {
-        setIsAuthenticated(true);
-        setIsDemoMode(false);
-        setUserEmail(data.session.user.email ?? null);
-      }
-      setAuthLoading(false);
-    });
+    supabase.auth
+      .getSession()
+      .then(async ({ data }) => {
+        if (!mounted) return;
+        if (data.session) {
+          setIsAuthenticated(true);
+          setIsDemoMode(false);
+          setUserEmail(data.session.user.email ?? null);
+          return;
+        }
+        // Inside Telegram the Mini App should open straight into the trader's own
+        // workspace. Supabase anonymous auth gives the row a real `authenticated`
+        // JWT for RLS; the workspace itself is keyed by telegram_user_id.
+        if (identity.isTelegram) {
+          const { data: anon, error } = await supabase!.auth.signInAnonymously();
+          if (!mounted) return;
+          if (error || !anon.session) {
+            console.warn(
+              '[useTradingTerminal] Telegram auto-login unavailable (enable Anonymous sign-ins in Supabase):',
+              error?.message
+            );
+          } else {
+            setIsAuthenticated(true);
+            setIsDemoMode(false);
+            setUserEmail(`telegram:${identity.telegramUserId}`);
+          }
+        }
+      })
+      .finally(() => {
+        if (mounted) setAuthLoading(false);
+      });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
@@ -838,19 +897,97 @@ export function useTradingTerminal() {
       mounted = false;
       sub.subscription.unsubscribe();
     };
-  }, []);
+  }, [identity]);
+
+  /**
+   * Creates this browser/Telegram user's own settings row on first contact.
+   * Everything the worker trades for them then lives behind that single key.
+   */
+  const ensureWorkspaceRow = useCallback(async (): Promise<Record<string, unknown> | null> => {
+    if (!supabase) return null;
+    const me = identityRef.current;
+    const payload: Record<string, unknown> = {
+      telegram_user_id: me.telegramUserId,
+      telegram_username: me.username,
+      full_name: me.displayName,
+      chat_id: me.chatId,
+      telegram_enabled: true,
+      bot_enabled: false,
+      is_running: false,
+      bot_running: false,
+      trading_mode: activeWorkspace === 'LIVE' ? 'live' : 'virtual',
+      mode: activeWorkspace,
+      virtual_balance: 10000,
+      zero_loss_mode: true,
+      sell_only_in_profit: true,
+      enabled_pairs: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'],
+    };
+    let { data, error } = await supabase
+      .from('settings')
+      .insert(payload)
+      .select('*')
+      .maybeSingle();
+    if (error && isMissingSupabaseColumnError(error)) {
+      // Pre-migration project: still create an isolated row with the basics.
+      ({ data, error } = await supabase
+        .from('settings')
+        .insert({
+          telegram_user_id: me.telegramUserId,
+          chat_id: me.chatId,
+          bot_enabled: false,
+        })
+        .select('*')
+        .maybeSingle());
+    }
+    if (error) {
+      console.warn('[useTradingTerminal] workspace provisioning failed:', error.message);
+      return null;
+    }
+    console.log(`[useTradingTerminal] Provisioned workspace ${me.telegramUserId}.`);
+    return (data as Record<string, unknown> | null) ?? null;
+  }, [activeWorkspace]);
 
   const fetchSupabaseData = useCallback(async () => {
     if (!supabase || isDemoMode || !isAuthenticated) return;
     setDataLoading(true);
     setErrorMsg(null);
     try {
-      const [settingsRes, tradesRes, logsRes, engineLogsRes] = await Promise.all([
-        supabase.from('settings').select('*').limit(1).maybeSingle(),
-        supabase.from('trades').select('*').order('opened_at', { ascending: false }).limit(200),
+      const scopeId = identityRef.current.telegramUserId;
+      const scopedSettings = () =>
+        supabase!
+          .from('settings')
+          .select('*')
+          .eq('telegram_user_id', scopeId)
+          .limit(1)
+          .maybeSingle();
+      const scopedTrades = () =>
+        supabase!
+          .from('trades')
+          .select('*')
+          .eq('telegram_user_id', scopeId)
+          .order('opened_at', { ascending: false })
+          .limit(200);
+
+      let [settingsRes, tradesRes, logsRes, engineLogsRes] = await Promise.all([
+        scopedSettings(),
+        scopedTrades(),
         supabase.from('logs').select('*').order('created_at', { ascending: false }).limit(120),
         supabase.from('engine_logs').select('*').order('created_at', { ascending: false }).limit(120),
       ]);
+
+      // Pre-multi-user schema: degrade to the original unscoped reads.
+      if (settingsRes.error && isMissingSupabaseColumnError(settingsRes.error)) {
+        [settingsRes, tradesRes] = await Promise.all([
+          supabase.from('settings').select('*').limit(1).maybeSingle(),
+          supabase.from('trades').select('*').order('opened_at', { ascending: false }).limit(200),
+        ]);
+      }
+
+      // First contact for this Telegram user: provision their isolated workspace.
+      if (!settingsRes.error && !settingsRes.data) {
+        const created = await ensureWorkspaceRow();
+        if (created) settingsRes = { data: created, error: null } as typeof settingsRes;
+      }
 
       const settingsMissing = isMissingSupabaseTableError(settingsRes.error);
       const tradesMissing = isMissingSupabaseTableError(tradesRes.error);
@@ -981,7 +1118,7 @@ export function useTradingTerminal() {
     } finally {
       setDataLoading(false);
     }
-  }, [balanceForVoice, isAuthenticated, isDemoMode]);
+  }, [balanceForVoice, ensureWorkspaceRow, isAuthenticated, isDemoMode]);
 
   useEffect(() => {
     if (!supabase || isDemoMode || !isAuthenticated) return;
@@ -1007,6 +1144,9 @@ export function useTradingTerminal() {
         (payload) => {
           if (payload.new && typeof payload.new === 'object') {
             const row = payload.new as Record<string, unknown>;
+            // Never mirror another trader's settings into this workspace.
+            const rowScope = String(row.telegram_user_id ?? '').trim();
+            if (rowScope && rowScope !== identityRef.current.telegramUserId) return;
             const rowId = row.id as number | string | undefined;
             if (rowId !== undefined && rowId !== null) settingsRowIdRef.current = rowId;
             setLiveSettings((prev) => {
@@ -1034,6 +1174,10 @@ export function useTradingTerminal() {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'trades' },
         (payload) => {
+          const rowScope = String(
+            (payload.new as Record<string, unknown> | undefined)?.telegram_user_id ?? ''
+          ).trim();
+          if (rowScope && rowScope !== identityRef.current.telegramUserId) return;
           if (payload.eventType === 'INSERT' && payload.new) {
             const incoming = normalizeTrade(payload.new as Record<string, unknown>);
             // Route by mode: a VDEMO- paper fill must never surface in the LIVE ledger.
@@ -1716,6 +1860,8 @@ export function useTradingTerminal() {
         const runStatePayload = runStateTouched
           ? {
               is_running: next.bot_enabled,
+              // Multi-user worker reads bot_running; keep both flags in lockstep.
+              bot_running: next.bot_enabled,
               trading_mode: activeWorkspace === 'LIVE' ? 'live' : 'virtual',
               mode: activeWorkspace,
             }
@@ -1800,22 +1946,23 @@ export function useTradingTerminal() {
     ): Promise<{ ok: boolean; executedQty: number; quoteQty: number; error?: string }> => {
       const apiKey = binanceConfig.api_key.trim();
       const apiSecret = binanceConfig.api_secret.trim();
-      if (!apiKey || !apiSecret) {
-        return { ok: false, executedQty: 0, quoteQty: 0, error: 'Binance API keys are not configured' };
-      }
+      // Empty local keys are fine: the worker executes with this workspace's vault.
       try {
         const res = await fetch(`${WORKER_URL}/api/order`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            apiKey,
-            apiSecret,
-            testnet: binanceConfig.use_testnet,
-            symbol,
-            side,
-            quoteOrderQty,
-            quantity,
-          }),
+                      body: JSON.stringify({
+              apiKey,
+              apiSecret,
+              testnet: binanceConfig.use_testnet,
+              // Order routing is scoped to this workspace's own vault.
+              telegram_user_id: identityRef.current.telegramUserId,
+              initData: identityRef.current.initData,
+              symbol,
+              side,
+              quoteOrderQty,
+              quantity,
+            }),
         });
         const data = (await res.json().catch(() => ({}))) as {
           ok?: boolean;
@@ -2368,31 +2515,17 @@ export function useTradingTerminal() {
       const activeCfg = cfgOverride ?? binanceConfig;
       const apiKey = activeCfg.api_key.trim();
       const apiSecret = activeCfg.api_secret.trim();
-
-      if (!apiKey || !apiSecret) {
-        console.warn('[useTradingTerminal] refreshBinanceBalance skipped: missing API Key or Secret');
-        const empty: BinanceAccountSummary & { ok: boolean } = {
-          ok: false,
-          connected: false,
-          usdtFree: 0,
-          usdtLocked: 0,
-          totalUsdt: 0,
-          totalPortfolioUsd: 0,
-          assets: [],
-          canTrade: false,
-          lastSyncedAt: new Date().toISOString(),
-          errorDetail: 'Binance API Key & Secret are required',
-        };
-        setBinanceAccount(empty);
-        setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
-        return empty;
-      }
+      // The worker owns this workspace's key vault, so local keys are only an
+      // override — the account is visible without them ever leaving the server.
+      const scopeQuery = `?telegram_user_id=${encodeURIComponent(
+        identityRef.current.telegramUserId
+      )}`;
 
       setSyncingBalance(true);
       try {
         let res: Response;
         try {
-          res = await fetch(`${WORKER_URL}/api/balance`, {
+          res = await fetch(`${WORKER_URL}/api/balance${scopeQuery}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2746,6 +2879,8 @@ export function useTradingTerminal() {
               apiKey: trimmedCfg.api_key,
               apiSecret: trimmedCfg.api_secret,
               testnet: trimmedCfg.use_testnet,
+              telegram_user_id: identityRef.current.telegramUserId,
+              initData: identityRef.current.initData,
             }),
           });
         } catch {
@@ -2803,6 +2938,161 @@ export function useTradingTerminal() {
     },
     [appendLog, refreshBinanceBalance]
   );
+
+  /* --------------------------------------------------------------------- *
+   * Per-user Binance key vault: the worker stores secrets that the browser can
+   * never read back, and only ever returns a mask.
+   * --------------------------------------------------------------------- */
+
+  const saveUserBinanceKeys = useCallback(async (cfg: BinanceConfig) => {
+    const me = identityRef.current;
+    const apiKey = cfg.api_key.trim();
+    const apiSecret = cfg.api_secret.trim();
+    if (apiKey.length < 16 || apiSecret.length < 16) {
+      return { ok: false, detail: 'API key and secret must be at least 16 characters' };
+    }
+    try {
+      const res = await fetch(`${WORKER_URL}/api/user/keys`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          telegram_user_id: me.telegramUserId,
+          initData: me.initData,
+          api_key: apiKey,
+          api_secret: apiSecret,
+          use_testnet: cfg.use_testnet,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        api_key_masked?: string;
+        use_testnet?: boolean;
+      };
+      if (!res.ok || data.ok === false) {
+        return { ok: false, detail: String(data.error || `Vault write failed (HTTP ${res.status})`) };
+      }
+      setApiKeyStatus({
+        linked: true,
+        api_key_masked: data.api_key_masked ?? null,
+        use_testnet: Boolean(data.use_testnet),
+      });
+      return { ok: true, detail: 'Saved to your private key vault' };
+    } catch (err) {
+      return {
+        ok: false,
+        detail: err instanceof Error ? err.message : 'Could not reach the key vault',
+      };
+    }
+  }, []);
+
+  const loadUserApiKeyStatus = useCallback(async () => {
+    const me = identityRef.current;
+    try {
+      const query = new URLSearchParams({ telegram_user_id: me.telegramUserId });
+      if (me.initData) query.set('initData', me.initData);
+      const res = await fetch(`${WORKER_URL}/api/user/keys?${query.toString()}`, {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) return;
+      const data = (await res.json().catch(() => ({}))) as Partial<UserApiKeyStatus>;
+      setApiKeyStatus({
+        linked: Boolean(data.linked),
+        api_key_masked: data.api_key_masked ?? null,
+        use_testnet: Boolean(data.use_testnet),
+        updated_at: data.updated_at ?? null,
+      });
+    } catch {
+      // Worker asleep — keep the last known vault state.
+    }
+  }, []);
+
+  const testUserBinanceConnection = useCallback(async () => {
+    const me = identityRef.current;
+    setSyncingBalance(true);
+    try {
+      const res = await fetch(`${WORKER_URL}/api/user/keys/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ telegram_user_id: me.telegramUserId, initData: me.initData }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        totalPortfolioUsd?: number;
+        usdtFree?: number;
+        spotUsd?: number;
+        fundingUsd?: number;
+        earnUsd?: number;
+        api_key_masked?: string;
+        use_testnet?: boolean;
+      };
+      if (!res.ok || data.ok === false) {
+        return { ok: false, detail: String(data.error || `Test failed (HTTP ${res.status})`) };
+      }
+      const usdtBal = pickPortfolioUsd(data);
+      setApiKeyStatus({
+        linked: true,
+        api_key_masked: data.api_key_masked ?? null,
+        use_testnet: Boolean(data.use_testnet),
+      });
+      setBinanceAccount({
+        connected: true,
+        usdtFree: Number(data.usdtFree ?? 0),
+        usdtLocked: 0,
+        totalUsdt: usdtBal,
+        totalPortfolioUsd: usdtBal,
+        spotUsd: Number(data.spotUsd ?? data.usdtFree ?? 0),
+        fundingUsd: Number(data.fundingUsd ?? 0),
+        earnUsd: Number(data.earnUsd ?? 0),
+        walletBreakdown: [{ walletName: 'Spot', balanceUsd: usdtBal }],
+        assets: [],
+        canTrade: Number(data.usdtFree ?? 0) >= MIN_TRADEABLE_USDT,
+        lastSyncedAt: new Date().toISOString(),
+        errorDetail: null,
+      });
+      setLiveSettings((prev) => ({ ...prev, balance_usdt: usdtBal }));
+      return {
+        ok: true,
+        detail: `Connected ✓ Portfolio $${usdtBal.toFixed(2)} · Spot $${Number(
+          data.usdtFree ?? 0
+        ).toFixed(2)} (৳${Math.round(usdtBal * BDT_PER_USD).toLocaleString('en-US')})`,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        detail: err instanceof Error ? err.message : 'Could not reach Binance',
+      };
+    } finally {
+      setSyncingBalance(false);
+    }
+  }, []);
+
+  const refreshLeaderboard = useCallback(async () => {
+    setLeaderboardLoading(true);
+    try {
+      const res = await fetch(`${WORKER_URL}/api/leaderboard`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) return;
+      const data = (await res.json().catch(() => ({}))) as { entries?: LeaderboardEntry[] };
+      setLeaderboard(Array.isArray(data.entries) ? data.entries : []);
+    } catch {
+      // Leaderboard is informational; a sleeping worker must not break the UI.
+    } finally {
+      setLeaderboardLoading(false);
+    }
+  }, []);
+
+  // Hydrate the vault badge and the public board once signed in, then refresh the
+  // board periodically so ranks stay live without a websocket.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    void loadUserApiKeyStatus();
+    void refreshLeaderboard();
+    const timer = window.setInterval(() => void refreshLeaderboard(), 120_000);
+    return () => window.clearInterval(timer);
+  }, [isAuthenticated, loadUserApiKeyStatus, refreshLeaderboard]);
 
   const signIn = useCallback(async (email: string, password: string) => {
     if (!supabase) {
@@ -2862,7 +3152,11 @@ export function useTradingTerminal() {
   }, []);
 
   const hasBinanceKeys = Boolean(
-    binanceConfig.api_key.trim().length >= 16 && binanceConfig.api_secret.trim().length >= 16
+    (binanceConfig.api_key.trim().length >= 16 &&
+      binanceConfig.api_secret.trim().length >= 16) ||
+      // Keys saved to this trader's private vault count even though the browser
+      // never receives the secret back.
+      apiKeyStatus.linked
   );
 
   const hasTelegramKeys = Boolean(
@@ -2911,6 +3205,13 @@ export function useTradingTerminal() {
     voiceEnabled,
     audioReady,
     crashGuards,
+    workspaceUser,
+    apiKeyStatus,
+    saveUserBinanceKeys,
+    testUserBinanceConnection,
+    leaderboard,
+    leaderboardLoading,
+    refreshLeaderboard,
     toggleVoice,
     testVoice,
     speakBalance,

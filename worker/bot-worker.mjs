@@ -28,6 +28,53 @@ const TELEGRAM_OPEN_TERMINAL_MARKUP = {
   inline_keyboard: [[{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }]],
 };
 const TELEGRAM_STATUS_BUTTON = { text: '📈 Live Status', callback_data: 'refresh_status' };
+/** Inline finance shortcuts attached to /help, /pnl and /leaderboard. */
+const TELEGRAM_FINANCE_MARKUP = {
+  inline_keyboard: [
+    [
+      { text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } },
+      { text: '💰 My PnL', callback_data: 'pnl' },
+    ],
+    [
+      { text: '🏆 Leaderboard', callback_data: 'leaderboard' },
+      TELEGRAM_STATUS_BUTTON,
+    ],
+  ],
+};
+
+function userScopeOf(settings) {
+  return scopeOf(settings) || DEFAULT_OWNER_SCOPE;
+}
+
+/** Shared ranked text for `/leaderboard` and the `leaderboard` callback. */
+function buildLeaderboardText(rows, ownScope) {
+  if (!rows || rows.length === 0) {
+    return [
+      '🏆 <b>AEGIS COMMUNITY LEADERBOARD</b>',
+      '',
+      'No closed trades yet. Start the engine with /start_bot and the first settled trade puts you on the board.',
+    ].join('\n');
+  }
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines = ['🏆 <b>AEGIS COMMUNITY LEADERBOARD</b>', '<i>Net realized PnL · all traders on @TaseenMarketBot</i>', ''];
+  rows.slice(0, 10).forEach((row, index) => {
+    const rank = medals[index] || `${index + 1}.`;
+    const you = row.telegram_user_id === ownScope ? ' ← you' : '';
+    const handle = row.username ? ` (@${row.username})` : '';
+    const sign = row.pnl_usd >= 0 ? '+' : '-'
+    lines.push(
+      `${rank} <b>${row.name}</b>${handle}${you}`,
+      `    ${row.mode} · ${row.win_rate.toFixed(1)}% win · ${row.trades} trades`,
+      `    ${sign}$${Math.abs(row.pnl_usd).toFixed(2)} · ৳${Math.abs(row.pnl_bdt).toLocaleString('en-US')}`
+    );
+  });
+  const mine = rows.findIndex((row) => row.telegram_user_id === ownScope);
+  if (mine >= 10) {
+    const row = rows[mine];
+    lines.push('', `Your rank: #${mine + 1} · ${row.pnl_usd >= 0 ? '+' : '-'}$${Math.abs(row.pnl_usd).toFixed(2)}`);
+  }
+  return lines.join('\n');
+}
 
 /**
  * Two rows of inline actions on every trade alert: the Mini App entry point, plus
@@ -65,6 +112,158 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
+
+/* ------------------------------------------------------------------------- *
+ * Multi-user workspace model
+ * ------------------------------------------------------------------------- */
+
+/** Fallback workspace used by the web terminal when it runs outside Telegram. */
+const DEFAULT_OWNER_SCOPE = 'guest:owner';
+/** Binance secrets live here and are readable ONLY with the service role key. */
+const USER_KEYS_TABLE = 'user_api_keys';
+const SCOPE_COLUMN = 'telegram_user_id';
+const DEMO_START_BALANCE = 10_000;
+
+/** `telegram_user_id` of a settings row (null for the legacy single-tenant row). */
+function scopeOf(row) {
+  const raw = String(row?.[SCOPE_COLUMN] ?? '').trim();
+  return raw || null;
+}
+
+function userLabel(row) {
+  const name = String(row?.full_name || '').trim();
+  if (name) return name;
+  const username = String(row?.telegram_username || '').trim();
+  if (username) return `@${username.replace(/^@/, '')}`;
+  return scopeOf(row) || 'Web Guest';
+}
+
+function maskSecret(value) {
+  const s = String(value || '');
+  if (!s) return '';
+  if (s.length <= 8) return '••••••••';
+  return `${s.slice(0, 4)}••••${s.slice(-4)}`;
+}
+
+/** Only sane scope ids reach Supabase; everything else is rejected. */
+function sanitiseScope(value) {
+  const raw = String(value ?? '').trim();
+  return /^[A-Za-z0-9:_@.\-]{1,64}$/.test(raw) ? raw : '';
+}
+
+/** Per-user Binance credentials, stored in the worker-only table. */
+async function loadUserApiKeys(scope) {
+  if (!scope) return null;
+  const { data, error } = await supabase
+    .from(USER_KEYS_TABLE)
+    .select('*')
+    .eq(SCOPE_COLUMN, scope)
+    .maybeSingle();
+  if (error) {
+    if (!isMissingTableError(error)) console.warn('[USER KEYS] read failed:', error.message);
+    return null;
+  }
+  if (!data) return null;
+  return {
+    apiKey: String(data.binance_api_key || '').trim(),
+    apiSecret: String(data.binance_api_secret || '').trim(),
+    useTestnet: Boolean(data.use_testnet),
+    updatedAt: data.updated_at || null,
+  };
+}
+
+async function saveUserApiKeys(scope, apiKey, apiSecret, useTestnet) {
+  if (!scope) return { ok: false, error: 'Missing workspace id' };
+  const { error } = await supabase.from(USER_KEYS_TABLE).upsert(
+    {
+      [SCOPE_COLUMN]: scope,
+      binance_api_key: apiKey,
+      binance_api_secret: apiSecret,
+      use_testnet: Boolean(useTestnet),
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: SCOPE_COLUMN }
+  );
+  if (error) return { ok: false, error: error.message };
+  return { ok: true };
+}
+
+/**
+ * Validates Telegram Mini App `initData` with the bot token so a browser can
+ * only claim a Telegram identity it actually owns. Returns the Telegram user id
+ * on success, or null when the payload is absent/invalid/stale.
+ */
+function verifyTelegramInitData(initData) {
+  const token = TELEGRAM_BOT_TOKEN;
+  const raw = String(initData || '').trim();
+  if (!token || !raw) return null;
+  try {
+    const params = new URLSearchParams(raw);
+    const hash = params.get('hash');
+    if (!hash) return null;
+    params.delete('hash');
+    const dataCheckString = [...params.entries()]
+      .map(([k, v]) => `${k}=${v}`)
+      .sort()
+      .join('\n');
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(token).digest();
+    const expected = crypto
+      .createHmac('sha256', secretKey)
+      .update(dataCheckString)
+      .digest('hex');
+    if (
+      expected.length !== hash.length ||
+      !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(hash))
+    ) {
+      return null;
+    }
+    const authDate = Number(params.get('auth_date') || 0);
+    if (!authDate || Date.now() / 1000 - authDate > 86_400) return null;
+    const user = JSON.parse(params.get('user') || 'null');
+    const id = Number(user?.id);
+    return Number.isFinite(id) && id > 0
+      ? { id: String(id), username: user?.username || null, name: [user?.first_name, user?.last_name].filter(Boolean).join(' ') }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Verified Telegram id wins over a claimed workspace id. */
+function resolveRequestScope(payload) {
+  const verified = verifyTelegramInitData(payload?.initData);
+  if (verified) return { scope: verified.id, verified, error: null };
+  const claimed = sanitiseScope(payload?.telegram_user_id ?? payload?.telegramUserId);
+  return { scope: claimed || DEFAULT_OWNER_SCOPE, verified: null, error: null };
+}
+
+/** Resolves the effective config (settings + that user's own credentials). */
+async function buildUserCfg(settings) {
+  const cfg = resolveTradingConfig(settings);
+  cfg.id = settings.id;
+  cfg.scope = scopeOf(settings);
+  cfg.displayName = userLabel(settings);
+  const stored = await loadUserApiKeys(cfg.scope);
+  const ownerScope = !cfg.scope || cfg.scope === DEFAULT_OWNER_SCOPE;
+  cfg.apiKey = (
+    stored?.apiKey ||
+    (ownerScope ? ENV_BINANCE_KEY : '') ||
+    settings.binance_api_key ||
+    ''
+  ).trim();
+  cfg.apiSecret = (
+    stored?.apiSecret ||
+    (ownerScope ? ENV_BINANCE_SECRET : '') ||
+    settings.binance_api_secret ||
+    ''
+  ).trim();
+  cfg.useTestnet =
+    process.env.BINANCE_TESTNET === 'false'
+      ? false
+      : ENV_TESTNET || Boolean(stored?.useTestnet ?? settings.use_testnet);
+  cfg.hasCredentials = Boolean(cfg.apiKey && cfg.apiSecret);
+  return cfg;
+}
 
 // Optional CORS HTTP Server & API Endpoints
 const PORT = Number(process.env.PORT || 10000);
@@ -135,13 +334,19 @@ if (PORT > 0) {
               return;
             }
 
-            const { data: settingsRow } = await supabase.from('settings').select('id').limit(1).maybeSingle();
+            const { scope } = resolveRequestScope(data);
+            if (scope) {
+              // Keys are private to the requesting workspace: never written to a shared row.
+              await saveUserApiKeys(scope, apiKey, apiSecret, testnet);
+            }
+            const { data: settingsRow } = scope
+              ? await supabase.from('settings').select('id').eq(SCOPE_COLUMN, scope).maybeSingle()
+              : await supabase.from('settings').select('id').limit(1).maybeSingle();
             if (settingsRow) {
               await supabase
                 .from('settings')
                 .update({
-                  binance_api_key: apiKey,
-                  binance_api_secret: apiSecret,
+                  ...(scope ? {} : { binance_api_key: apiKey, binance_api_secret: apiSecret }),
                   use_testnet: testnet,
                   balance_usdt: portfolio.total,
                   last_heartbeat: new Date().toISOString(),
@@ -172,16 +377,43 @@ if (PORT > 0) {
 
       if ((req.method === 'GET' || req.method === 'POST') && (pathname === '/api/balance' || pathname === '/api/binance/balance')) {
         try {
-          const { data: settingsRow } = await supabase.from('settings').select('*').limit(1).maybeSingle();
+          // Optional workspace scope: a user's terminal only ever sees its own account.
+          const scope = sanitiseScope(url.searchParams.get(SCOPE_COLUMN));
+          const ownerScope = !scope || scope === DEFAULT_OWNER_SCOPE;
+          const { data: settingsRow } = scope
+            ? { data: await fetchUserSettings(scope) }
+            : await supabase.from('settings').select('*').limit(1).maybeSingle();
           if (!settingsRow) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, usdtBalance: 0, totalUsdt: 0, totalPortfolioUsd: 0 }));
             return;
           }
 
-          const apiKey = (ENV_BINANCE_KEY || settingsRow.binance_api_key || '').trim();
-          const apiSecret = (ENV_BINANCE_SECRET || settingsRow.binance_api_secret || '').trim();
-          const useTestnet = process.env.BINANCE_TESTNET === 'false' ? false : (ENV_TESTNET || Boolean(settingsRow.use_testnet));
+          const stored = scope ? await loadUserApiKeys(scope) : null;
+          const apiKey = (
+            stored?.apiKey ||
+            (ownerScope ? ENV_BINANCE_KEY : '') ||
+            settingsRow.binance_api_key ||
+            ''
+          ).trim();
+          const apiSecret = (
+            stored?.apiSecret ||
+            (ownerScope ? ENV_BINANCE_SECRET : '') ||
+            settingsRow.binance_api_secret ||
+            ''
+          ).trim();
+          const useTestnet =
+            process.env.BINANCE_TESTNET === 'false'
+              ? false
+              : ENV_TESTNET || Boolean(stored?.useTestnet ?? settingsRow.use_testnet);
+
+          if (!apiKey || !apiSecret) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({ ok: false, error: 'No Binance API keys linked to this workspace' })
+            );
+            return;
+          }
 
           let spotUsdt = Number(settingsRow.balance_usdt || 0);
           let fundingUsd = 0;
@@ -231,13 +463,33 @@ if (PORT > 0) {
         req.on('end', async () => {
           try {
             const data = JSON.parse(body || '{}');
-            const { data: settingsRow } = await supabase.from('settings').select('*').limit(1).maybeSingle();
-            const apiKey = (ENV_BINANCE_KEY || data.apiKey || settingsRow?.binance_api_key || '').trim();
-            const apiSecret = (ENV_BINANCE_SECRET || data.apiSecret || settingsRow?.binance_api_secret || '').trim();
+            // Manual orders execute against the CALLER'S workspace credentials only.
+            const { scope } = resolveRequestScope(data);
+            const ownerScope = !scope || scope === DEFAULT_OWNER_SCOPE;
+            const scopedRow = await fetchUserSettings(scope);
+            const { data: settingsRow } = scopedRow
+              ? { data: scopedRow }
+              : await supabase.from('settings').select('*').limit(1).maybeSingle();
+            const stored = await loadUserApiKeys(scope);
+            const apiKey = (
+              data.apiKey ||
+              stored?.apiKey ||
+              (ownerScope ? ENV_BINANCE_KEY : '') ||
+              settingsRow?.binance_api_key ||
+              ''
+            ).trim();
+            const apiSecret = (
+              data.apiSecret ||
+              stored?.apiSecret ||
+              (ownerScope ? ENV_BINANCE_SECRET : '') ||
+              settingsRow?.binance_api_secret ||
+              ''
+            ).trim();
             const useTestnet =
               process.env.BINANCE_TESTNET === 'false'
                 ? false
-                : ENV_TESTNET || Boolean(data.testnet ?? data.useTestnet ?? settingsRow?.use_testnet);
+                : ENV_TESTNET ||
+                  Boolean(data.testnet ?? data.useTestnet ?? stored?.useTestnet ?? settingsRow?.use_testnet);
             const symbol = String(data.symbol || '').trim().toUpperCase();
             const side = String(data.side || '').trim().toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
             const quoteOrderQty = Number(data.quoteOrderQty || 0);
@@ -294,6 +546,139 @@ if (PORT > 0) {
         return;
       }
 
+      /** Per-user Binance key vault. Secrets are write-only; reads return a mask. */
+      if (pathname === '/api/user/keys') {
+        if (req.method === 'GET') {
+          const { scope } = resolveRequestScope({
+            telegram_user_id: url.searchParams.get('telegram_user_id'),
+            initData: url.searchParams.get('initData'),
+          });
+          const stored = await loadUserApiKeys(scope);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              telegram_user_id: scope,
+              linked: Boolean(stored?.apiKey && stored?.apiSecret),
+              api_key_masked: stored?.apiKey ? maskSecret(stored.apiKey) : null,
+              use_testnet: Boolean(stored?.useTestnet),
+              updated_at: stored?.updatedAt || null,
+            })
+          );
+          return;
+        }
+        if (req.method === 'POST') {
+          let body = '';
+          req.on('data', (chunk) => { body += chunk; });
+          req.on('end', async () => {
+            try {
+              const data = JSON.parse(body || '{}');
+              const apiKey = String(data.api_key || data.apiKey || '').trim();
+              const apiSecret = String(data.api_secret || data.apiSecret || '').trim();
+              if (apiKey.length < 16 || apiSecret.length < 16) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'API key and secret must be at least 16 characters' }));
+                return;
+              }
+              const { scope, verified } = resolveRequestScope(data);
+              const saved = await saveUserApiKeys(
+                scope,
+                apiKey,
+                apiSecret,
+                Boolean(data.use_testnet ?? data.testnet)
+              );
+              if (!saved.ok) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: saved.error }));
+                return;
+              }
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({
+                  ok: true,
+                  telegram_user_id: scope,
+                  verified: Boolean(verified),
+                  linked: true,
+                  api_key_masked: maskSecret(apiKey),
+                  use_testnet: Boolean(data.use_testnet ?? data.testnet),
+                })
+              );
+            } catch (err) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: err.message }));
+            }
+          });
+          return;
+        }
+      }
+
+      /** Tests the CALLER'S OWN stored Binance keys and syncs their live balance. */
+      if (req.method === 'POST' && pathname === '/api/user/keys/test') {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            const { scope } = resolveRequestScope(data);
+            const stored = await loadUserApiKeys(scope);
+            if (!stored?.apiKey || !stored?.apiSecret) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'No Binance keys saved for this workspace yet' }));
+              return;
+            }
+            const useTestnet = data.use_testnet === undefined ? stored.useTestnet : Boolean(data.use_testnet);
+            const portfolio = await fetchBinancePortfolioUsdt(stored.apiKey, stored.apiSecret, useTestnet);
+            if (!portfolio) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Binance rejected the keys or the account is unreachable' }));
+              return;
+            }
+            const { data: row } = await supabase
+              .from('settings')
+              .select('id')
+              .eq(SCOPE_COLUMN, scope)
+              .maybeSingle();
+            if (row) {
+              await supabase
+                .from('settings')
+                .update({ balance_usdt: portfolio.total, last_heartbeat: new Date().toISOString() })
+                .eq('id', row.id);
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                usdtBalance: portfolio.total,
+                totalPortfolioUsd: portfolio.total,
+                usdtFree: portfolio.spot,
+                spotUsd: portfolio.spot,
+                fundingUsd: portfolio.funding,
+                earnUsd: portfolio.earn,
+                api_key_masked: maskSecret(stored.apiKey),
+                use_testnet: useTestnet,
+              })
+            );
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      /** Public leaderboard: aggregates only, never balances of keys/balances. */
+      if (req.method === 'GET' && pathname === '/api/leaderboard') {
+        try {
+          const board = await buildLeaderboardRows();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, timestamp: new Date().toISOString(), entries: board }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not Found' }));
     })
@@ -304,7 +689,8 @@ if (PORT > 0) {
 
 async function sendTelegram(text, token, chatId, options = {}) {
   const t = (token || TELEGRAM_BOT_TOKEN || '').trim();
-  const c = (chatId || TELEGRAM_CHAT_ID || '').trim();
+  // Never fall back to another workspace's chat: each user is alerted privately.
+  const c = String(chatId || '').trim();
   if (!t || !c) return false;
   const replyMarkup =
     options.replyMarkup === null ? null : options.replyMarkup || TELEGRAM_OPEN_TERMINAL_MARKUP;
@@ -336,7 +722,7 @@ async function sendTelegram(text, token, chatId, options = {}) {
 /** Sends a rendered PNG with an HTML caption (used for the shareable PnL card). */
 async function sendTelegramPhoto(pngBuffer, caption, token, chatId, replyMarkup) {
   const t = (token || TELEGRAM_BOT_TOKEN || '').trim();
-  const c = (chatId || TELEGRAM_CHAT_ID || '').trim();
+  const c = String(chatId || '').trim();
   if (!t || !c || !pngBuffer) return false;
   try {
     const form = new FormData();
@@ -918,7 +1304,8 @@ async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret,
   }
 }
 
-let lastLoggedBalance = null;
+/** Last portfolio value logged, per workspace (so users don't stomp each other). */
+const lastLoggedBalance = new Map();
 
 const MODE_LABEL = { live: 'LIVE', virtual: 'DEMO' };
 
@@ -949,7 +1336,7 @@ function resolveTradingConfig(settings) {
   const zeroLoss = Boolean(
     settings.zero_loss_shield ?? settings.zero_loss_mode ?? settings.sell_only_in_profit ?? true
   );
-  const runFlag = settings.is_running ?? settings.engine_running;
+  const runFlag = settings.is_running ?? settings.bot_running ?? settings.engine_running;
   const isRunning =
     runFlag === null || runFlag === undefined ? Boolean(settings.bot_enabled) : Boolean(runFlag);
   return {
@@ -958,10 +1345,13 @@ function resolveTradingConfig(settings) {
       settings.workspace_mode ?? settings.trading_mode ?? settings.mode
     ),
     telegramEnabled: settings.telegram_enabled !== false,
+    // One shared @TaseenMarketBot talks to every user; only the chat differs.
     telegramToken: String(
-      settings.telegram_bot_token || settings.bot_token || TELEGRAM_BOT_TOKEN || ''
+      TELEGRAM_BOT_TOKEN || settings.telegram_bot_token || settings.bot_token || ''
     ).trim(),
-    telegramChatId: String(settings.telegram_chat_id || settings.chat_id || TELEGRAM_CHAT_ID || '').trim(),
+    telegramChatId: String(
+      settings.chat_id || settings.telegram_chat_id || TELEGRAM_CHAT_ID || ''
+    ).trim(),
     lotRequested: Math.max(1, Number(settings.trade_amount ?? settings.amount_per_trade ?? 10)),
     pairs: normalizePairList(settings.enabled_pairs),
     tpPct: Number(settings.take_profit_pct || 2.4),
@@ -1063,17 +1453,13 @@ function dhakaDateKey(now = new Date()) {
 
 let lastDailyReportKey = null;
 
-async function sendDailyPnlReport() {
-  const settings = await fetchSettingsRow();
-  if (!settings) return false;
-  const cfg = resolveTradingConfig(settings);
+/** One midnight report per workspace, delivered to that trader's private chat. */
+async function sendDailyPnlReportFor(settings) {
+  const cfg = await buildUserCfg(settings);
+  if (!cfg.isRunning) return false;
 
   const since = new Date(Date.now() - 24 * 3600_000).toISOString();
-  const { data: rows } = await supabase
-    .from('trades')
-    .select('*')
-    .eq('status', 'CLOSED')
-    .gte('closed_at', since);
+  const { data: rows } = await queryTrades(cfg.scope, { status: 'CLOSED', since });
   const closed = (rows || []).filter((row) => tradeModeOf(row) === cfg.mode);
   const totalTrades = closed.length;
   const wins = closed.filter((row) => Number(row.profit_usdt || 0) > 0).length;
@@ -1083,13 +1469,9 @@ async function sendDailyPnlReport() {
 
   let liveSpot = Number(settings.balance_usdt || 0);
   let liveTotal = liveSpot;
-  const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
-  const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
-  const useTestnet =
-    process.env.BINANCE_TESTNET === 'false' ? false : ENV_TESTNET || Boolean(settings.use_testnet);
-  if (apiKey && apiSecret) {
+  if (cfg.hasCredentials) {
     try {
-      const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
+      const portfolio = await fetchBinancePortfolioUsdt(cfg.apiKey, cfg.apiSecret, cfg.useTestnet);
       if (portfolio) {
         liveSpot = portfolio.spot;
         liveTotal = portfolio.total;
@@ -1123,15 +1505,30 @@ async function sendDailyPnlReport() {
     `🧪 Virtual balance: $${virtualBalance.toFixed(2)} (৳${bdtVirtual.toLocaleString('en-US')})`,
   ];
 
-  if (!cfg.telegramEnabled) return false;
-  await sendTelegram(lines.join('\n'), cfg.telegramToken, cfg.telegramChatId);
+  if (!cfg.telegramEnabled || !cfg.telegramToken || !cfg.telegramChatId) return false;
+  await sendTelegram(lines.join('\n'), cfg.telegramToken, cfg.telegramChatId, {
+    replyMarkup: TELEGRAM_FINANCE_MARKUP,
+  });
   await appendLog(
     'INFO',
-    `[${MODE_LABEL[cfg.mode]}] Daily report sent — ${totalTrades} trades, ${winRate.toFixed(
+    `[${MODE_LABEL[cfg.mode]}] Daily report sent to ${cfg.displayName} — ${totalTrades} trades, ${winRate.toFixed(
       1
     )}% win rate, realized $${realized.toFixed(2)}.`
   );
   return true;
+}
+
+async function sendDailyPnlReport() {
+  const rows = await fetchWorkspaceRows();
+  let sent = 0;
+  for (const row of rows) {
+    try {
+      if (await sendDailyPnlReportFor(row)) sent += 1;
+    } catch (err) {
+      console.warn('[DAILY REPORT] workspace failed:', err.message);
+    }
+  }
+  return sent;
 }
 
 /** Fires once per Dhaka day during the first ten minutes after local midnight. */
@@ -1164,6 +1561,7 @@ let telegramOffsetInitialised = false;
 let telegramPolling = false;
 let telegramBridgeCache = null;
 
+/** Legacy single-tenant row, kept for pre-multi-user projects. */
 async function fetchSettingsRow() {
   const { data, error } = await supabase.from('settings').select('*').limit(1).maybeSingle();
   if (error) {
@@ -1173,14 +1571,311 @@ async function fetchSettingsRow() {
   return data || null;
 }
 
+/** One workspace per `telegram_user_id` (guest browsers use `guest:owner`). */
+async function fetchUserSettings(scope) {
+  const clean = sanitiseScope(scope);
+  if (!clean) return null;
+  const { data, error } = await supabase
+    .from('settings')
+    .select('*')
+    .eq(SCOPE_COLUMN, clean)
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    if (!isMissingColumnError(error)) console.warn('[USERS] read failed:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function fetchUserSettingsByChatId(chatId) {
+  const clean = String(chatId || '').trim();
+  if (!clean) return null;
+  for (const column of ['chat_id', 'telegram_chat_id']) {
+    const { data, error } = await supabase
+      .from('settings')
+      .select('*')
+      .eq(column, clean)
+      .limit(1)
+      .maybeSingle();
+    if (!error && data) return data;
+    if (error && !isMissingColumnError(error)) return null;
+  }
+  return null;
+}
+
+/**
+ * Auto-provisions a fresh DEMO workspace the first time somebody talks to the
+ * bot, so every Telegram user gets an isolated account with no setup step.
+ */
+async function ensureUserProfile({ telegramId, chatId, username, fullName }) {
+  const scope = sanitiseScope(telegramId) || sanitiseScope(chatId) || DEFAULT_OWNER_SCOPE;
+  const existing = await fetchUserSettings(scope);
+  if (existing) {
+    const patch = {};
+    if (chatId && String(existing.chat_id || '') !== String(chatId)) patch.chat_id = String(chatId);
+    if (username && existing.telegram_username !== username) patch.telegram_username = username;
+    if (fullName && existing.full_name !== fullName) patch.full_name = fullName;
+    if (Object.keys(patch).length > 0) {
+      await supabase.from('settings').update(patch).eq('id', existing.id);
+      Object.assign(existing, patch);
+    }
+    return existing;
+  }
+
+  // Pre-multi-user project (no scope column yet): the owner chat keeps the legacy row.
+  if (!telegramId || String(chatId || '') === TELEGRAM_CHAT_ID || scope === DEFAULT_OWNER_SCOPE) {
+    const legacy = await fetchSettingsRow();
+    if (legacy) return legacy;
+  }
+
+  const full = {
+    [SCOPE_COLUMN]: scope,
+    telegram_username: username || null,
+    full_name: fullName || null,
+    chat_id: String(chatId || '') || null,
+    bot_enabled: false,
+    is_running: false,
+    bot_running: false,
+    trading_mode: 'virtual',
+    mode: 'DEMO',
+    virtual_balance: DEMO_START_BALANCE,
+    amount_per_trade: 10,
+    take_profit_pct: 2.4,
+    zero_loss_mode: true,
+    zero_loss_shield: true,
+    sell_only_in_profit: true,
+    dca_enabled: true,
+    dca_step_pct: 1.5,
+    dca_max_buys: 12,
+    max_open_trades: 5,
+    max_amount_per_pair: 500,
+    daily_loss_limit: 150,
+    telegram_enabled: true,
+    enabled_pairs: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'],
+  };
+
+  let { data, error } = await supabase.from('settings').insert(full).select('*').maybeSingle();
+  if (error && isMissingColumnError(error)) {
+    // Pre-upgrade project: keep the identity + chat so commands still work.
+    const minimal = {
+      [SCOPE_COLUMN]: scope,
+      chat_id: String(chatId || '') || null,
+      bot_enabled: false,
+    };
+    ({ data, error } = await supabase.from('settings').insert(minimal).select('*').maybeSingle());
+  }
+  if (error) {
+    console.warn('[USERS] could not create workspace:', error.message);
+    return null;
+  }
+  console.log(`[USERS] Provisioned workspace ${scope} (${fullName || username || 'new trader'}).`);
+  return data || null;
+}
+
+/** Every scoped workspace, falling back to the legacy single row. */
+async function fetchWorkspaceRows() {
+  const { data, error } = await supabase
+    .from('settings')
+    .select('*')
+    .not(SCOPE_COLUMN, 'is', null);
+  if (error) {
+    if (isMissingColumnError(error) || isMissingTableError(error)) {
+      const legacy = await fetchSettingsRow();
+      return legacy ? [legacy] : [];
+    }
+    console.warn('[USERS] could not list workspaces:', error.message);
+    return [];
+  }
+  const rows = (data || []).filter((row) => scopeOf(row));
+  if (rows.length > 0) return rows;
+  // A project upgraded from single-tenant keeps trading the original row.
+  const legacy = await fetchSettingsRow();
+  return legacy ? [legacy] : [];
+}
+
+function isWorkspaceRunning(row) {
+  const flag = row?.is_running ?? row?.bot_running ?? row?.engine_running;
+  return flag === null || flag === undefined ? Boolean(row?.bot_enabled) : Boolean(flag);
+}
+
+/**
+ * Trades are always scoped to the owning workspace. Older schemas without the
+ * column degrade to the legacy global view instead of silently returning zero.
+ */
+async function queryTrades(scope, { status, pair, since } = {}) {
+  const run = async (scoped) => {
+    let q = supabase.from('trades').select('*');
+    if (status) q = q.eq('status', status);
+    if (pair) q = q.eq('pair', pair);
+    if (since) q = q.gte('closed_at', since);
+    if (scoped && scope) q = q.eq(SCOPE_COLUMN, scope);
+    return q;
+  };
+  let res = await run(Boolean(scope));
+  if (res.error && isMissingColumnError(res.error)) res = await run(false);
+  return res;
+}
+
+/**
+ * Recomputes this user's PnL counters plus the `open_positions` / `trade_history`
+ * JSON snapshots kept on their own settings row (used by /pnl and the web UI).
+ */
+async function refreshUserStats(cfg) {
+  if (!cfg?.id) return;
+  const { data, error } = await queryTrades(cfg.scope, { status: 'CLOSED' });
+  if (error || !Array.isArray(data)) return;
+  const total = data.length;
+  const wins = data.filter((row) => Number(row.profit_usdt || 0) > 0).length;
+  const realized = Number(
+    data.reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0).toFixed(2)
+  );
+
+  const { data: openRows } = await queryTrades(cfg.scope, { status: 'OPEN' });
+  const openPositions = (openRows || [])
+    .filter((row) => tradeModeOf(row) === cfg.mode)
+    .map((row) => ({
+      pair: row.pair,
+      quantity: Number(row.quantity || 0),
+      entry_price: Number(row.entry_price || 0),
+      invested_usdt: Number(row.invested_usdt || 0),
+      profit_usdt: Number(row.profit_usdt || 0),
+      opened_at: row.opened_at,
+    }));
+  const tradeHistory = data.slice(-50).map((row) => ({
+    pair: row.pair,
+    exit_price: Number(row.exit_price || 0),
+    invested_usdt: Number(row.invested_usdt || 0),
+    profit_usdt: Number(row.profit_usdt || 0),
+    closed_at: row.closed_at,
+  }));
+
+  const { error: upErr } = await supabase
+    .from('settings')
+    .update({
+      realized_pnl_usd: realized,
+      total_trades: total,
+      win_trades: wins,
+      open_positions: openPositions,
+      trade_history: tradeHistory,
+    })
+    .eq('id', cfg.id);
+  if (upErr && !isMissingColumnError(upErr)) {
+    console.warn('[USERS] stats sync failed:', upErr.message);
+  }
+}
+
+/** Ranked, key-free leaderboard rows shared by Telegram and the web terminal. */
+async function buildLeaderboardRows() {
+  const { data: users, error: usersErr } = await supabase
+    .from('settings')
+    .select('*')
+    .not(SCOPE_COLUMN, 'is', null);
+  if (usersErr) {
+    if (!isMissingColumnError(usersErr) && !isMissingTableError(usersErr)) {
+      console.warn('[LEADERBOARD] users read failed:', usersErr.message);
+    }
+    return [];
+  }
+  const scopedUsers = (users || []).filter((row) => scopeOf(row));
+  if (scopedUsers.length === 0) return [];
+
+  const { data: closed, error: closedErr } = await supabase
+    .from('trades')
+    .select(`${SCOPE_COLUMN},profit_usdt,status`)
+    .eq('status', 'CLOSED');
+  const stats = new Map();
+  if (!closedErr && Array.isArray(closed)) {
+    for (const row of closed) {
+      const scope = String(row[SCOPE_COLUMN] || '').trim();
+      if (!scope) continue;
+      const entry = stats.get(scope) || { pnl: 0, wins: 0, trades: 0 };
+      const pnl = Number(row.profit_usdt || 0);
+      entry.pnl += pnl;
+      entry.trades += 1;
+      if (pnl > 0) entry.wins += 1;
+      stats.set(scope, entry);
+    }
+  }
+
+  return scopedUsers
+    .map((row) => {
+      const scope = scopeOf(row);
+      const stored = stats.get(scope);
+      const trades = stored ? stored.trades : Number(row.total_trades || 0);
+      const wins = stored ? stored.wins : Number(row.win_trades || 0);
+      const pnlUsd = Number((stored ? stored.pnl : Number(row.realized_pnl_usd || 0)).toFixed(2));
+      return {
+        telegram_user_id: scope,
+        name: userLabel(row),
+        username: String(row.telegram_username || '').replace(/^@/, '') || null,
+        mode: settingsModeLabel(row) === 'LIVE' ? 'LIVE' : 'DEMO',
+        running: isWorkspaceRunning(row),
+        trades,
+        wins,
+        win_rate: trades > 0 ? Number(((wins / trades) * 100).toFixed(1)) : 0,
+        pnl_usd: pnlUsd,
+        pnl_bdt: Math.round(pnlUsd * BDT_PER_USD),
+        open_positions: Number(row.open_positions_count || 0),
+      };
+    })
+    .sort((a, b) => b.pnl_usd - a.pnl_usd);
+}
+
+/** `/pnl` payload: realized USD + BDT, win rate, closed trades, live open PnL. */
+async function buildPersonalPnlMessage(settings) {
+  const cfg = await buildUserCfg(settings);
+  const [{ data: closedRows }, { data: openRows }] = await Promise.all([
+    queryTrades(cfg.scope, { status: 'CLOSED' }),
+    queryTrades(cfg.scope, { status: 'OPEN' }),
+  ]);
+  const closed = closedRows || [];
+  const open = openRows || [];
+  const total = closed.length;
+  const wins = closed.filter((row) => Number(row.profit_usdt || 0) > 0).length;
+  const losses = Math.max(0, total - wins);
+  const winRate = total > 0 ? (wins / total) * 100 : 0;
+  const realized = closed.reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
+  const openPnl = open.reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
+  const openInvested = open.reduce((sum, row) => sum + Number(row.invested_usdt || 0), 0);
+
+  let balance = readVirtualBalance(settings);
+  const mode = MODE_LABEL[cfg.mode];
+  if (cfg.mode === 'live' && cfg.hasCredentials) {
+    try {
+      const portfolio = await fetchBinancePortfolioUsdt(cfg.apiKey, cfg.apiSecret, cfg.useTestnet);
+      if (portfolio) balance = portfolio.total;
+    } catch {
+      /* keep the last stored balance */
+    }
+  }
+
+  const sign = (n) => (n >= 0 ? '+' : '-');
+  return [
+    '💰 <b>PERSONAL PROFIT &amp; LOSS</b>',
+    `👤 ${userLabel(settings)} · Workspace <b>${mode}</b>`,
+    '',
+    `📈 Realized PnL: <b>${sign(realized)}$${Math.abs(realized).toFixed(2)}</b> · ৳${Math.abs(
+      Math.round(realized * BDT_PER_USD)
+    ).toLocaleString('en-US')}`,
+    `🎯 Win rate: <b>${winRate.toFixed(1)}%</b> (${wins}W / ${losses}L)`,
+    `🧾 Closed trades: <b>${total}</b>`,
+    `📂 Open positions: <b>${open.length}</b> · ${money(openInvested)} deployed`,
+    `↕️ Open PnL: <b>${sign(openPnl)}$${Math.abs(openPnl).toFixed(2)}</b>`,
+    `🏦 Balance: <b>${money(balance)}</b> (৳${Math.round(balance * BDT_PER_USD).toLocaleString('en-US')})`,
+    '',
+    'Send /leaderboard to see every trader\'s net PnL.',
+  ].join('\n');
+}
+
 async function resolveTelegramBridge() {
-  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+  if (TELEGRAM_BOT_TOKEN) {
     return { token: TELEGRAM_BOT_TOKEN, chatId: TELEGRAM_CHAT_ID };
   }
-  if (telegramBridgeCache?.token && telegramBridgeCache?.chatId) return telegramBridgeCache;
+  if (telegramBridgeCache?.token) return telegramBridgeCache;
   const settings = await fetchSettingsRow();
   telegramBridgeCache = {
-    token: (TELEGRAM_BOT_TOKEN || settings?.telegram_bot_token || settings?.bot_token || '').trim(),
+    token: (settings?.telegram_bot_token || settings?.bot_token || '').trim(),
     chatId: (TELEGRAM_CHAT_ID || settings?.telegram_chat_id || settings?.chat_id || '').trim(),
   };
   return telegramBridgeCache;
@@ -1230,16 +1925,17 @@ function settingsModeLabel(settings) {
   return raw === 'live' || raw === 'real' ? 'LIVE' : 'VIRTUAL';
 }
 
-async function handleTelegramCommand(rawText, token, chatId, operatorName) {
+async function handleTelegramCommand(rawText, token, chatId, operatorName, userSettings = null) {
   const command = String(rawText || '')
     .trim()
     .split(/\s+/)[0]
     .toLowerCase()
     .replace(/@[a-z0-9_]+$/i, '');
 
-  const settings = await fetchSettingsRow();
+  // Every command runs against the caller's own workspace only.
+  const settings = userSettings || (await ensureUserProfile({ telegramId: '', chatId, fullName: operatorName }));
   if (!settings) {
-    await sendTelegram('⚠️ Aegis Quant: Supabase settings row not found — command ignored.', token, chatId);
+    await sendTelegram('⚠️ Aegis Quant: could not load your workspace — command ignored.', token, chatId);
     return;
   }
 
@@ -1250,6 +1946,8 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
         [
           '<b>🛡️ AEGIS QUANT — COMMAND MENU</b>',
           '',
+          '/pnl — your realized profit &amp; loss (USD + BDT)',
+          '/leaderboard — community profit rankings',
           '/balance — live Spot USDT + virtual demo balance',
           '/status — engine state, workspace mode, open positions',
           '/start_bot — start the 24/7 engine (LIVE or VIRTUAL)',
@@ -1257,21 +1955,43 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
           '/mode_live — switch the workspace to LIVE Binance Spot',
           '/mode_demo — switch the workspace to VIRTUAL demo',
           '',
-          `Operator: <b>${operatorName}</b>`,
+          `Trader: <b>${operatorName}</b> · Workspace ${settingsModeLabel(settings)}`,
         ].join('\n'),
         token,
-        chatId
+        chatId,
+        { replyMarkup: TELEGRAM_FINANCE_MARKUP }
+      );
+      return;
+    }
+
+    case '/pnl': {
+      await sendTelegram(await buildPersonalPnlMessage(settings), token, chatId, {
+        replyMarkup: TELEGRAM_FINANCE_MARKUP,
+      });
+      try {
+        await refreshUserStats(await buildUserCfg(settings));
+      } catch {
+        /* counters are a convenience, never a blocker */
+      }
+      return;
+    }
+
+    case '/leaderboard': {
+      const rows = await buildLeaderboardRows();
+      await sendTelegram(
+        buildLeaderboardText(rows, userScopeOf(settings)),
+        token,
+        chatId,
+        { replyMarkup: TELEGRAM_FINANCE_MARKUP }
       );
       return;
     }
 
     case '/balance': {
-      const apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
-      const apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
-      const useTestnet =
-        process.env.BINANCE_TESTNET === 'false'
-          ? false
-          : ENV_TESTNET || Boolean(settings.use_testnet);
+      const cfg = await buildUserCfg(settings);
+      const apiKey = cfg.apiKey;
+      const apiSecret = cfg.apiSecret;
+      const useTestnet = cfg.useTestnet;
       let liveSpot = Number(settings.balance_usdt || 0);
       let note = '';
       if (apiKey && apiSecret) {
@@ -1304,15 +2024,11 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
     }
 
     case '/status': {
-      const engineRunning =
-        settings.is_running === null || settings.is_running === undefined
-          ? Boolean(settings.engine_running ?? settings.bot_enabled)
-          : Boolean(settings.is_running);
+      const engineRunning = isWorkspaceRunning(settings);
       const modeLabel = settingsModeLabel(settings);
-      const { data: openRows, error: openErr } = await supabase
-        .from('trades')
-        .select('*')
-        .eq('status', 'OPEN');
+      const { data: openRows, error: openErr } = await queryTrades(userScopeOf(settings), {
+        status: 'OPEN',
+      });
       const openCount = openErr
         ? 0
         : (openRows || []).filter(
@@ -1354,6 +2070,7 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
       const result = await updateSettingsWithFallback(settings.id, {
         engine_running: true,
         is_running: true,
+        bot_running: true,
         bot_enabled: true,
       });
       if (!result.ok) {
@@ -1377,6 +2094,7 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
       const result = await updateSettingsWithFallback(settings.id, {
         engine_running: false,
         is_running: false,
+        bot_running: false,
         bot_enabled: false,
       });
       if (!result.ok) {
@@ -1436,7 +2154,7 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName) {
  * ------------------------------------------------------------------------- */
 
 async function buildLiveStatusMessage(cfg, settings) {
-  const { data: openRows } = await supabase.from('trades').select('*').eq('status', 'OPEN');
+  const { data: openRows } = await queryTrades(cfg.scope, { status: 'OPEN' });
   const positions = (openRows || []).filter((row) => tradeModeOf(row) === cfg.mode);
   const openPnl = positions.reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
   const invested = positions.reduce((sum, row) => sum + Number(row.invested_usdt || 0), 0);
@@ -1487,12 +2205,11 @@ async function buildLiveStatusMessage(cfg, settings) {
  * the Telegram keyboard: LIVE sells the real Spot quantity first, DEMO settles
  * the paper P&L. Replies with the realized result (and the PnL card on profit).
  */
-async function closeSymbolFromTelegram(symbol, cfg, token, chatId) {
-  const { data: openRows, error: openErr } = await supabase
-    .from('trades')
-    .select('*')
-    .eq('status', 'OPEN')
-    .eq('pair', symbol);
+async function closeSymbolFromTelegram(symbol, cfg, token, chatId, settings = null) {
+  const { data: openRows, error: openErr } = await queryTrades(cfg.scope, {
+    status: 'OPEN',
+    pair: symbol,
+  });
   if (openErr) {
     await sendTelegram(`⚠️ Could not read open ${symbol} positions: ${openErr.message}`, token, chatId);
     return;
@@ -1564,10 +2281,12 @@ async function closeSymbolFromTelegram(symbol, cfg, token, chatId) {
   }
 
   if (cfg.mode === 'virtual') {
-    const settings = await fetchSettingsRow();
-    const balance = readVirtualBalance(settings || {});
+    const row = settings || (await fetchUserSettings(cfg.scope)) || {};
+    const balance = readVirtualBalance(row);
     await writeVirtualBalance(cfg.id, balance + invested + realized, cfg);
   }
+  // Keep this trader's P&L / win-rate counters current for the leaderboard.
+  await refreshUserStats(cfg);
 
   const avgEntry =
     invested > 0
@@ -1615,27 +2334,48 @@ async function closeSymbolFromTelegram(symbol, cfg, token, chatId) {
   }
 }
 
-async function handleTelegramCallback(callbackQuery, token, chatId) {
+async function handleTelegramCallback(callbackQuery, token) {
   const id = String(callbackQuery?.id || '');
   const data = String(callbackQuery?.data || '');
+  const from = callbackQuery?.from || {};
   const incomingChatId = String(callbackQuery?.message?.chat?.id ?? '').trim();
-  if (incomingChatId !== chatId) {
-    await answerCallbackQuery(token, id, 'Unauthorized chat', true);
+
+  // The tap belongs to whoever pressed it — resolve THEIR workspace, not the owner's.
+  const settings = await ensureUserProfile({
+    telegramId: from.id ? String(from.id) : '',
+    chatId: incomingChatId,
+    username: from.username || null,
+    fullName: [from.first_name, from.last_name].filter(Boolean).join(' '),
+  });
+  if (!settings) {
+    await answerCallbackQuery(token, id, 'Workspace not found', true);
+    return;
+  }
+  const cfg = await buildUserCfg(settings);
+  const chatId = cfg.telegramChatId || incomingChatId;
+  if (!chatId) {
+    await answerCallbackQuery(token, id, 'No private chat linked to this workspace', true);
     return;
   }
 
-  const settings = await fetchSettingsRow();
-  if (!settings) {
-    await answerCallbackQuery(token, id, 'Settings row not found', true);
+  if (data === 'pnl') {
+    await answerCallbackQuery(token, id, 'Building your P&L report…');
+    await sendTelegram(await buildPersonalPnlMessage(settings), token, chatId, {
+      replyMarkup: TELEGRAM_FINANCE_MARKUP,
+    });
     return;
   }
-  const cfg = resolveTradingConfig(settings);
-  cfg.id = settings.id;
-  cfg.apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
-  cfg.apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
-  cfg.useTestnet =
-    process.env.BINANCE_TESTNET === 'false' ? false : ENV_TESTNET || Boolean(settings.use_testnet);
-  cfg.hasCredentials = Boolean(cfg.apiKey && cfg.apiSecret);
+
+  if (data === 'leaderboard') {
+    await answerCallbackQuery(token, id, 'Loading leaderboard…');
+    await sendTelegram(
+      buildLeaderboardText(await buildLeaderboardRows(), userScopeOf(settings)),
+      token,
+      chatId,
+      { replyMarkup: TELEGRAM_FINANCE_MARKUP }
+    );
+    return;
+  }
 
   if (data === 'refresh_status') {
     await answerCallbackQuery(token, id, 'Refreshing live snapshot…');
@@ -1659,7 +2399,7 @@ async function handleTelegramCallback(callbackQuery, token, chatId) {
       return;
     }
     await answerCallbackQuery(token, id, `Closing ${symbol}…`);
-    await closeSymbolFromTelegram(symbol, cfg, token, chatId);
+    await closeSymbolFromTelegram(symbol, cfg, token, chatId, settings);
     return;
   }
 
@@ -1670,8 +2410,8 @@ async function pollTelegramUpdates() {
   if (telegramPolling) return;
   telegramPolling = true;
   try {
-    const { token, chatId } = await resolveTelegramBridge();
-    if (!token || !chatId) return;
+    const { token } = await resolveTelegramBridge();
+    if (!token) return;
 
     // Skip the backlog once at boot so a restart never replays days-old commands.
     if (!telegramOffsetInitialised) {
@@ -1713,8 +2453,10 @@ async function pollTelegramUpdates() {
       }
       const callbackQuery = update?.callback_query;
       if (callbackQuery) {
-        console.log(`[TELEGRAM BOT] Callback ${callbackQuery.data} from chat ${callbackQuery?.message?.chat?.id}`);
-        await handleTelegramCallback(callbackQuery, token, chatId);
+        console.log(
+          `[TELEGRAM BOT] Callback ${callbackQuery.data} from ${callbackQuery?.from?.id} (chat ${callbackQuery?.message?.chat?.id})`
+        );
+        await handleTelegramCallback(callbackQuery, token);
         continue;
       }
 
@@ -1723,18 +2465,25 @@ async function pollTelegramUpdates() {
       if (!text) continue;
 
       const incomingChatId = String(message?.chat?.id ?? '').trim();
-      if (incomingChatId !== chatId) {
-        console.warn(`[TELEGRAM BOT] Ignored command from unauthorized chat ${incomingChatId || 'unknown'}.`);
+      if (!incomingChatId) continue;
+      const from = message?.from || {};
+      const senderName =
+        [from.first_name, from.last_name].filter(Boolean).join(' ') ||
+        (from.username ? `@${from.username}` : 'Trader');
+      // Each sender is provisioned/looked up independently — no shared owner chat.
+      const senderSettings = await ensureUserProfile({
+        telegramId: from.id ? String(from.id) : '',
+        chatId: incomingChatId,
+        username: from.username || null,
+        fullName: senderName,
+      });
+      if (!senderSettings) {
+        console.warn(`[TELEGRAM BOT] No workspace resolved for chat ${incomingChatId} — ignored.`);
         continue;
       }
 
-      console.log(`[TELEGRAM BOT] Command from ${incomingChatId}: ${text}`);
-      await handleTelegramCommand(
-        text,
-        token,
-        incomingChatId,
-        String(message?.from?.first_name || 'Operator')
-      );
+      console.log(`[TELEGRAM BOT] Command from ${incomingChatId} (${senderName}): ${text}`);
+      await handleTelegramCommand(text, token, incomingChatId, senderName, senderSettings);
     }
   } catch (err) {
     const msg = String(err?.message || err);
@@ -1748,15 +2497,15 @@ async function pollTelegramUpdates() {
 }
 
 async function startTelegramCommandLoop() {
-  const { token, chatId } = await resolveTelegramBridge();
-  if (!token || !chatId) {
+  const { token } = await resolveTelegramBridge();
+  if (!token) {
     console.warn(
-      '[TELEGRAM BOT] Command listener idle — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured yet. Retrying in 60s.'
+      '[TELEGRAM BOT] Command listener idle — TELEGRAM_BOT_TOKEN not configured yet. Retrying in 60s.'
     );
     setTimeout(() => void startTelegramCommandLoop(), 60_000).unref?.();
     return;
   }
-  console.log('[TELEGRAM BOT] Command listener online — long polling, authorized chat only.');
+  console.log('[TELEGRAM BOT] Command listener online — multi-user long polling on @TaseenMarketBot.');
   for (;;) {
     await pollTelegramUpdates();
     await sleep(1_200);
@@ -1784,10 +2533,11 @@ function buildTradeRow({ mode, symbol, price, quantity, notional, tpPct, zeroLos
   };
 }
 
-async function insertTradeWithMode(row, mode) {
-  let { error } = await supabase.from('trades').insert({ ...row, mode });
+async function insertTradeWithMode(row, mode, scope = null) {
+  const payload = { ...row, mode, ...(scope ? { [SCOPE_COLUMN]: scope } : {}) };
+  let { error } = await supabase.from('trades').insert(payload);
   if (error && isMissingColumnError(error)) {
-    const { mode: _ignored, ...legacyRow } = row;
+    const { mode: _ignored, [SCOPE_COLUMN]: _ignoredScope, ...legacyRow } = payload;
     ({ error } = await supabase.from('trades').insert(legacyRow));
   }
   if (error) {
@@ -1802,25 +2552,36 @@ const VIRTUAL_BALANCE_START = 10_000;
 // Written in this order; the first column that accepts a write becomes the one we read back.
 const VIRTUAL_BALANCE_COLUMNS = ['virtual_balance', 'demo_balance'];
 let virtualBalanceColumn = VIRTUAL_BALANCE_COLUMNS[0];
-let virtualBalanceMemory = null;
-let virtualBalanceHeldInMemory = false;
+/** Per-workspace in-process balances: one user's paper cash never leaks into another's. */
+const virtualBalanceMemory = new Map();
+const virtualBalanceHeldInMemory = new Set();
+
+function balanceKey(settingsOrId) {
+  const id =
+    settingsOrId && typeof settingsOrId === 'object' ? settingsOrId.id : settingsOrId;
+  return String(id ?? 'default');
+}
 
 function readVirtualBalance(settings) {
   // While no column accepts writes, the in-process balance is the only source of truth,
   // otherwise every cycle would resurrect the stale DB value and restart the paper P&L.
-  if (virtualBalanceHeldInMemory && virtualBalanceMemory !== null) return virtualBalanceMemory;
-  const stored = Number(settings[virtualBalanceColumn] ?? settings.virtual_balance ?? settings.demo_balance);
+  const key = balanceKey(settings);
+  if (virtualBalanceHeldInMemory.has(key) && virtualBalanceMemory.has(key)) {
+    return virtualBalanceMemory.get(key);
+  }
+  const stored = Number(settings?.[virtualBalanceColumn] ?? settings?.virtual_balance ?? settings?.demo_balance);
   if (Number.isFinite(stored)) {
-    virtualBalanceMemory = stored;
+    virtualBalanceMemory.set(key, stored);
     return stored;
   }
-  if (virtualBalanceMemory !== null) return virtualBalanceMemory;
+  if (virtualBalanceMemory.has(key)) return virtualBalanceMemory.get(key);
   return VIRTUAL_BALANCE_START;
 }
 
 async function writeVirtualBalance(settingsId, balance, cfg = null) {
   const value = Math.max(0, Number(balance.toFixed(2)));
-  virtualBalanceMemory = value;
+  const key = balanceKey(settingsId);
+  virtualBalanceMemory.set(key, value);
 
   let lastError = null;
   for (const column of VIRTUAL_BALANCE_COLUMNS) {
@@ -1833,8 +2594,8 @@ async function writeVirtualBalance(settingsId, balance, cfg = null) {
         console.warn(`[DEMO BALANCE] Persisting paper balance in settings.${column}.`);
       }
       virtualBalanceColumn = column;
-      if (virtualBalanceHeldInMemory) {
-        virtualBalanceHeldInMemory = false;
+      if (virtualBalanceHeldInMemory.has(key)) {
+        virtualBalanceHeldInMemory.delete(key);
         await appendLog('INFO', `[${MODE_LABEL[cfg?.mode] || 'DEMO'}] Paper balance persistence restored — ${money(value)} saved to settings.${column}.`);
       }
       return value;
@@ -1844,8 +2605,8 @@ async function writeVirtualBalance(settingsId, balance, cfg = null) {
   }
 
   const reason = lastError?.message || 'no writable settings column';
-  if (!virtualBalanceHeldInMemory) {
-    virtualBalanceHeldInMemory = true;
+  if (!virtualBalanceHeldInMemory.has(key)) {
+    virtualBalanceHeldInMemory.add(key);
     console.warn(
       `[DEMO BALANCE] ${reason} — holding paper balance in memory so DEMO trades and P&L keep accumulating.`
     );
@@ -1859,23 +2620,13 @@ async function writeVirtualBalance(settingsId, balance, cfg = null) {
   return value;
 }
 
-async function runCycle() {
+/**
+ * Runs the full trading engine for ONE workspace using that user's own mode,
+ * credentials, risk settings and trade history. Nothing is shared across users.
+ */
+async function runCycleForUser(settings) {
   try {
-    const { data: settings, error: setErr } = await supabase
-      .from('settings')
-      .select('*')
-      .limit(1)
-      .maybeSingle();
-
-    if (setErr || !settings) return;
-
-    const cfg = resolveTradingConfig(settings);
-    cfg.id = settings.id;
-    cfg.apiKey = (ENV_BINANCE_KEY || settings.binance_api_key || '').trim();
-    cfg.apiSecret = (ENV_BINANCE_SECRET || settings.binance_api_secret || '').trim();
-    cfg.useTestnet =
-      process.env.BINANCE_TESTNET === 'false' ? false : ENV_TESTNET || Boolean(settings.use_testnet);
-    cfg.hasCredentials = Boolean(cfg.apiKey && cfg.apiSecret);
+    const cfg = await buildUserCfg(settings);
     const label = MODE_LABEL[cfg.mode];
 
     const heartbeatPatch = { last_heartbeat: new Date().toISOString() };
@@ -1889,8 +2640,9 @@ async function runCycle() {
         if (portfolio) {
           liveSpot = portfolio.spot;
           heartbeatPatch.balance_usdt = portfolio.total;
-          if (lastLoggedBalance !== portfolio.total) {
-            lastLoggedBalance = portfolio.total;
+          const balanceKeyId = cfg.scope || 'owner';
+          if (lastLoggedBalance.get(balanceKeyId) !== portfolio.total) {
+            lastLoggedBalance.set(balanceKeyId, portfolio.total);
             const logMsg = `[BALANCE SYNC] Portfolio $${portfolio.total.toFixed(2)} — Spot $${portfolio.spot.toFixed(2)} (tradeable) · Funding $${portfolio.funding.toFixed(2)} · Earn $${portfolio.earn.toFixed(2)}`;
             console.log(logMsg);
             await appendLog('INFO', logMsg);
@@ -1905,7 +2657,7 @@ async function runCycle() {
 
     if (!cfg.isRunning) return; // Standby: heartbeat only, never place orders.
 
-    const { data: openRows } = await supabase.from('trades').select('*').eq('status', 'OPEN');
+    const { data: openRows } = await queryTrades(cfg.scope, { status: 'OPEN' });
     const activeTrades = (openRows || []).filter((row) => tradeModeOf(row) === cfg.mode);
 
     const symbolsToFetch = Array.from(
@@ -1954,11 +2706,10 @@ async function runCycle() {
     let dailyLossBreached = false;
     if (cfg.dailyMaxLossPct > 0) {
       try {
-        const { data: closedToday } = await supabase
-          .from('trades')
-          .select('id,mode,trading_mode,profit_usdt,closed_at')
-          .eq('status', 'CLOSED')
-          .gte('closed_at', dhakaDayStartUtc().toISOString());
+        const { data: closedToday } = await queryTrades(cfg.scope, {
+          status: 'CLOSED',
+          since: dhakaDayStartUtc().toISOString(),
+        });
         const realizedToday = (closedToday || [])
           .filter((row) => tradeModeOf(row) === cfg.mode)
           .reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
@@ -2080,6 +2831,8 @@ async function runCycle() {
               : trailingTriggered
                 ? 'TRAILING STOP EXIT'
                 : 'STOP-LOSS EXIT';
+            // Every settlement refreshes THIS user's leaderboard counters.
+            await refreshUserStats(cfg);
             const msg = `${tag} ${symbol} (${closedCount} orders) @ $${livePx} | Net PnL ${
               netPnlAfterFees >= 0 ? '+' : ''
             }$${netPnlAfterFees.toFixed(2)} (${aggPct >= 0 ? '+' : ''}${aggPct.toFixed(2)}%)`;
@@ -2154,7 +2907,7 @@ async function runCycle() {
                 zeroLoss: cfg.zeroLoss,
                 stopLossPct: cfg.stopLossPct,
               });
-              if (!(await insertTradeWithMode(row, 'live'))) continue;
+              if (!(await insertTradeWithMode(row, 'live', cfg.scope))) continue;
               liveSpot = Math.max(0, liveSpot - buy.notional);
             } else {
               if (virtualBalance < dcaNotional) {
@@ -2178,7 +2931,7 @@ async function runCycle() {
                 zeroLoss: cfg.zeroLoss,
                 stopLossPct: cfg.stopLossPct,
               });
-              if (!(await insertTradeWithMode(row, 'virtual'))) continue;
+              if (!(await insertTradeWithMode(row, 'virtual', cfg.scope))) continue;
               virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - dcaNotional, cfg);
             }
             activeTrades.push(row);
@@ -2266,7 +3019,7 @@ async function runCycle() {
               zeroLoss: cfg.zeroLoss,
               stopLossPct: cfg.stopLossPct,
             });
-            if (!(await insertTradeWithMode(row, 'live'))) continue;
+            if (!(await insertTradeWithMode(row, 'live', cfg.scope))) continue;
             liveSpot = Math.max(0, liveSpot - buy.notional);
           } else {
             if (virtualBalance < entryNotional) {
@@ -2290,7 +3043,7 @@ async function runCycle() {
               zeroLoss: cfg.zeroLoss,
               stopLossPct: cfg.stopLossPct,
             });
-            if (!(await insertTradeWithMode(row, 'virtual'))) continue;
+            if (!(await insertTradeWithMode(row, 'virtual', cfg.scope))) continue;
             virtualBalance = await writeVirtualBalance(cfg.id, virtualBalance - entryNotional, cfg);
           }
 
@@ -2315,15 +3068,53 @@ async function runCycle() {
         }
       }
     }
+
+    // One snapshot per cycle keeps open_positions / trade_history in step with
+    // the actual ledger for this user (and powers the web P&L panel).
+    await refreshUserStats(cfg);
   } catch (err) {
     console.error('[CYCLE ERROR]', err.message);
-    await appendLog('ERROR', `Worker cycle error: ${err.message}`);
+    await appendLog('ERROR', `Worker cycle error for ${userLabel(settings)}: ${err.message}`);
+  }
+}
+
+let lastActiveWorkspaceCount = -1;
+
+/** Multi-user driver: executes every workspace whose engine is switched ON. */
+async function runCycle() {
+  try {
+    const rows = await fetchWorkspaceRows();
+    if (rows.length === 0) return;
+
+    // Standby workspaces still get a heartbeat so their terminal shows a live engine clock.
+    const stamp = new Date().toISOString();
+    for (const row of rows.filter((r) => !isWorkspaceRunning(r))) {
+      await supabase.from('settings').update({ last_heartbeat: stamp }).eq('id', row.id);
+    }
+
+    const active = rows.filter(isWorkspaceRunning);
+    if (active.length !== lastActiveWorkspaceCount) {
+      lastActiveWorkspaceCount = active.length;
+      console.log(
+        `[CYCLE] Executing ${active.length} active workspace(s) out of ${rows.length} registered trader(s).`
+      );
+    }
+    for (const row of active) {
+      try {
+        await runCycleForUser(row);
+      } catch (err) {
+        console.error(`[CYCLE ERROR] workspace ${scopeOf(row) || row.id}:`, err.message);
+        await appendLog('ERROR', `Worker cycle error (${userLabel(row)}): ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.error('[CYCLE ERROR]', err.message);
   }
 }
 
 async function startWorker() {
   console.log(
-    '[AEGIS WORKER] Started — 24/7 engine for LIVE + DEMO/VIRTUAL modes. Polling Supabase settings every 15s...'
+    '[AEGIS WORKER] Started — multi-user 24/7 engine. Each telegram_user_id runs with its own mode, keys and risk profile; polling every 15s...'
   );
   await logServerPublicIp();
   void startTelegramCommandLoop();

@@ -100,6 +100,16 @@ export interface BinanceAccountSummary {
 
 export interface BotSettings {
   id: number | string;
+  /** Supabase workspace key: Telegram user id, or `guest:owner` in a browser. */
+  telegram_user_id?: string | null;
+  telegram_username?: string | null;
+  full_name?: string | null;
+  chat_id?: string | null;
+  /** Multi-user mirror of `bot_enabled` consumed by the 24/7 worker. */
+  bot_running?: boolean;
+  realized_pnl_usd?: number;
+  total_trades?: number;
+  win_trades?: number;
   bot_enabled: boolean;
   amount_per_trade: number;
   take_profit_pct: number;
@@ -139,6 +149,36 @@ export interface BotSettings {
 }
 
 /** Pair currently paused by the worker's flash-crash circuit breaker. */
+/** Ranked public trader stats — never contains keys or balances. */
+export interface LeaderboardEntry {
+  telegram_user_id: string;
+  name: string;
+  username: string | null;
+  mode: 'LIVE' | 'DEMO';
+  running: boolean;
+  trades: number;
+  wins: number;
+  win_rate: number;
+  pnl_usd: number;
+  pnl_bdt: number;
+}
+
+/** Masked per-user Binance key vault status returned by the worker. */
+export interface UserApiKeyStatus {
+  linked: boolean;
+  api_key_masked: string | null;
+  use_testnet: boolean;
+  updated_at?: string | null;
+}
+
+/** Identity card shown in the terminal for the active workspace owner. */
+export interface WorkspaceUser {
+  telegramUserId: string;
+  displayName: string;
+  username: string | null;
+  isTelegram: boolean;
+}
+
 export interface CrashGuardState {
   symbol: string;
   dropPct: number;
