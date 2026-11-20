@@ -10,6 +10,7 @@ import {
   Layers,
   LineChart,
   Lock,
+  LogIn,
   Power,
   RefreshCw,
   Settings as SettingsIcon,
@@ -17,6 +18,8 @@ import {
   ShieldCheck,
   Terminal,
   Trophy,
+  UserPlus,
+  X,
 } from 'lucide-react';
 import { AdminPanel } from './components/screens/AdminPanel';
 import { CommandCenter } from './components/screens/CommandCenter';
@@ -59,6 +62,8 @@ export default function App() {
   const [bootComplete, setBootComplete] = useState(false);
   const [pendingLiveConfirm, setPendingLiveConfirm] = useState(false);
   const [showLeaderboard, setShowLeaderboard] = useState(false);
+  const [showAccountGate, setShowAccountGate] = useState(false);
+  const [authIntent, setAuthIntent] = useState<'SIGNIN' | 'SIGNUP'>('SIGNIN');
   const [bgPredator, setBgPredator] = useState<BackgroundPresetId>(() => {
     if (typeof window === 'undefined') return 'tiger';
     try {
@@ -82,6 +87,14 @@ export default function App() {
   }, []);
 
   const terminal = useTradingTerminal();
+  // Guests browse the terminal and paper-trade DEMO; money actions ask for an account.
+  const terminalUnlocked = terminal.isAuthenticated || terminal.isGuest;
+  const requireAccount = useCallback(() => setShowAccountGate(true), []);
+  const openAuth = useCallback((intent: 'SIGNIN' | 'SIGNUP') => {
+    setAuthIntent(intent);
+    setShowAccountGate(false);
+    terminal.exitGuestMode();
+  }, [terminal.exitGuestMode]);
   const [engineToggling, setEngineToggling] = useState(false);
   const engineRunning = terminal.botStatus === 'RUNNING';
 
@@ -137,6 +150,10 @@ export default function App() {
 
   const handleRequestWorkspaceSwitch = (target: TradingMode) => {
     if (target === terminal.activeWorkspace) return;
+    if (target === 'LIVE' && !terminal.isAuthenticated) {
+      requireAccount();
+      return;
+    }
     if (target === 'LIVE') {
       audioSynth.playClick();
       setPendingLiveConfirm(true);
@@ -147,6 +164,10 @@ export default function App() {
 
   const handleEngineToggle = useCallback(async () => {
     if (engineToggling) return;
+    if (!terminal.isAuthenticated && terminal.activeWorkspace === 'LIVE') {
+      requireAccount();
+      return;
+    }
     telegramHaptic('light');
     audioSynth.playToggle(!engineRunning);
     setEngineToggling(true);
@@ -155,7 +176,7 @@ export default function App() {
     } finally {
       setEngineToggling(false);
     }
-  }, [engineToggling, engineRunning, terminal.toggleBot]);
+  }, [engineToggling, engineRunning, requireAccount, terminal.activeWorkspace, terminal.isAuthenticated, terminal.toggleBot]);
 
   const handleDockWorkspace = (target: TradingMode) => {
     if (target === terminal.activeWorkspace) return;
@@ -302,7 +323,7 @@ export default function App() {
           </div>
 
           {/* Desktop Navigation Tabs */}
-          {terminal.isAuthenticated && (
+          {terminalUnlocked && (
             <nav
               aria-label="Primary Navigation"
               className="hidden lg:flex items-center gap-1"
@@ -341,7 +362,7 @@ export default function App() {
 
           {/* Right Controls: Isolated VIRTUAL / LIVE Switcher + Live Balance Pill + Audio + Language + Lock */}
           <div className="flex items-center gap-2 shrink-0">
-            {terminal.isAuthenticated && (
+            {terminalUnlocked && (
               <div className="hidden sm:flex">
                 <AudioStatusPill
                   ready={terminal.audioReady}
@@ -350,7 +371,7 @@ export default function App() {
                 />
               </div>
             )}
-            {terminal.isAuthenticated && (
+            {terminalUnlocked && (
               <div className="hidden items-center gap-1.5 md:flex">
                 <div className="flex items-center rounded-lg border border-slate-800 bg-[#080b12] p-0.5">
                   <button
@@ -464,18 +485,21 @@ export default function App() {
               <span className="hidden sm:inline">{lang === 'en' ? 'বাংলা' : 'EN'}</span>
             </button>
 
-            {terminal.isAuthenticated && (
+            {terminalUnlocked && (
               <button
                 type="button"
                 onClick={() => {
                   audioSynth.playClick();
-                  terminal.signOut();
+                  if (terminal.isGuest) terminal.exitGuestMode();
+                  else terminal.signOut();
                 }}
-                title={t.signOutBtn}
+                title={terminal.isGuest ? 'Sign in or register' : t.signOutBtn}
                 className="tap-target flex min-h-[36px] cursor-pointer items-center gap-1 rounded-lg border border-slate-700/80 bg-[#090d16] px-2.5 py-1 font-mono-tech text-[11px] text-slate-300 transition-colors hover:border-rose-400/60 hover:text-rose-300 whitespace-nowrap"
               >
                 <Lock className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">{t.signOutBtn}</span>
+                <span className="hidden sm:inline">
+                  {terminal.isGuest ? 'Sign In' : t.signOutBtn}
+                </span>
               </button>
             )}
           </div>
@@ -514,14 +538,16 @@ export default function App() {
             onRefresh={terminal.refreshAccount}
             onSignOut={terminal.signOut}
           />
-        ) : !terminal.isAuthenticated ? (
+        ) : !terminalUnlocked ? (
           <LoginScreen
             t={t}
             isSupabaseConfigured={terminal.isSupabaseConfigured}
+            initialMode={authIntent}
             onSignIn={terminal.signIn}
             onSignUp={terminal.signUp}
-            onResetPassword={terminal.resetPassword}
-            onEnterDemo={terminal.enterDemoMode}
+            onRequestResetCode={terminal.requestPasswordResetCode}
+            onConfirmResetCode={terminal.confirmPasswordResetCode}
+            onEnterDemo={terminal.enterGuestMode}
             onReplayBoot={() => setBootComplete(false)}
           />
         ) : (
@@ -668,9 +694,13 @@ export default function App() {
                   onVerifyBinance={terminal.verifyBinanceCredentials}
                   workspaceUser={terminal.workspaceUser}
                   account={terminal.account}
+                  isGuest={terminal.isGuest}
+                  onRequireAccount={requireAccount}
+                  onChangePassword={terminal.changePassword}
                   onUpdateProfile={terminal.updateUserProfile}
                   apiKeyStatus={terminal.apiKeyStatus}
                   onSaveUserBinanceKeys={terminal.saveUserBinanceKeys}
+                  onSaveAndVerifyKeys={terminal.saveAndVerifyUserBinanceKeys}
                   onTestUserBinance={terminal.testUserBinanceConnection}
                   voiceEnabled={terminal.voiceEnabled}
                   onToggleVoice={terminal.toggleVoice}
@@ -729,6 +759,69 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Account Required gate: LIVE trading, key vault and live engine */}
+      <AnimatePresence>
+        {showAccountGate && (
+          <motion.div
+            initial={reducedMotion ? false : { opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={reducedMotion ? undefined : { opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="account-required-title"
+          >
+            <motion.div
+              initial={reducedMotion ? false : { scale: 0.94, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={reducedMotion ? undefined : { scale: 0.94, opacity: 0 }}
+              className="relative w-full max-w-md rounded-2xl border border-cyan-500/50 bg-[#070b12] p-6 shadow-[0_0_50px_-10px_rgba(34,211,238,0.45)]"
+            >
+              <button
+                type="button"
+                onClick={() => setShowAccountGate(false)}
+                aria-label="Close"
+                className="absolute top-3 right-3 rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:text-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+              <div className="flex items-center gap-2 text-cyan-300">
+                <Lock className="h-5 w-5" />
+                <h3
+                  id="account-required-title"
+                  className="font-display text-lg font-bold tracking-wider uppercase"
+                >
+                  Account Required
+                </h3>
+              </div>
+              <p className="mt-3 text-xs leading-relaxed text-slate-300">
+                Live trading, your Binance Spot keys and 24/7 automated execution run inside a
+                private, admin-approved workspace. Virtual Demo stays free — keep exploring, or
+                create an account to go LIVE.
+              </p>
+              <ul className="mt-3 space-y-1 font-mono-tech text-[11px] text-slate-400">
+                <li>• Register with full name, photo, email, password and Telegram chat ID</li>
+                <li>• An admin approves your account instantly from @TaseenMarketBot</li>
+                <li>• Then save keys once and see your real USDT + BDT balance immediately</li>
+              </ul>
+              <div className="mt-5 flex flex-wrap items-center justify-end gap-2">
+                <NeonButton variant="ghost" onClick={() => setShowAccountGate(false)}>
+                  Keep Browsing
+                </NeonButton>
+                <NeonButton variant="cyan" onClick={() => openAuth('SIGNIN')}>
+                  <LogIn className="h-3.5 w-3.5" />
+                  Log In
+                </NeonButton>
+                <NeonButton variant="emerald" onClick={() => openAuth('SIGNUP')}>
+                  <UserPlus className="h-3.5 w-3.5" />
+                  Register
+                </NeonButton>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Community P&L leaderboard (aggregates only — keys stay private) */}
       <LeaderboardModal
         open={showLeaderboard}
@@ -757,7 +850,7 @@ export default function App() {
       </footer>
 
       {/* Floating Mini App Dock — workspace switch + center engine action */}
-      {terminal.isAuthenticated && (
+      {terminalUnlocked && (
         <div className="fixed inset-x-0 bottom-0 z-40 lg:hidden">
           <div className="pointer-events-none absolute inset-x-0 bottom-0 h-36 bg-gradient-to-t from-[#070b10] via-[#070b10]/80 to-transparent" />
           <div className="relative mx-auto w-full max-w-md px-3">

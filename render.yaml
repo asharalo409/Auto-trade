@@ -9,6 +9,8 @@ services:
         source: /*
         destination: /index.html
     envVars:
+      - key: VITE_WORKER_URL
+        value: https://aegis-quant-worker-eu.onrender.com
       - key: VITE_SUPABASE_URL
         sync: false
       - key: VITE_SUPABASE_ANON_KEY

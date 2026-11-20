@@ -71,7 +71,14 @@ interface SettingsPanelProps {
   }) => Promise<{ ok: boolean; detail: string }>;
   apiKeyStatus: UserApiKeyStatus;
   onSaveUserBinanceKeys: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
+  onSaveAndVerifyKeys: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
   onTestUserBinance: () => Promise<{ ok: boolean; detail: string }>;
+  isGuest: boolean;
+  onRequireAccount: () => void;
+  onChangePassword: (
+    currentPassword: string,
+    newPassword: string
+  ) => Promise<{ ok: boolean; detail: string }>;
   voiceEnabled: boolean;
   onToggleVoice: (enabled: boolean) => void;
   onTestVoice: () => void;
@@ -103,7 +110,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   onUpdateProfile,
   apiKeyStatus,
   onSaveUserBinanceKeys,
+  onSaveAndVerifyKeys,
   onTestUserBinance,
+  isGuest,
+  onRequireAccount,
+  onChangePassword,
   voiceEnabled,
   onToggleVoice,
   onTestVoice,
@@ -125,6 +136,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const profileFileRef = useRef<HTMLInputElement | null>(null);
   const [savingVault, setSavingVault] = useState(false);
   const [testingVault, setTestingVault] = useState(false);
+  const [pwCurrent, setPwCurrent] = useState('');
+  const [pwNext, setPwNext] = useState('');
+  const [pwConfirm, setPwConfirm] = useState('');
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwFeedback, setPwFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [testingTg, setTestingTg] = useState(false);
   const [sendingBalTg, setSendingBalTg] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
@@ -240,6 +256,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
 
   const handleSendBalFromBinancePanel = async () => {
     audioSynth.playClick();
+    if (isGuest) {
+      onRequireAccount();
+      return;
+    }
     setSendingBalTg(true);
     setBnFeedback(null);
     onSaveTelegram(tgDraft);
@@ -259,28 +279,71 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   };
 
   const handleVerifyBn = async () => {
-    onSaveBinance(bnDraft);
-    const res = await onVerifyBinance(bnDraft);
-    setBnFeedback({ ok: res.ok, text: res.detail });
-  };
-
-  const handleSaveVault = async () => {
+    if (isGuest) {
+      onRequireAccount();
+      return;
+    }
     audioSynth.playClick();
     onSaveBinance(bnDraft);
     setSavingVault(true);
     setVaultFeedback(null);
-    const res = await onSaveUserBinanceKeys(bnDraft);
+    const res = await onVerifyBinance(bnDraft);
+    setSavingVault(false);
+    setVaultFeedback({ ok: res.ok, text: res.detail });
+  };
+
+  /** Save both keys, then immediately verify + load the real portfolio in place. */
+  const handleSaveVault = async () => {
+    audioSynth.playClick();
+    if (isGuest) {
+      onRequireAccount();
+      return;
+    }
+    onSaveBinance(bnDraft);
+    setSavingVault(true);
+    setVaultFeedback(null);
+    const res = await onSaveAndVerifyKeys(bnDraft);
     setSavingVault(false);
     setVaultFeedback({ ok: res.ok, text: res.detail });
   };
 
   const handleTestVault = async () => {
     audioSynth.playClick();
+    if (isGuest) {
+      onRequireAccount();
+      return;
+    }
     setTestingVault(true);
     setVaultFeedback(null);
     const res = await onTestUserBinance();
     setTestingVault(false);
     setVaultFeedback({ ok: res.ok, text: res.detail });
+  };
+
+  const handleChangePassword = async () => {
+    audioSynth.playClick();
+    setPwFeedback(null);
+    if (!pwCurrent || !pwNext) {
+      setPwFeedback({ ok: false, text: 'Enter your current and new password.' });
+      return;
+    }
+    if (pwNext.length < 8) {
+      setPwFeedback({ ok: false, text: 'New password must be at least 8 characters.' });
+      return;
+    }
+    if (pwNext !== pwConfirm) {
+      setPwFeedback({ ok: false, text: 'The two new passwords do not match.' });
+      return;
+    }
+    setPwBusy(true);
+    const res = await onChangePassword(pwCurrent, pwNext);
+    setPwBusy(false);
+    setPwFeedback({ ok: res.ok, text: res.detail });
+    if (res.ok) {
+      setPwCurrent('');
+      setPwNext('');
+      setPwConfirm('');
+    }
   };
 
   const handleCopySql = async () => {
@@ -430,6 +493,100 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               }`}
             >
               {profileFeedback.text}
+            </div>
+          )}
+        </TerminalPanel>
+      )}
+
+      {/* Account Security: self-service password change (Supabase Auth owns the hash) */}
+      {account && (
+        <TerminalPanel
+          accent="crimson"
+          title="ACCOUNT SECURITY"
+          subtitle="Change the password you sign in with"
+        >
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div>
+              <label
+                htmlFor="pw-current"
+                className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
+              >
+                Current Password
+              </label>
+              <input
+                id="pw-current"
+                type="password"
+                value={pwCurrent}
+                onChange={(e) => setPwCurrent(e.target.value)}
+                autoComplete="current-password"
+                placeholder="••••••••"
+                className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-rose-400 focus:outline-none"
+              />
+            </div>
+            <div>
+              <label
+                htmlFor="pw-new"
+                className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
+              >
+                New Password
+              </label>
+              <input
+                id="pw-new"
+                type="password"
+                value={pwNext}
+                onChange={(e) => setPwNext(e.target.value)}
+                autoComplete="new-password"
+                placeholder="Min. 8 characters"
+                className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-rose-400 focus:outline-none"
+              />
+            </div>
+            <div>
+              <label
+                htmlFor="pw-confirm"
+                className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
+              >
+                Confirm New Password
+              </label>
+              <input
+                id="pw-confirm"
+                type="password"
+                value={pwConfirm}
+                onChange={(e) => setPwConfirm(e.target.value)}
+                autoComplete="new-password"
+                placeholder="Repeat new password"
+                className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-rose-400 focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <NeonButton
+              type="button"
+              variant="rose"
+              disabled={pwBusy}
+              onClick={() => void handleChangePassword()}
+              className="min-h-[36px] px-3 py-1 text-[11px]"
+            >
+              <KeyRound className="h-3.5 w-3.5" />
+              {pwBusy ? 'UPDATING PASSWORD...' : 'CHANGE PASSWORD'}
+            </NeonButton>
+          </div>
+
+          <p className="mt-2 font-mono-tech text-[10px] leading-relaxed text-slate-500">
+            The current password is verified first; the new one is hashed and stored by Supabase
+            Auth against your account row. Forgot it instead? Use Forgot Password? on the sign-in
+            screen — @TaseenMarketBot DMs a 6-digit reset code.
+          </p>
+
+          {pwFeedback && (
+            <div
+              className={`mt-3 rounded-lg border px-2.5 py-1.5 font-mono-tech text-[11px] ${
+                pwFeedback.ok
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+              }`}
+            >
+              {pwFeedback.text}
             </div>
           )}
         </TerminalPanel>
@@ -1350,29 +1507,47 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         }
       >
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-          {/* Per-user workspace + private Binance key vault */}
+          {/* One unified Binance Spot API & Secret Vault (form + status + live balance) */}
           <div className="space-y-3 rounded-xl border border-amber-500/35 bg-gradient-to-br from-amber-500/[0.08] via-[#05070d]/95 to-emerald-500/[0.06] p-4 lg:col-span-2">
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-amber-200">
                 <ShieldCheck className="h-4 w-4" />
-                <span>YOUR WORKSPACE &amp; PRIVATE KEY VAULT</span>
+                <span>BINANCE SPOT API &amp; SECRET VAULT</span>
+                <InfoTip text={t.helpBinance} label="BINANCE SPOT API" />
               </div>
-              <span
-                className={`rounded border px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase ${
-                  apiKeyStatus.linked
-                    ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-300'
-                    : 'border-slate-600 bg-slate-800/60 text-slate-400'
-                }`}
-              >
-                {apiKeyStatus.linked ? 'KEYS LINKED' : 'NO KEYS LINKED'}
-              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = { ...bnDraft, use_testnet: !bnDraft.use_testnet };
+                    setBnDraft(next);
+                    onSaveBinance(next);
+                  }}
+                  className={`cursor-pointer rounded border px-2 py-0.5 font-mono-tech text-[10px] font-semibold uppercase ${
+                    bnDraft.use_testnet
+                      ? 'border-amber-400/60 bg-amber-500/15 text-amber-300'
+                      : 'border-emerald-400/60 bg-emerald-500/15 text-emerald-300'
+                  }`}
+                >
+                  {bnDraft.use_testnet ? 'TESTNET' : 'SPOT MAINNET'}
+                </button>
+                <span
+                  className={`rounded border px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase ${
+                    apiKeyStatus.linked
+                      ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-300'
+                      : 'border-slate-600 bg-slate-800/60 text-slate-400'
+                  }`}
+                >
+                  {apiKeyStatus.linked
+                    ? `LINKED${apiKeyStatus.api_key_masked ? ` · ${apiKeyStatus.api_key_masked}` : ''}`
+                    : 'NO KEYS LINKED'}
+                </span>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 gap-2 font-mono-tech text-[11px] sm:grid-cols-3">
               <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
-                <div className="text-[9px] tracking-wider text-slate-500 uppercase">
-                  Workspace ID
-                </div>
+                <div className="text-[9px] tracking-wider text-slate-500 uppercase">Workspace ID</div>
                 <div className="truncate text-slate-100">{workspaceUser.telegramUserId}</div>
               </div>
               <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
@@ -1392,11 +1567,52 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               </div>
             </div>
 
-            <p className="font-mono-tech text-[10px] leading-relaxed text-slate-400">
-              Every Telegram user owns an isolated workspace: their own mode, risk limits, virtual
-              balance and trade history. The Binance secret is written to the worker's private
-              vault and is never returned to any browser — only this masked preview is.
-            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div>
+                <label
+                  htmlFor="binance-api-key"
+                  className="mb-1 block font-mono-tech text-[11px] text-slate-400"
+                >
+                  Binance API Key
+                </label>
+                <input
+                  id="binance-api-key"
+                  type={showSecrets ? 'text' : 'password'}
+                  value={bnDraft.api_key}
+                  onChange={(e) => {
+                    const next = { ...bnDraft, api_key: e.target.value, verified: false };
+                    setBnDraft(next);
+                    onSaveBinance(next);
+                  }}
+                  placeholder="Paste your Binance Spot API Key"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="binance-api-secret"
+                  className="mb-1 block font-mono-tech text-[11px] text-slate-400"
+                >
+                  Binance API Secret
+                </label>
+                <input
+                  id="binance-api-secret"
+                  type={showSecrets ? 'text' : 'password'}
+                  value={bnDraft.api_secret}
+                  onChange={(e) => {
+                    const next = { ...bnDraft, api_secret: e.target.value, verified: false };
+                    setBnDraft(next);
+                    onSaveBinance(next);
+                  }}
+                  placeholder="Paste your Binance Spot API Secret"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
+                />
+              </div>
+            </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <NeonButton
@@ -1407,7 +1623,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 className="min-h-[36px] px-3 py-1 text-[11px]"
               >
                 <KeyRound className="h-3.5 w-3.5" />
-                {savingVault ? 'SAVING TO VAULT...' : 'SAVE KEYS TO MY VAULT'}
+                {savingVault ? 'SAVING & VERIFYING...' : 'SAVE & VERIFY KEYS'}
               </NeonButton>
               <NeonButton
                 type="button"
@@ -1419,7 +1635,32 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 <Activity className="h-3.5 w-3.5" />
                 {testingVault ? 'TESTING...' : 'TEST CONNECTION'}
               </NeonButton>
+              <NeonButton
+                type="button"
+                variant="cyan"
+                disabled={savingVault}
+                onClick={handleVerifyBn}
+                className="min-h-[36px] px-3 py-1 text-[11px]"
+              >
+                {savingVault ? 'VERIFYING...' : 'VERIFY KEYS'}
+              </NeonButton>
+              <NeonButton
+                type="button"
+                variant="emerald"
+                disabled={sendingBalTg}
+                onClick={handleSendBalFromBinancePanel}
+                className="min-h-[36px] px-3 py-1 text-[11px]"
+              >
+                <Send className="h-3.5 w-3.5" />
+                {sendingBalTg ? 'SENDING...' : 'VIEW BALANCE IN TELEGRAM'}
+              </NeonButton>
             </div>
+
+            <p className="font-mono-tech text-[10px] leading-relaxed text-slate-400">
+              {isGuest
+                ? 'Guest mode: register an account to save real Binance keys. Virtual Demo trading stays free without an account.'
+                : 'Both values are written to the worker’s private vault and never returned to a browser — only the mask above is. Saving verifies the keys, flips the badge to LINKED and loads your real portfolio (Spot USDT + held coins, converted to USD & BDT) immediately.'}
+            </p>
 
             {vaultFeedback && (
               <div
@@ -1432,10 +1673,45 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 {vaultFeedback.text}
               </div>
             )}
-          </div>
 
+            {binanceAccount?.connected && (
+              <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-2.5 font-mono-tech text-[10px]">
+                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 font-bold">
+                  <span className="text-emerald-300">REAL BINANCE PORTFOLIO</span>
+                  <span className="text-emerald-200">
+                    ${binanceAccount.totalPortfolioUsd.toFixed(2)} USD · ৳
+                    {Math.round(binanceAccount.totalPortfolioUsd * BDT_PER_USD).toLocaleString(
+                      'en-US'
+                    )}{' '}
+                    BDT
+                  </span>
+                </div>
+                <div className="mb-1.5 flex flex-wrap gap-x-3 gap-y-1 text-slate-300">
+                  <span>Spot USDT ${(binanceAccount.spotUsd ?? 0).toFixed(2)}</span>
+                  <span>Held coins ${(binanceAccount.spotCoinsUsd ?? 0).toFixed(2)}</span>
+                  <span className={canFundOrders ? 'text-emerald-300' : 'text-amber-300'}>
+                    {t.tradeableUsdtLabel}: ${tradeableUsdt.toFixed(2)}
+                  </span>
+                </div>
+                {binanceAccount.assets.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {binanceAccount.assets.slice(0, 8).map((a) => (
+                      <span
+                        key={a.asset}
+                        className="rounded border border-slate-700/80 bg-[#090d16] px-2 py-0.5 text-slate-200"
+                      >
+                        {a.asset}: {a.total} (${a.usdValue.toFixed(2)})
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-amber-300">{t.liveBalanceEmptyZero}</div>
+                )}
+              </div>
+            )}
+          </div>
           {/* Telegram Bot Integration */}
-          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d]/90 p-4">
+          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d]/90 p-4 lg:col-span-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-cyan-300">
                 <Send className="h-4 w-4" />
@@ -1547,137 +1823,6 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             )}
           </div>
 
-          {/* Binance API Key & Secret */}
-          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#05070d]/90 p-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-amber-300">
-                <KeyRound className="h-4 w-4" />
-                <span>BINANCE SPOT API</span>
-                <InfoTip text={t.helpBinance} label="BINANCE SPOT API" />
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  const next = { ...bnDraft, use_testnet: !bnDraft.use_testnet };
-                  setBnDraft(next);
-                  onSaveBinance(next);
-                }}
-                className={`cursor-pointer rounded border px-2 py-0.5 font-mono-tech text-[10px] font-semibold uppercase ${
-                  bnDraft.use_testnet
-                    ? 'border-amber-400/60 bg-amber-500/15 text-amber-300'
-                    : 'border-emerald-400/60 bg-emerald-500/15 text-emerald-300'
-                }`}
-              >
-                {bnDraft.use_testnet ? 'TESTNET' : 'SPOT MAINNET'}
-              </button>
-            </div>
-
-            <div>
-              <label className="mb-1 block font-mono-tech text-[11px] text-slate-400">
-                {t.binanceKeyLabel}
-              </label>
-              <input
-                type={showSecrets ? 'text' : 'password'}
-                value={bnDraft.api_key}
-                onChange={(e) => {
-                  const next = { ...bnDraft, api_key: e.target.value, verified: false };
-                  setBnDraft(next);
-                  onSaveBinance(next);
-                }}
-                placeholder="Binance Spot API Key..."
-                className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <label className="mb-1 block font-mono-tech text-[11px] text-slate-400">
-                {t.binanceSecretLabel}
-              </label>
-              <input
-                type={showSecrets ? 'text' : 'password'}
-                value={bnDraft.api_secret}
-                onChange={(e) => {
-                  const next = { ...bnDraft, api_secret: e.target.value, verified: false };
-                  setBnDraft(next);
-                  onSaveBinance(next);
-                }}
-                placeholder="Binance Spot API Secret..."
-                className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
-              />
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <NeonButton
-                  type="button"
-                  variant="amber"
-                  disabled={syncingBalance}
-                  onClick={handleVerifyBn}
-                  className="min-h-[36px] px-3 py-1 text-[11px]"
-                >
-                  {syncingBalance ? 'SYNCING BINANCE...' : t.verifyBinanceBtn}
-                </NeonButton>
-
-                <NeonButton
-                  type="button"
-                  variant="emerald"
-                  disabled={sendingBalTg || syncingBalance}
-                  onClick={handleSendBalFromBinancePanel}
-                  className="min-h-[36px] px-3 py-1 text-[11px]"
-                >
-                  <Send className="h-3.5 w-3.5" />
-                  <span>{sendingBalTg ? 'SENDING...' : t.viewRealMoneyTelegramBtn}</span>
-                </NeonButton>
-              </div>
-
-              {binanceAccount?.connected && (
-                <span className="font-mono-tech text-[11px] font-bold text-emerald-300">
-                  {t.portfolioLabel}: ${binanceAccount.totalPortfolioUsd.toFixed(2)} USD · ৳
-                  {Math.round(binanceAccount.totalPortfolioUsd * BDT_PER_USD).toLocaleString('en-US')}
-                </span>
-              )}
-            </div>
-
-            {bnFeedback && (
-              <div
-                className={`rounded-lg border px-2.5 py-1.5 font-mono-tech text-[11px] ${
-                  bnFeedback.ok
-                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                    : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                }`}
-              >
-                {bnFeedback.text}
-              </div>
-            )}
-
-            {binanceAccount?.connected && (
-              <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-2.5 font-mono-tech text-[10px]">
-                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 font-bold">
-                  <span className="text-emerald-300">REAL BINANCE HOLDINGS</span>
-                  <span className={canFundOrders ? 'text-emerald-300' : 'text-amber-300'}>
-                    {t.tradeableUsdtLabel}: ${tradeableUsdt.toFixed(2)}
-                  </span>
-                </div>
-                {!canFundOrders && (
-                  <div className="mb-1.5 text-amber-300">{t.tradeableHint}</div>
-                )}
-                {binanceAccount.assets.length > 0 ? (
-                  <div className="flex flex-wrap gap-1.5">
-                    {binanceAccount.assets.slice(0, 6).map((a) => (
-                      <span
-                        key={a.asset}
-                        className="rounded border border-slate-700/80 bg-[#090d16] px-2 py-0.5 text-slate-200"
-                      >
-                        {a.asset}: {a.total} (${a.usdValue.toFixed(2)})
-                      </span>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="text-amber-300">{t.liveBalanceEmptyZero}</div>
-                )}
-              </div>
-            )}
-          </div>
         </div>
       </TerminalPanel>
 

@@ -1,6 +1,16 @@
 import React, { useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { Camera, CheckCircle2, Lock, Play, ShieldAlert, Terminal, UserPlus } from 'lucide-react';
+import {
+  Camera,
+  CheckCircle2,
+  KeyRound,
+  Lock,
+  Play,
+  Send,
+  ShieldAlert,
+  Terminal,
+  UserPlus,
+} from 'lucide-react';
 import { audioSynth } from '../../lib/audioSynth';
 import { avatarInitials, fileToAvatarDataUrl } from '../../lib/avatar';
 import { checkEmailWithApyhub } from '../../lib/emailValidation';
@@ -21,11 +31,17 @@ interface LoginScreenProps {
       telegramUsername?: string | null;
     }
   ) => Promise<{ error: string | null; message?: string }>;
-  onResetPassword: (
-    email: string
-  ) => Promise<{ error: string | null; message?: string }>;
+  /** Step 1 of the Telegram reset: @TaseenMarketBot DMs a 6-digit code. */
+  onRequestResetCode: (email: string) => Promise<{ ok: boolean; detail: string }>;
+  /** Step 2: verify that code and set the new password. */
+  onConfirmResetCode: (
+    email: string,
+    code: string,
+    newPassword: string
+  ) => Promise<{ ok: boolean; detail: string }>;
   onEnterDemo: () => void;
   onReplayBoot: () => void;
+  initialMode?: 'SIGNIN' | 'SIGNUP';
 }
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({
@@ -33,13 +49,19 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   isSupabaseConfigured,
   onSignIn,
   onSignUp,
-  onResetPassword,
+  onRequestResetCode,
+  onConfirmResetCode,
   onEnterDemo,
   onReplayBoot,
+  initialMode = 'SIGNIN',
 }) => {
   const reducedMotion = useReducedMotion();
   const telegramIdentity = resolveWorkspaceIdentity();
-  const [authMode, setAuthMode] = useState<'SIGNIN' | 'SIGNUP'>('SIGNIN');
+  const [authMode, setAuthMode] = useState<'SIGNIN' | 'SIGNUP'>(initialMode);
+  const [resetStage, setResetStage] = useState<'idle' | 'code'>('idle');
+  const [resetCode, setResetCode] = useState('');
+  const [resetPassword, setResetPassword] = useState('');
+  const [resetBusy, setResetBusy] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -129,11 +151,40 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setError('আগে আপনার ইমেইল লিখুন।');
       return;
     }
-    setLoading(true);
-    const res = await onResetPassword(email.trim());
-    setLoading(false);
-    if (res.error) setError(res.error);
-    else if (res.message) setInfoMsg(res.message);
+    setResetBusy(true);
+    const res = await onRequestResetCode(email.trim());
+    setResetBusy(false);
+    if (!res.ok) {
+      setError(res.detail);
+      return;
+    }
+    setResetStage('code');
+    setInfoMsg(res.detail);
+  };
+
+  const handleConfirmReset = async () => {
+    setError(null);
+    setInfoMsg(null);
+    if (!/^\d{6}$/.test(resetCode.trim())) {
+      setError('Telegram-এ পাঠানো ৬ ডিজিটের কোডটি দিন। (Enter the 6-digit code.)');
+      return;
+    }
+    if (resetPassword.length < 8) {
+      setError('নতুন পাসওয়ার্ড কমপক্ষে ৮ অক্ষরের হতে হবে।');
+      return;
+    }
+    setResetBusy(true);
+    const res = await onConfirmResetCode(email.trim(), resetCode.trim(), resetPassword);
+    setResetBusy(false);
+    if (!res.ok) {
+      setError(res.detail);
+      return;
+    }
+    setResetStage('idle');
+    setResetCode('');
+    setResetPassword('');
+    setPassword('');
+    setInfoMsg(res.detail);
   };
 
   return (
@@ -424,14 +475,71 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               </NeonButton>
             )}
 
-            {isSupabaseConfigured && authMode === 'SIGNIN' && (
+            {isSupabaseConfigured && authMode === 'SIGNIN' && resetStage === 'idle' && (
               <button
                 type="button"
-                onClick={handleForgot}
-                className="cursor-pointer text-right font-mono-tech text-[11px] text-cyan-400 hover:underline"
+                onClick={() => void handleForgot()}
+                disabled={resetBusy}
+                className="flex cursor-pointer items-center justify-end gap-1.5 font-mono-tech text-[11px] text-cyan-400 hover:underline disabled:opacity-60"
               >
-                Reset / Forgot Password?
+                <Send className="h-3 w-3" />
+                {resetBusy ? 'SENDING CODE...' : 'Forgot Password? (Telegram code)'}
               </button>
+            )}
+
+            {isSupabaseConfigured && resetStage === 'code' && (
+              <div className="space-y-2.5 rounded-xl border border-cyan-500/35 bg-cyan-500/[0.06] p-3">
+                <div className="flex items-center gap-1.5 font-mono-tech text-[11px] font-bold text-cyan-200 uppercase">
+                  <KeyRound className="h-3.5 w-3.5" />
+                  Telegram Password Reset
+                </div>
+                <p className="font-mono-tech text-[10px] leading-relaxed text-slate-400">
+                  Open @TaseenMarketBot — the 6-digit code for{' '}
+                  <span className="text-slate-200">{email.trim() || 'your email'}</span> was sent to
+                  your registered chat.
+                </p>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={resetCode}
+                  onChange={(e) => setResetCode(e.target.value.replace(/\D/g, ''))}
+                  placeholder="6-digit code"
+                  autoComplete="one-time-code"
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 font-mono-tech text-sm tracking-[0.4em] text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
+                />
+                <input
+                  type="password"
+                  value={resetPassword}
+                  onChange={(e) => setResetPassword(e.target.value)}
+                  placeholder="New password (min. 8 characters)"
+                  autoComplete="new-password"
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setResetStage('idle');
+                      setResetCode('');
+                      setResetPassword('');
+                      setInfoMsg(null);
+                    }}
+                    className="cursor-pointer font-mono-tech text-[10px] text-slate-400 hover:text-slate-200"
+                  >
+                    Cancel
+                  </button>
+                  <NeonButton
+                    type="button"
+                    variant="cyan"
+                    disabled={resetBusy}
+                    onClick={() => void handleConfirmReset()}
+                    className="min-h-[36px] px-3 py-1 text-[11px]"
+                  >
+                    {resetBusy ? 'UPDATING...' : 'SET NEW PASSWORD'}
+                  </NeonButton>
+                </div>
+              </div>
             )}
 
             <NeonButton
@@ -441,8 +549,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               className="w-full"
             >
               <Play className="h-3.5 w-3.5" />
-              {t.enterDemoBtn}
+              Continue as Guest · Virtual Demo
             </NeonButton>
+            <p className="text-center font-mono-tech text-[10px] leading-relaxed text-slate-500">
+              Guests can browse live charts and paper-trade. LIVE mode and Binance keys ask you to
+              register or log in.
+            </p>
           </div>
         </form>
       </motion.div>

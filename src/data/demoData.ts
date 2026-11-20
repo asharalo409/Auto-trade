@@ -293,6 +293,17 @@ create trigger users_bootstrap_first_admin after insert on public.users
 update public.users set is_admin = true, approval_status = 'approved'
   where email in ('billahtaseen@gmail.com', 'taseenbillah409@gmail.com');
 
+-- Telegram password-reset codes: hashed, 10-minute lifetime, worker-only access.
+-- RLS is on with NO policy, so no browser can ever read a code.
+create table if not exists public.password_reset_otps (
+  email text primary key,
+  code_hash text not null,
+  expires_at timestamptz not null,
+  attempts integer not null default 0,
+  created_at timestamptz not null default now()
+);
+alter table public.password_reset_otps enable row level security;
+
 -- Leaderboard read model is exposed by the worker (/api/leaderboard), which returns
 -- aggregates only: names, mode, win rate and net PnL — no keys, no balances.
 alter table public.trades add column if not exists peak_price numeric;`;

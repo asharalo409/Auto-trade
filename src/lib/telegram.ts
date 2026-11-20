@@ -1,5 +1,10 @@
 import { TelegramConfig } from '../types/trading';
 
+/** The 24/7 worker serves /api/*; the static frontend origin returns index.html. */
+const WORKER_URL =
+  (import.meta.env.VITE_WORKER_URL as string | undefined) ||
+  'https://aegis-quant-worker-eu.onrender.com';
+
 /** Every alert carries a Mini App shortcut back into the terminal. */
 const TELEGRAM_MINI_APP_URL = 'https://auto-trade-qxp7.onrender.com';
 const TELEGRAM_OPEN_TERMINAL_MARKUP = {
@@ -41,7 +46,7 @@ export async function dispatchTelegramAlert(
     });
   }
 
-  const proxyEndpoint = '/api/telegram/send';
+  const proxyEndpoint = `${WORKER_URL}/api/telegram/send`;
   console.info('[Telegram] Sending payload via proxy:', {
     endpoint: proxyEndpoint,
     maskedToken,
@@ -84,7 +89,7 @@ export async function dispatchTelegramAlert(
           messageId: proxyData.messageId ?? null,
         };
       }
-      if (proxyRes.status !== 404) {
+      if (proxyRes.status !== 404 && proxyRes.status !== 405) {
         console.error('[Telegram] Proxy returned API error:', {
           status: proxyRes.status,
           errorCode: proxyData.errorCode ?? null,
@@ -101,7 +106,9 @@ export async function dispatchTelegramAlert(
       }
       console.warn('[Telegram] Proxy returned 404 — falling back to direct Telegram Bot API');
     } else {
-      console.warn('[Telegram] Proxy returned non-JSON response:', {
+      // A static host answers /api/* with index.html (HTTP 200). That is not a
+      // Telegram rejection — go straight to the Bot API instead of reporting it.
+      console.warn('[Telegram] Proxy returned non-JSON response, using direct Bot API:', {
         status: proxyRes.status,
         contentType,
       });

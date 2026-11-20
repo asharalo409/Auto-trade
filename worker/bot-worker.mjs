@@ -24,6 +24,10 @@ const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || '').trim();
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim();
 /** Account/approval table (one row per Supabase Auth user). */
 const USERS_TABLE = 'users';
+/** Short-lived 6-digit Telegram password-reset codes (service-role only). */
+const PASSWORD_RESET_TABLE = 'password_reset_otps';
+const PASSWORD_RESET_TTL_MINUTES = 10;
+const PASSWORD_RESET_MAX_ATTEMPTS = 5;
 const TELEGRAM_MINI_APP_URL = (
   process.env.TELEGRAM_MINI_APP_URL || 'https://auto-trade-qxp7.onrender.com'
 ).trim();
@@ -176,6 +180,14 @@ async function loadUserApiKeys(scope) {
     useTestnet: Boolean(data.use_testnet),
     updatedAt: data.updated_at || null,
   };
+}
+
+/** Codes are stored hashed so the reset table never holds a usable OTP. */
+function hashResetCode(email, code) {
+  return crypto
+    .createHash('sha256')
+    .update(`${String(email || '').trim().toLowerCase()}:${String(code || '').trim()}`)
+    .digest('hex');
 }
 
 function scopeForAccount(accountId) {
@@ -615,9 +627,15 @@ const PORT = Number(process.env.PORT || 10000);
 if (PORT > 0) {
   http
     .createServer(async (req, res) => {
+      // The terminal is served from a different origin (Render static site), so every
+      // API call — including the Supabase Bearer session — must pass CORS preflight.
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-MBX-APIKEY');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Authorization, apikey, x-client-info, X-MBX-APIKEY'
+      );
+      res.setHeader('Access-Control-Max-Age', '86400');
 
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
@@ -653,6 +671,65 @@ if (PORT > 0) {
             guards: describeCrashGuards(),
           })
         );
+        return;
+      }
+
+      // Server-side Telegram proxy for the web terminal and Mini App. The static
+      // frontend origin has no API routes, so /api/telegram/send must live here.
+      if (req.method === 'POST' && pathname === '/api/telegram/send') {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            const rawToken = String(data.botToken || data.bot_token || '')
+              .trim()
+              .replace(/^["']|["']$/g, '')
+              .replace(/^bot/i, '')
+              .trim();
+            const chatId = String(data.chatId || data.chat_id || '').trim();
+            const text = String(data.text || '').trim();
+            if (!rawToken || !chatId || !text) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, detail: 'Missing botToken, chatId or text' }));
+              return;
+            }
+            const tgRes = await fetch(`https://api.telegram.org/bot${rawToken}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text,
+                parse_mode: 'HTML',
+                disable_web_page_preview: true,
+                reply_markup: data.replyMarkup ?? data.reply_markup ?? undefined,
+              }),
+            });
+            const tgData = await tgRes.json().catch(() => ({}));
+            if (!tgRes.ok || tgData.ok === false) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  detail: tgData.description || `Telegram HTTP ${tgRes.status}`,
+                  errorCode: tgData.error_code ?? null,
+                })
+              );
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                detail: 'Dispatched to Telegram ✓',
+                messageId: tgData.result?.message_id ?? null,
+              })
+            );
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, detail: err.message }));
+          }
+        });
         return;
       }
 
@@ -705,10 +782,13 @@ if (PORT > 0) {
                 ok: true,
                 usdtBalance: portfolio.total,
                 totalPortfolioUsd: portfolio.total,
-                usdtFree: portfolio.spot,
+                usdtFree: portfolio.usdtFree,
+                usdtLocked: portfolio.usdtLocked,
                 spotUsd: portfolio.spot,
+                spotCoinsUsd: portfolio.spotCoins,
                 fundingUsd: portfolio.funding,
                 earnUsd: portfolio.earn,
+                assets: portfolio.assets,
                 message: `Binance API verified successfully. Portfolio balance: $${portfolio.total.toFixed(2)} (Spot $${portfolio.spot.toFixed(2)})`,
               })
             );
@@ -764,12 +844,20 @@ if (PORT > 0) {
           }
 
           let spotUsdt = Number(settingsRow.balance_usdt || 0);
+          let usdtFree = spotUsdt;
+          let usdtLocked = 0;
+          let spotCoins = 0;
+          let assets = [];
           let fundingUsd = 0;
           let earnUsd = 0;
           if (apiKey && apiSecret) {
             const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
             if (portfolio) {
               spotUsdt = portfolio.spot;
+              usdtFree = portfolio.usdtFree;
+              usdtLocked = portfolio.usdtLocked;
+              spotCoins = portfolio.spotCoins;
+              assets = portfolio.assets;
               fundingUsd = portfolio.funding;
               earnUsd = portfolio.earn;
             }
@@ -786,14 +874,16 @@ if (PORT > 0) {
             JSON.stringify({
               ok: true,
               usdtBalance: totalPortfolioUsd,
-              usdtFree: spotUsdt,
+              usdtFree,
+              usdtLocked,
               totalUsdt: totalPortfolioUsd,
               totalPortfolioUsd,
               spotUsd: spotUsdt,
+              spotCoinsUsd: spotCoins,
               fundingUsd,
               earnUsd,
               walletBreakdown,
-              assets: [],
+              assets,
             })
           );
         } catch (err) {
@@ -1001,10 +1091,13 @@ if (PORT > 0) {
                 ok: true,
                 usdtBalance: portfolio.total,
                 totalPortfolioUsd: portfolio.total,
-                usdtFree: portfolio.spot,
+                usdtFree: portfolio.usdtFree,
+                usdtLocked: portfolio.usdtLocked,
                 spotUsd: portfolio.spot,
+                spotCoinsUsd: portfolio.spotCoins,
                 fundingUsd: portfolio.funding,
                 earnUsd: portfolio.earn,
+                assets: portfolio.assets,
                 api_key_masked: maskSecret(stored.apiKey),
                 use_testnet: useTestnet,
               })
@@ -1140,6 +1233,182 @@ if (PORT > 0) {
                 status: result.status,
                 email: result.user?.email || null,
               })
+            );
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      /* ------------------------------------------------------------------ *
+       * Password reset over Telegram: a 6-digit code is DM'd by @TaseenMarketBot
+       * to the account's registered chat, then the worker sets the new password.
+       * ------------------------------------------------------------------ */
+
+      if (req.method === 'POST' && pathname === '/api/auth/reset-request') {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', async () => {
+          const generic = {
+            ok: true,
+            message:
+              'If that email has a Telegram chat linked, a 6-digit reset code was sent by @TaseenMarketBot.',
+          };
+          try {
+            const data = JSON.parse(body || '{}');
+            const email = String(data.email || '').trim().toLowerCase();
+            if (!email) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Email is required' }));
+              return;
+            }
+
+            const { data: account } = await supabase
+              .from(USERS_TABLE)
+              .select('id,email,full_name,telegram_chat_id')
+              .eq('email', email)
+              .maybeSingle();
+
+            if (!account?.telegram_chat_id) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(generic));
+              return;
+            }
+
+            const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+            const expiresAt = new Date(
+              Date.now() + PASSWORD_RESET_TTL_MINUTES * 60_000
+            ).toISOString();
+            const { error: storeError } = await supabase.from(PASSWORD_RESET_TABLE).upsert(
+              {
+                email,
+                code_hash: hashResetCode(email, code),
+                expires_at: expiresAt,
+                attempts: 0,
+                created_at: new Date().toISOString(),
+              },
+              { onConflict: 'email' }
+            );
+            if (storeError) throw new Error(storeError.message);
+
+            const delivered = await sendTelegram(
+              [
+                '🔐 <b>AEGIS QUANT PASSWORD RESET</b>',
+                '',
+                `Hi ${account.full_name || 'Trader'}, your one-time reset code is:`,
+                `<code>${code}</code>`,
+                '',
+                `It expires in ${PASSWORD_RESET_TTL_MINUTES} minutes. If you did not request this, ignore this message — your password stays unchanged.`,
+              ].join('\n'),
+              TELEGRAM_BOT_TOKEN,
+              account.telegram_chat_id,
+              { replyMarkup: null }
+            );
+            if (!delivered) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error:
+                    'Telegram could not deliver the code. Open @TaseenMarketBot, send /start, and try again.',
+                })
+              );
+              return;
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(generic));
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/auth/reset-confirm') {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            const email = String(data.email || '').trim().toLowerCase();
+            const code = String(data.code || '').trim();
+            const newPassword = String(data.new_password || data.newPassword || '');
+
+            if (!email || !/^\d{6}$/.test(code)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Enter the 6-digit code sent on Telegram' }));
+              return;
+            }
+            if (newPassword.length < 8) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({ ok: false, error: 'New password must be at least 8 characters' })
+              );
+              return;
+            }
+
+            const { data: row } = await supabase
+              .from(PASSWORD_RESET_TABLE)
+              .select('*')
+              .eq('email', email)
+              .maybeSingle();
+            if (!row || !row.code_hash) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Request a new reset code first' }));
+              return;
+            }
+            if (new Date(row.expires_at).getTime() < Date.now()) {
+              await supabase.from(PASSWORD_RESET_TABLE).delete().eq('email', email);
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'That code expired — request a new one' }));
+              return;
+            }
+            if (Number(row.attempts || 0) >= PASSWORD_RESET_MAX_ATTEMPTS) {
+              await supabase.from(PASSWORD_RESET_TABLE).delete().eq('email', email);
+              res.writeHead(429, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({ ok: false, error: 'Too many wrong codes — request a new one' })
+              );
+              return;
+            }
+            if (row.code_hash !== hashResetCode(email, code)) {
+              await supabase
+                .from(PASSWORD_RESET_TABLE)
+                .update({ attempts: Number(row.attempts || 0) + 1 })
+                .eq('email', email);
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Incorrect reset code' }));
+              return;
+            }
+
+            const { data: account } = await supabase
+              .from(USERS_TABLE)
+              .select('id,email')
+              .eq('email', email)
+              .maybeSingle();
+            if (!account?.id) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'No account found for that email' }));
+              return;
+            }
+
+            const { error: authError } = await supabase.auth.admin.updateUserById(account.id, {
+              password: newPassword,
+            });
+            if (authError) throw new Error(authError.message);
+
+            await supabase.from(PASSWORD_RESET_TABLE).delete().eq('email', email);
+            if (account.email) {
+              await appendLog('INFO', `[AUTH] Password reset completed for ${account.email}.`);
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({ ok: true, message: 'Password updated. Sign in with your new password.' })
             );
           } catch (err) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -1630,13 +1899,66 @@ function resolveEntryNotional(cfg, balance) {
   return Math.max(floor, Number(sized.toFixed(2)));
 }
 
-async function fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet) {
+/**
+ * Full Spot snapshot: spendable/locked USDT **plus** every other held coin valued at
+ * the live ticker. A wallet holding BTC/ETH must never be reported as its stablecoins.
+ */
+async function fetchBinanceSpotSnapshot(apiKey, apiSecret, useTestnet) {
   if (!apiKey || !apiSecret) return null;
   const account = await signedBinanceRequest('GET', '/api/v3/account', apiKey, apiSecret, useTestnet);
   if (!account || !Array.isArray(account.balances)) return null;
-  const usdt = account.balances.find((b) => b.asset === 'USDT');
-  if (!usdt) return 0;
-  return Number((Number(usdt.free || 0) + Number(usdt.locked || 0)).toFixed(2));
+
+  const holdings = account.balances
+    .map((row) => ({
+      asset: String(row.asset || '').toUpperCase(),
+      free: Number(row.free || 0),
+      locked: Number(row.locked || 0),
+    }))
+    .filter((row) => row.asset && row.free + row.locked > 0);
+
+  const usdt = holdings.find((row) => row.asset === 'USDT');
+  const usdtFree = Number((usdt ? usdt.free : 0).toFixed(2));
+  const usdtLocked = Number((usdt ? usdt.locked : 0).toFixed(2));
+
+  const coins = holdings.filter((row) => row.asset !== 'USDT');
+  let prices = {};
+  if (coins.length > 0) {
+    try {
+      const tickers = await fetchPublicWithFallback('/api/v3/ticker/price', useTestnet);
+      prices = Array.isArray(tickers)
+        ? Object.fromEntries(
+            tickers.map((t) => [String(t.symbol || '').toUpperCase(), Number(t.price || 0)])
+          )
+        : {};
+    } catch (err) {
+      console.warn('[SPOT PRICES] live ticker lookup skipped:', err.message);
+    }
+  }
+
+  const assets = holdings
+    .map((row) => {
+      const total = Number((row.free + row.locked).toFixed(8));
+      const usdValue =
+        row.asset === 'USDT'
+          ? Number(total.toFixed(2))
+          : Number((total * (prices[`${row.asset}USDT`] || 0)).toFixed(2));
+      return { asset: row.asset, total, usdValue };
+    })
+    .filter((row) => row.usdValue >= 0.01)
+    .sort((a, b) => b.usdValue - a.usdValue)
+    .slice(0, 20);
+
+  const coinsUsd = assets
+    .filter((row) => row.asset !== 'USDT')
+    .reduce((sum, row) => sum + row.usdValue, 0);
+
+  return {
+    usdtFree,
+    usdtLocked,
+    coinsUsd: Number(coinsUsd.toFixed(2)),
+    spotValue: Number((usdtFree + usdtLocked + coinsUsd).toFixed(2)),
+    assets,
+  };
 }
 
 async function fetchBinanceFundingUsdt(apiKey, apiSecret, useTestnet) {
@@ -1675,17 +1997,21 @@ async function fetchBinanceEarnUsdt(apiKey, apiSecret, useTestnet) {
  * Returns null when the Spot account itself cannot be read (bad keys/IP block).
  */
 async function fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet) {
-  const spot = await fetchBinanceSpotUsdtBalance(apiKey, apiSecret, useTestnet);
-  if (spot === null) return null;
+  const snapshot = await fetchBinanceSpotSnapshot(apiKey, apiSecret, useTestnet);
+  if (!snapshot) return null;
   const [funding, earn] = await Promise.all([
     fetchBinanceFundingUsdt(apiKey, apiSecret, useTestnet),
     fetchBinanceEarnUsdt(apiKey, apiSecret, useTestnet),
   ]);
   return {
-    spot: Number(spot.toFixed(2)),
+    spot: Number(snapshot.spotValue.toFixed(2)),
+    usdtFree: snapshot.usdtFree,
+    usdtLocked: snapshot.usdtLocked,
+    spotCoins: snapshot.coinsUsd,
+    assets: snapshot.assets,
     funding: Number(funding.toFixed(2)),
     earn: Number(earn.toFixed(2)),
-    total: Number((spot + funding + earn).toFixed(2)),
+    total: Number((snapshot.spotValue + funding + earn).toFixed(2)),
   };
 }
 

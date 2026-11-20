@@ -400,6 +400,9 @@ export function useTradingTerminal() {
 
   const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  // A guest browses the terminal and paper-trades DEMO without an account. Every
+  // money-touching action (LIVE, key vault, live engine) is gated in the UI.
+  const [isGuest, setIsGuest] = useState<boolean>(false);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(isSupabaseConfigured);
   const [dataLoading, setDataLoading] = useState<boolean>(false);
@@ -2669,30 +2672,37 @@ export function useTradingTerminal() {
         identityRef.current.telegramUserId
       )}`;
 
+      if (isGuest) {
+        // Never ask the worker for the shared demo vault as an anonymous guest.
+        const errSummary: BinanceAccountSummary & { ok: boolean } = {
+          ok: false,
+          connected: false,
+          usdtFree: 0,
+          usdtLocked: 0,
+          totalUsdt: 0,
+          totalPortfolioUsd: 0,
+          assets: [],
+          canTrade: false,
+          lastSyncedAt: new Date().toISOString(),
+          errorDetail: 'Create an account to link real Binance keys',
+        };
+        setBinanceAccount(errSummary);
+        return errSummary;
+      }
+
       setSyncingBalance(true);
       try {
-        let res: Response;
-        try {
-          res = await fetch(`${WORKER_URL}/api/balance${scopeQuery}`, {
-            method: 'POST',
-            headers: workerAuthHeaders(),
-            body: JSON.stringify({
-              apiKey,
-              apiSecret,
-              testnet: activeCfg.use_testnet,
-            }),
-          });
-        } catch {
-          res = await fetch('/api/binance/balance', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              apiKey,
-              apiSecret,
-              useTestnet: activeCfg.use_testnet,
-            }),
-          });
-        }
+        // Always the 24/7 worker: the static frontend origin answers /api/* with
+        // index.html (HTTP 200), which used to look like a broken verification.
+        const res = await fetch(`${WORKER_URL}/api/balance${scopeQuery}`, {
+          method: 'POST',
+          headers: workerAuthHeaders(),
+          body: JSON.stringify({
+            apiKey,
+            apiSecret,
+            testnet: activeCfg.use_testnet,
+          }),
+        });
         const text = await res.text();
         const data = text ? JSON.parse(text) : {};
 
@@ -2709,6 +2719,7 @@ export function useTradingTerminal() {
             totalUsdt: usdtBal,
             totalPortfolioUsd: usdtBal,
             spotUsd: Number(data.spotUsd ?? usdtFree),
+            spotCoinsUsd: Number(data.spotCoinsUsd ?? 0),
             fundingUsd: Number(data.fundingUsd ?? 0),
             earnUsd: Number(data.earnUsd ?? 0),
             walletBreakdown: Array.isArray(data.walletBreakdown) && data.walletBreakdown.length > 0
@@ -2744,8 +2755,11 @@ export function useTradingTerminal() {
         setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
         return errSummary;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Unable to reach Binance balance service';
-        console.warn('[useTradingTerminal] Binance balance fetch fallback warning:', msg);
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Live balance service unreachable — check VITE_WORKER_URL and that the worker is awake';
+        console.warn('[useTradingTerminal] Binance balance fetch failed:', msg);
         const errSummary: BinanceAccountSummary & { ok: boolean } = {
           ok: false,
           connected: false,
@@ -2765,12 +2779,16 @@ export function useTradingTerminal() {
         setSyncingBalance(false);
       }
     },
-    [binanceConfig, isDemoMode, liveSettings.id]
+    [binanceConfig, isDemoMode, isGuest, liveSettings.id]
   );
 
-  // Auto-sync real Binance Spot balance on mount and every 30s when keys are configured
+  // Auto-sync the real Binance portfolio on mount and every 30s. Keys saved to the
+  // worker vault count too: the browser never needs the secret back to see money.
   useEffect(() => {
-    if (!binanceConfig.api_key.trim() || !binanceConfig.api_secret.trim()) {
+    const hasLocalKeys = Boolean(
+      binanceConfig.api_key.trim() && binanceConfig.api_secret.trim()
+    );
+    if (isGuest || (!hasLocalKeys && !apiKeyStatus.linked)) {
       setBinanceAccount(null);
       setLiveSettings((prev) => (prev.balance_usdt !== 0 ? { ...prev, balance_usdt: 0 } : prev));
       return;
@@ -2783,7 +2801,13 @@ export function useTradingTerminal() {
     }, 30_000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [binanceConfig.api_key, binanceConfig.api_secret, binanceConfig.use_testnet]);
+  }, [
+    binanceConfig.api_key,
+    binanceConfig.api_secret,
+    binanceConfig.use_testnet,
+    apiKeyStatus.linked,
+    isGuest,
+  ]);
 
   const testTelegramConnection = useCallback(
     async (cfg: TelegramConfig) => {
@@ -3018,30 +3042,18 @@ export function useTradingTerminal() {
 
       setBinanceConfig(trimmedCfg);
       try {
-        let res: Response;
-        try {
-          res = await fetch(`${WORKER_URL}/api/verify-keys`, {
-            method: 'POST',
-            headers: workerAuthHeaders(),
-            body: JSON.stringify({
-              apiKey: trimmedCfg.api_key,
-              apiSecret: trimmedCfg.api_secret,
-              testnet: trimmedCfg.use_testnet,
-              telegram_user_id: identityRef.current.telegramUserId,
-              initData: identityRef.current.initData,
-            }),
-          });
-        } catch {
-          res = await fetch('/api/binance/balance', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              apiKey: trimmedCfg.api_key,
-              apiSecret: trimmedCfg.api_secret,
-              useTestnet: trimmedCfg.use_testnet,
-            }),
-          });
-        }
+        // Worker-only: verifying against the static origin returns index.html (HTTP 200).
+        const res = await fetch(`${WORKER_URL}/api/verify-keys`, {
+          method: 'POST',
+          headers: workerAuthHeaders(),
+          body: JSON.stringify({
+            apiKey: trimmedCfg.api_key,
+            apiSecret: trimmedCfg.api_secret,
+            testnet: trimmedCfg.use_testnet,
+            telegram_user_id: identityRef.current.telegramUserId,
+            initData: identityRef.current.initData,
+          }),
+        });
         const text = await res.text();
         const data = text ? JSON.parse(text) : {};
         if (res.ok && (data.ok || data.usdtBalance !== undefined || data.totalUsdt !== undefined)) {
@@ -3170,9 +3182,12 @@ export function useTradingTerminal() {
         error?: string;
         totalPortfolioUsd?: number;
         usdtFree?: number;
+        usdtLocked?: number;
         spotUsd?: number;
+        spotCoinsUsd?: number;
         fundingUsd?: number;
         earnUsd?: number;
+        assets?: BinanceAccountSummary['assets'];
         api_key_masked?: string;
         use_testnet?: boolean;
       };
@@ -3180,6 +3195,9 @@ export function useTradingTerminal() {
         return { ok: false, detail: String(data.error || `Test failed (HTTP ${res.status})`) };
       }
       const usdtBal = pickPortfolioUsd(data);
+      const spotUsd = Number(data.spotUsd ?? data.usdtFree ?? 0);
+      const fundingUsd = Number(data.fundingUsd ?? 0);
+      const earnUsd = Number(data.earnUsd ?? 0);
       setApiKeyStatus({
         linked: true,
         api_key_masked: data.api_key_masked ?? null,
@@ -3188,14 +3206,19 @@ export function useTradingTerminal() {
       setBinanceAccount({
         connected: true,
         usdtFree: Number(data.usdtFree ?? 0),
-        usdtLocked: 0,
+        usdtLocked: Number(data.usdtLocked ?? 0),
         totalUsdt: usdtBal,
         totalPortfolioUsd: usdtBal,
-        spotUsd: Number(data.spotUsd ?? data.usdtFree ?? 0),
-        fundingUsd: Number(data.fundingUsd ?? 0),
-        earnUsd: Number(data.earnUsd ?? 0),
-        walletBreakdown: [{ walletName: 'Spot', balanceUsd: usdtBal }],
-        assets: [],
+        spotUsd,
+        spotCoinsUsd: Number(data.spotCoinsUsd ?? 0),
+        fundingUsd,
+        earnUsd,
+        walletBreakdown: [
+          { walletName: 'Spot', balanceUsd: spotUsd },
+          { walletName: 'Funding', balanceUsd: fundingUsd },
+          { walletName: 'Earn', balanceUsd: earnUsd },
+        ].filter((wallet) => wallet.balanceUsd > 0),
+        assets: Array.isArray(data.assets) ? data.assets : [],
         canTrade: Number(data.usdtFree ?? 0) >= MIN_TRADEABLE_USDT,
         lastSyncedAt: new Date().toISOString(),
         errorDetail: null,
@@ -3216,6 +3239,92 @@ export function useTradingTerminal() {
       setSyncingBalance(false);
     }
   }, []);
+
+  /**
+   * One click in Settings: write both keys to the worker vault, then immediately
+   * test them and load the real portfolio so the header + card update without a
+   * page reload and the badge flips to LINKED.
+   */
+  const saveAndVerifyUserBinanceKeys = useCallback(
+    async (cfg: BinanceConfig) => {
+      const saved = await saveUserBinanceKeys(cfg);
+      if (!saved.ok) return saved;
+      const tested = await testUserBinanceConnection();
+      if (!tested.ok) {
+        return { ok: true, detail: `${saved.detail} · balance sync: ${tested.detail}` };
+      }
+      await refreshBinanceBalance();
+      return { ok: true, detail: `${saved.detail} · ${tested.detail}` };
+    },
+    [refreshBinanceBalance, saveUserBinanceKeys, testUserBinanceConnection]
+  );
+
+  /** Change password for the signed-in account (Supabase Auth owns the hash). */
+  const changePassword = useCallback(
+    async (currentPassword: string, newPassword: string) => {
+      if (!supabase) return { ok: false, detail: 'Supabase is not configured' };
+      const email = accountRef.current?.email;
+      if (!email) return { ok: false, detail: 'Sign in again to change your password' };
+      if (newPassword.length < 8) {
+        return { ok: false, detail: 'New password must be at least 8 characters' };
+      }
+      const { data, error: verifyError } = await supabase.auth.signInWithPassword({
+        email,
+        password: currentPassword,
+      });
+      if (verifyError) return { ok: false, detail: 'Current password is incorrect' };
+      if (data.session) accessTokenRef.current = data.session.access_token;
+      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      if (error) return { ok: false, detail: error.message };
+      return { ok: true, detail: 'Password updated — use it next time you sign in.' };
+    },
+    []
+  );
+
+  /** Step 1 of Telegram reset: the worker DMs a 6-digit code via @TaseenMarketBot. */
+  const requestPasswordResetCode = useCallback(async (email: string) => {
+    try {
+      const res = await fetch(`${WORKER_URL}/api/auth/reset-request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; message?: string };
+      if (!res.ok || data.ok === false) {
+        return { ok: false, detail: String(data.error || `Reset request failed (HTTP ${res.status})`) };
+      }
+      return {
+        ok: true,
+        detail: String(data.message || 'Code sent. Check @TaseenMarketBot on Telegram.'),
+      };
+    } catch {
+      return {
+        ok: false,
+        detail: 'Could not reach the reset service — the worker may be waking up. Try again.',
+      };
+    }
+  }, []);
+
+  /** Step 2 of Telegram reset: verify the code and set the new password. */
+  const confirmPasswordResetCode = useCallback(
+    async (email: string, code: string, newPassword: string) => {
+      try {
+        const res = await fetch(`${WORKER_URL}/api/auth/reset-confirm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email.trim(), code: code.trim(), new_password: newPassword }),
+        });
+        const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; message?: string };
+        if (!res.ok || data.ok === false) {
+          return { ok: false, detail: String(data.error || `Reset failed (HTTP ${res.status})`) };
+        }
+        return { ok: true, detail: String(data.message || 'Password updated. Sign in now.') };
+      } catch {
+        return { ok: false, detail: 'Could not reach the reset service. Try again.' };
+      }
+    },
+    []
+  );
 
   const refreshLeaderboard = useCallback(async () => {
     setLeaderboardLoading(true);
@@ -3377,6 +3486,7 @@ export function useTradingTerminal() {
     if (!error && data.session) {
       accessTokenRef.current = data.session.access_token;
       setIsDemoMode(false);
+      setIsGuest(false);
       setUserEmail(data.session.user.email ?? null);
       await loadAccountProfile(data.session.user);
       setIsAuthenticated(true);
@@ -3418,6 +3528,7 @@ export function useTradingTerminal() {
       if (data.session) {
         accessTokenRef.current = data.session.access_token;
         setIsDemoMode(false);
+        setIsGuest(false);
         setUserEmail(data.session.user.email ?? null);
         await loadAccountProfile(data.session.user);
         setIsAuthenticated(true);
@@ -3449,20 +3560,40 @@ export function useTradingTerminal() {
     accountRef.current = null;
     setAccount(null);
     setIsAuthenticated(false);
+    setIsGuest(false);
+    setIsDemoMode(false);
+    setApiKeyStatus({ linked: false, api_key_masked: null, use_testnet: false });
   }, [isDemoMode]);
 
   const enterDemoMode = useCallback(() => {
     setIsDemoMode(true);
     setIsAuthenticated(true);
+    setIsGuest(false);
     setUserEmail('demo-operator@aegis.local');
   }, []);
 
+  /** Browse the terminal without an account: DEMO only, nothing persisted. */
+  const enterGuestMode = useCallback(() => {
+    setIsDemoMode(true);
+    setIsGuest(true);
+    setIsAuthenticated(false);
+    setUserEmail(null);
+    setActiveWorkspace('DEMO');
+    saveJson(STORAGE_WORKSPACE_KEY, 'DEMO');
+  }, []);
+
+  const exitGuestMode = useCallback(() => {
+    setIsGuest(false);
+    setIsDemoMode(false);
+  }, []);
+
   const hasBinanceKeys = Boolean(
-    (binanceConfig.api_key.trim().length >= 16 &&
-      binanceConfig.api_secret.trim().length >= 16) ||
-      // Keys saved to this trader's private vault count even though the browser
-      // never receives the secret back.
-      apiKeyStatus.linked
+    !isGuest &&
+      ((binanceConfig.api_key.trim().length >= 16 &&
+        binanceConfig.api_secret.trim().length >= 16) ||
+        // Keys saved to this trader's private vault count even though the browser
+        // never receives the secret back.
+        apiKeyStatus.linked)
   );
 
   const hasTelegramKeys = Boolean(
@@ -3473,6 +3604,9 @@ export function useTradingTerminal() {
     isSupabaseConfigured,
     isDemoMode,
     isAuthenticated,
+    isGuest,
+    enterGuestMode,
+    exitGuestMode,
     userEmail,
     authLoading,
     dataLoading,
@@ -3525,7 +3659,11 @@ export function useTradingTerminal() {
     workspaceUser,
     apiKeyStatus,
     saveUserBinanceKeys,
+    saveAndVerifyUserBinanceKeys,
     testUserBinanceConnection,
+    changePassword,
+    requestPasswordResetCode,
+    confirmPasswordResetCode,
     leaderboard,
     leaderboardLoading,
     refreshLeaderboard,

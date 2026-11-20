@@ -89,6 +89,8 @@ export interface BinanceAccountSummary {
   totalUsdt: number;
   totalPortfolioUsd: number;
   spotUsd?: number;
+  /** Value of held spot coins (non-USDT) converted at the live ticker. */
+  spotCoinsUsd?: number;
   fundingUsd?: number;
   earnUsd?: number;
   walletBreakdown?: { walletName: string; balanceUsd: number }[];
