@@ -7,7 +7,8 @@ export type TabId =
   | 'trades'
   | 'performance'
   | 'risk'
-  | 'settings';
+  | 'settings'
+  | 'admin';
 
 export type BotStatus = 'RUNNING' | 'STOPPED' | 'OFFLINE';
 
@@ -177,6 +178,44 @@ export interface WorkspaceUser {
   displayName: string;
   username: string | null;
   isTelegram: boolean;
+}
+
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+
+/** Row of the `users` table — the account, approval and trading profile. */
+export interface AccountProfile {
+  id: string;
+  email: string;
+  full_name: string;
+  telegram_chat_id: string | null;
+  telegram_username: string | null;
+  approval_status: ApprovalStatus;
+  is_admin: boolean;
+  trading_mode: 'VIRTUAL' | 'LIVE';
+  bot_running: boolean;
+  virtual_balance: number;
+  realized_pnl_usd: number;
+  total_trades: number;
+  win_trades: number;
+  binance_api_key?: string | null;
+}
+
+/** Admin panel row: account + aggregate performance, never secrets. */
+export interface AdminUserRow {
+  id: string;
+  email: string;
+  full_name: string;
+  telegram_chat_id: string | null;
+  telegram_username: string | null;
+  approval_status: ApprovalStatus;
+  is_admin: boolean;
+  trading_mode: 'VIRTUAL' | 'LIVE';
+  bot_running: boolean;
+  realized_pnl_usd: number;
+  total_trades: number;
+  win_trades: number;
+  has_keys: boolean;
+  created_at: string | null;
 }
 
 export interface CrashGuardState {

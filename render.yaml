@@ -33,5 +33,9 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
       - key: BINANCE_TESTNET
         value: "false"

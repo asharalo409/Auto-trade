@@ -14,13 +14,16 @@ import {
   RefreshCw,
   Settings as SettingsIcon,
   ShieldAlert,
+  ShieldCheck,
   Terminal,
   Trophy,
 } from 'lucide-react';
+import { AdminPanel } from './components/screens/AdminPanel';
 import { CommandCenter } from './components/screens/CommandCenter';
 import { LiveEngineFeed } from './components/screens/LiveEngineFeed';
 import { LoginScreen } from './components/screens/LoginScreen';
 import { MarketHeatmap } from './components/screens/MarketHeatmap';
+import { PendingApprovalScreen } from './components/screens/PendingApprovalScreen';
 import { PerformanceScreen } from './components/screens/PerformanceScreen';
 import { RiskPanel } from './components/screens/RiskPanel';
 import { SettingsPanel } from './components/screens/SettingsPanel';
@@ -112,6 +115,10 @@ export default function App() {
     },
     { id: 'risk', label: t.navRisk, icon: BarChart3 },
     { id: 'settings', label: t.navSettings, icon: SettingsIcon },
+    // Admin console only exists for accounts flagged is_admin in Supabase.
+    ...(terminal.isAdmin
+      ? [{ id: 'admin' as TabId, label: 'Admin', icon: ShieldCheck }]
+      : []),
   ];
 
   const toggleLanguage = () => {
@@ -486,6 +493,12 @@ export default function App() {
             <Activity className="mr-2 h-4 w-4 animate-spin" />
             SYNCING AUTH SESSION...
           </div>
+        ) : terminal.isAuthenticated && terminal.account && !terminal.accountApproved ? (
+          <PendingApprovalScreen
+            account={terminal.account}
+            onRefresh={terminal.refreshAccount}
+            onSignOut={terminal.signOut}
+          />
         ) : !terminal.isAuthenticated ? (
           <LoginScreen
             t={t}
@@ -604,6 +617,18 @@ export default function App() {
                   settings={terminal.settings}
                   stats={terminal.stats}
                   trades={terminal.trades}
+                />
+              )}
+
+              {activeTab === 'admin' && terminal.isAdmin && (
+                <AdminPanel
+                  users={terminal.adminUsers}
+                  totals={terminal.adminTotals}
+                  loading={terminal.adminLoading}
+                  error={terminal.adminError}
+                  currentAdminId={terminal.account?.id ?? ''}
+                  onRefresh={terminal.refreshAdminUsers}
+                  onReview={terminal.reviewUser}
                 />
               )}
 

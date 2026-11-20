@@ -28,6 +28,9 @@ import {
   voiceAnnouncer,
 } from '../lib/voiceAnnouncer';
 import {
+  AccountProfile,
+  AdminUserRow,
+  ApprovalStatus,
   BinanceAccountSummary,
   BinanceConfig,
   BotSettings,
@@ -193,6 +196,29 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
   };
 }
 
+function normalizeAccount(row: Record<string, unknown>): AccountProfile {
+  const rawStatus = String(row.approval_status ?? 'pending').toLowerCase();
+  const approval_status: ApprovalStatus =
+    rawStatus === 'approved' || rawStatus === 'rejected' ? rawStatus : 'pending';
+  return {
+    id: String(row.id ?? ''),
+    email: String(row.email ?? ''),
+    full_name: String(row.full_name ?? ''),
+    telegram_chat_id: row.telegram_chat_id ? String(row.telegram_chat_id) : null,
+    telegram_username: row.telegram_username ? String(row.telegram_username) : null,
+    approval_status,
+    is_admin: Boolean(row.is_admin),
+    trading_mode:
+      String(row.trading_mode ?? 'VIRTUAL').toUpperCase() === 'LIVE' ? 'LIVE' : 'VIRTUAL',
+    bot_running: Boolean(row.bot_running),
+    virtual_balance: Number(row.virtual_balance ?? 10000),
+    realized_pnl_usd: Number(row.realized_pnl_usd ?? 0),
+    total_trades: Number(row.total_trades ?? 0),
+    win_trades: Number(row.win_trades ?? 0),
+    binance_api_key: row.binance_api_key ? String(row.binance_api_key) : null,
+  };
+}
+
 function normalizeTrade(row: Record<string, unknown>): Trade {
   const entry = Number(row.entry_price ?? 0);
   const current = Number(row.current_price ?? row.exit_price ?? entry);
@@ -325,19 +351,49 @@ export function useTradingTerminal() {
     []
   );
 
-  // Who owns this workspace: the Telegram user inside the Mini App, otherwise the
-  // single default owner/guest workspace. Every query below is scoped to it.
+  // Telegram identity (for pre-filling the registration form) and the signed-in
+  // account that actually owns the workspace.
   const identity = useMemo(() => resolveWorkspaceIdentity(), []);
   const identityRef = useRef(identity);
+  const [account, setAccount] = useState<AccountProfile | null>(null);
+  const accountRef = useRef<AccountProfile | null>(null);
+  const accessTokenRef = useRef<string | null>(null);
+
+  // A signed-in account owns `u:<uuid>`; otherwise the Telegram id / guest scope.
+  const activeIdentity = useMemo(() => {
+    if (account?.id) {
+      return {
+        ...identity,
+        telegramUserId: `u:${account.id}`,
+        displayName: account.full_name || account.email || identity.displayName,
+        username: account.telegram_username ?? identity.username,
+        chatId: account.telegram_chat_id ?? identity.chatId,
+        isTelegram: Boolean(account.telegram_chat_id),
+      };
+    }
+    return identity;
+  }, [account, identity]);
+  identityRef.current = activeIdentity;
+
   const workspaceUser: WorkspaceUser = useMemo(
     () => ({
-      telegramUserId: identity.telegramUserId,
-      displayName: identity.displayName,
-      username: identity.username,
-      isTelegram: identity.isTelegram,
+      telegramUserId: activeIdentity.telegramUserId,
+      displayName: activeIdentity.displayName,
+      username: activeIdentity.username,
+      isTelegram: activeIdentity.isTelegram,
     }),
-    [identity]
+    [activeIdentity]
   );
+
+  const accountApproved = account === null || account.approval_status === 'approved';
+  const isAdmin = Boolean(account?.is_admin);
+
+  /** Worker calls carry the Supabase session so scope/authority is server-verified. */
+  const workerAuthHeaders = useCallback(() => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (accessTokenRef.current) headers.Authorization = `Bearer ${accessTokenRef.current}`;
+    return headers;
+  }, []);
 
   const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
@@ -439,6 +495,17 @@ export function useTradingTerminal() {
   });
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
+  const [adminUsers, setAdminUsers] = useState<AdminUserRow[]>([]);
+  const [adminTotals, setAdminTotals] = useState<{
+    users: number;
+    pending: number;
+    approved: number;
+    rejected: number;
+    pnl_usd: number;
+    pnl_bdt: number;
+  } | null>(null);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminError, setAdminError] = useState<string | null>(null);
 
   const [alertEnabledPairs, setAlertEnabledPairs] = useState<string[]>(() =>
     loadJson<string[]>(STORAGE_ALERT_PAIRS_KEY, [...SUPPORTED_PAIRS])
@@ -605,7 +672,11 @@ export function useTradingTerminal() {
       const botToken = telegramConfig.bot_token.trim();
       const chatId = telegramConfig.chat_id.trim();
       if (botToken) patch.telegram_bot_token = botToken;
-      if (chatId) patch.telegram_chat_id = chatId;
+      if (chatId) {
+        patch.telegram_chat_id = chatId;
+        // The worker's per-user alerts read `chat_id`; keep it in sync too.
+        patch.chat_id = chatId;
+      }
       void supabase!
         .from('settings')
         .update(patch)
@@ -613,6 +684,17 @@ export function useTradingTerminal() {
         .then(({ error }) => {
           if (error) console.warn('Telegram settings sync warning:', error.message);
         });
+      // And on the account, so approval/welcome messages reach the right chat.
+      const accountId = accountRef.current?.id;
+      if (chatId && accountId) {
+        void supabase!
+          .from('users')
+          .update({ telegram_chat_id: chatId })
+          .eq('id', accountId)
+          .then(({ error }) => {
+            if (error) console.warn('Telegram chat sync warning:', error.message);
+          });
+      }
     }, 700);
     return () => window.clearTimeout(timeout);
   }, [isAuthenticated, isDemoMode, settings.id, settings.telegram_enabled, telegramConfig]);
@@ -842,6 +924,72 @@ export function useTradingTerminal() {
     return () => window.clearInterval(id);
   }, []);
 
+  /**
+   * Loads this session's `users` row — the approval gate, admin flag and trading
+   * profile. Projects without the table keep working (no gate).
+   */
+  const loadAccountProfile = useCallback(
+    async (authUser: { id: string; email?: string | null } | null) => {
+      if (!supabase) return null;
+      if (!authUser?.id) {
+        accountRef.current = null;
+        setAccount(null);
+        return null;
+      }
+      try {
+        const { data, error } = await supabase
+          .from('users')
+          .select('*')
+          .eq('id', authUser.id)
+          .maybeSingle();
+        if (error) {
+          if (
+            isMissingSupabaseTableError(error) ||
+            isMissingSupabaseColumnError(error)
+          ) {
+            accountRef.current = null;
+            setAccount(null);
+            return null;
+          }
+          console.warn('[useTradingTerminal] account load failed:', error.message);
+          return null;
+        }
+
+        let row = data as Record<string, unknown> | null;
+        if (!row) {
+          // Trigger-less project: create the pending profile from this session.
+          const me = identityRef.current;
+          const { data: created, error: insertErr } = await supabase
+            .from('users')
+            .insert({
+              id: authUser.id,
+              email: authUser.email ?? me.username ?? '',
+              full_name: me.displayName,
+              telegram_chat_id: me.chatId,
+              telegram_username: me.username,
+              approval_status: 'pending',
+            })
+            .select('*')
+            .maybeSingle();
+          if (insertErr) {
+            console.warn('[useTradingTerminal] account provisioning failed:', insertErr.message);
+            return null;
+          }
+          row = created as Record<string, unknown> | null;
+        }
+
+        const profile = row ? normalizeAccount(row) : null;
+        accountRef.current = profile;
+        setAccount(profile);
+        return profile;
+      } catch (err) {
+        console.warn('[useTradingTerminal] account load error:', err);
+        return null;
+      }
+    },
+    []
+  );
+
   useEffect(() => {
     if (!supabase) {
       setAuthLoading(false);
@@ -853,28 +1001,13 @@ export function useTradingTerminal() {
       .getSession()
       .then(async ({ data }) => {
         if (!mounted) return;
+        accessTokenRef.current = data.session?.access_token ?? null;
         if (data.session) {
-          setIsAuthenticated(true);
           setIsDemoMode(false);
           setUserEmail(data.session.user.email ?? null);
-          return;
-        }
-        // Inside Telegram the Mini App should open straight into the trader's own
-        // workspace. Supabase anonymous auth gives the row a real `authenticated`
-        // JWT for RLS; the workspace itself is keyed by telegram_user_id.
-        if (identity.isTelegram) {
-          const { data: anon, error } = await supabase!.auth.signInAnonymously();
-          if (!mounted) return;
-          if (error || !anon.session) {
-            console.warn(
-              '[useTradingTerminal] Telegram auto-login unavailable (enable Anonymous sign-ins in Supabase):',
-              error?.message
-            );
-          } else {
-            setIsAuthenticated(true);
-            setIsDemoMode(false);
-            setUserEmail(`telegram:${identity.telegramUserId}`);
-          }
+          // Load the approval profile BEFORE unlocking data fetches.
+          await loadAccountProfile(data.session.user);
+          setIsAuthenticated(true);
         }
       })
       .finally(() => {
@@ -883,13 +1016,16 @@ export function useTradingTerminal() {
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
+      accessTokenRef.current = session?.access_token ?? null;
       if (session) {
-        setIsAuthenticated(true);
         setIsDemoMode(false);
         setUserEmail(session.user.email ?? null);
+        void loadAccountProfile(session.user).then(() => setIsAuthenticated(true));
       } else {
         setIsAuthenticated(false);
         setUserEmail(null);
+        accountRef.current = null;
+        setAccount(null);
       }
     });
 
@@ -897,7 +1033,7 @@ export function useTradingTerminal() {
       mounted = false;
       sub.subscription.unsubscribe();
     };
-  }, [identity]);
+  }, [loadAccountProfile]);
 
   /**
    * Creates this browser/Telegram user's own settings row on first contact.
@@ -905,6 +1041,8 @@ export function useTradingTerminal() {
    */
   const ensureWorkspaceRow = useCallback(async (): Promise<Record<string, unknown> | null> => {
     if (!supabase) return null;
+    // Never provision trading state for an account that is still pending.
+    if (accountRef.current && accountRef.current.approval_status !== 'approved') return null;
     const me = identityRef.current;
     const payload: Record<string, unknown> = {
       telegram_user_id: me.telegramUserId,
@@ -949,6 +1087,11 @@ export function useTradingTerminal() {
 
   const fetchSupabaseData = useCallback(async () => {
     if (!supabase || isDemoMode || !isAuthenticated) return;
+    // Pending/rejected accounts never load or provision a trading workspace.
+    if (accountRef.current && accountRef.current.approval_status !== 'approved') {
+      setDataLoading(false);
+      return;
+    }
     setDataLoading(true);
     setErrorMsg(null);
     try {
@@ -1122,6 +1265,8 @@ export function useTradingTerminal() {
 
   useEffect(() => {
     if (!supabase || isDemoMode || !isAuthenticated) return;
+    // Never stream another workspace into a pending account.
+    if (accountRef.current && accountRef.current.approval_status !== 'approved') return;
     fetchSupabaseData();
 
     const handleRealtimeLog = (source: string) => (payload: { new?: unknown }) => {
@@ -1948,9 +2093,9 @@ export function useTradingTerminal() {
       const apiSecret = binanceConfig.api_secret.trim();
       // Empty local keys are fine: the worker executes with this workspace's vault.
       try {
-        const res = await fetch(`${WORKER_URL}/api/order`, {
+        const           res = await fetch(`${WORKER_URL}/api/order`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: workerAuthHeaders(),
                       body: JSON.stringify({
               apiKey,
               apiSecret,
@@ -2527,7 +2672,7 @@ export function useTradingTerminal() {
         try {
           res = await fetch(`${WORKER_URL}/api/balance${scopeQuery}`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: workerAuthHeaders(),
             body: JSON.stringify({
               apiKey,
               apiSecret,
@@ -2874,7 +3019,7 @@ export function useTradingTerminal() {
         try {
           res = await fetch(`${WORKER_URL}/api/verify-keys`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: workerAuthHeaders(),
             body: JSON.stringify({
               apiKey: trimmedCfg.api_key,
               apiSecret: trimmedCfg.api_secret,
@@ -2954,7 +3099,7 @@ export function useTradingTerminal() {
     try {
       const res = await fetch(`${WORKER_URL}/api/user/keys`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: workerAuthHeaders(),
         body: JSON.stringify({
           telegram_user_id: me.telegramUserId,
           initData: me.initData,
@@ -2992,6 +3137,7 @@ export function useTradingTerminal() {
       const query = new URLSearchParams({ telegram_user_id: me.telegramUserId });
       if (me.initData) query.set('initData', me.initData);
       const res = await fetch(`${WORKER_URL}/api/user/keys?${query.toString()}`, {
+        headers: workerAuthHeaders(),
         signal: AbortSignal.timeout(8000),
       });
       if (!res.ok) return;
@@ -3013,7 +3159,7 @@ export function useTradingTerminal() {
     try {
       const res = await fetch(`${WORKER_URL}/api/user/keys/test`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: workerAuthHeaders(),
         body: JSON.stringify({ telegram_user_id: me.telegramUserId, initData: me.initData }),
       });
       const data = (await res.json().catch(() => ({}))) as {
@@ -3094,6 +3240,87 @@ export function useTradingTerminal() {
     return () => window.clearInterval(timer);
   }, [isAuthenticated, loadUserApiKeyStatus, refreshLeaderboard]);
 
+  /** Re-reads the approval status so the pending screen can flip to the terminal. */
+  const refreshAccount = useCallback(async () => {
+    if (!supabase) return;
+    const { data } = await supabase.auth.getSession();
+    accessTokenRef.current = data.session?.access_token ?? null;
+    if (data.session?.user) await loadAccountProfile(data.session.user);
+  }, [loadAccountProfile]);
+
+  /** Admin panel: every account with aggregates (worker verifies the session). */
+  const refreshAdminUsers = useCallback(async () => {
+    if (!accessTokenRef.current) return;
+    setAdminLoading(true);
+    setAdminError(null);
+    try {
+      const res = await fetch(`${WORKER_URL}/api/admin/users`, {
+        headers: workerAuthHeaders(),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        entries?: AdminUserRow[];
+        totals?: {
+          users: number;
+          pending: number;
+          approved: number;
+          rejected: number;
+          pnl_usd: number;
+          pnl_bdt: number;
+        };
+      };
+      if (!res.ok || data.ok === false) {
+        setAdminError(String(data.error || `Admin API HTTP ${res.status}`));
+        setAdminUsers([]);
+        return;
+      }
+      setAdminUsers(Array.isArray(data.entries) ? data.entries : []);
+      setAdminTotals(data.totals ?? null);
+    } catch (err) {
+      setAdminError(err instanceof Error ? err.message : 'Admin service unreachable');
+    } finally {
+      setAdminLoading(false);
+    }
+  }, [workerAuthHeaders]);
+
+  const reviewUser = useCallback(
+    async (userId: string, decision: 'approve' | 'reject') => {
+      try {
+        const res = await fetch(`${WORKER_URL}/api/admin/approval`, {
+          method: 'POST',
+          headers: workerAuthHeaders(),
+          body: JSON.stringify({ user_id: userId, decision }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          email?: string;
+        };
+        if (!res.ok || data.ok === false) {
+          return { ok: false, detail: String(data.error || `HTTP ${res.status}`) };
+        }
+        await refreshAdminUsers();
+        return {
+          ok: true,
+          detail: `${decision === 'approve' ? 'Approved' : 'Rejected'} ${data.email ?? 'user'}`,
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          detail: err instanceof Error ? err.message : 'Approval request failed',
+        };
+      }
+    },
+    [refreshAdminUsers, workerAuthHeaders]
+  );
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    void refreshAdminUsers();
+  }, [isAdmin, refreshAdminUsers]);
+
   const signIn = useCallback(async (email: string, password: string) => {
     if (!supabase) {
       setIsDemoMode(true);
@@ -3102,32 +3329,60 @@ export function useTradingTerminal() {
     }
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
     if (!error && data.session) {
+      accessTokenRef.current = data.session.access_token;
       setIsDemoMode(false);
-      setIsAuthenticated(true);
       setUserEmail(data.session.user.email ?? null);
+      await loadAccountProfile(data.session.user);
+      setIsAuthenticated(true);
     }
     return { error: error ? error.message : null };
-  }, []);
+  }, [loadAccountProfile]);
 
-  const signUp = useCallback(async (email: string, password: string) => {
-    if (!supabase) {
-      return { error: null, message: 'Preview mode active — connect Supabase keys to register real operator account.' };
-    }
-    const { data, error } = await supabase.auth.signUp({ email, password });
-    if (error) {
-      return { error: error.message };
-    }
-    if (data.session) {
-      setIsDemoMode(false);
-      setIsAuthenticated(true);
-      setUserEmail(data.session.user.email ?? null);
-      return { error: null };
-    }
-    return {
-      error: null,
-      message: 'Account created! Check your email inbox to confirm or sign in directly.',
-    };
-  }, []);
+  const signUp = useCallback(
+    async (
+      email: string,
+      password: string,
+      profile?: {
+        fullName?: string;
+        telegramChatId?: string | null;
+        telegramUsername?: string | null;
+      }
+    ) => {
+      if (!supabase) {
+        return { error: null, message: 'Preview mode active — connect Supabase keys to register real operator account.' };
+      }
+      const me = identityRef.current;
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          // Read by the `handle_new_user` trigger to create the pending profile.
+          data: {
+            full_name: profile?.fullName?.trim() || me.displayName,
+            telegram_chat_id: String(profile?.telegramChatId ?? me.chatId ?? '').trim(),
+            telegram_username: String(profile?.telegramUsername ?? me.username ?? '').trim(),
+          },
+        },
+      });
+      if (error) {
+        return { error: error.message };
+      }
+      if (data.session) {
+        accessTokenRef.current = data.session.access_token;
+        setIsDemoMode(false);
+        setUserEmail(data.session.user.email ?? null);
+        await loadAccountProfile(data.session.user);
+        setIsAuthenticated(true);
+        return { error: null };
+      }
+      return {
+        error: null,
+        message:
+          'Account created and submitted for admin approval. Confirm your email if Supabase asks, then sign in to see your approval status.',
+      };
+    },
+    [loadAccountProfile]
+  );
 
   const resetPassword = useCallback(async (email: string) => {
     if (!supabase) {
@@ -3142,6 +3397,9 @@ export function useTradingTerminal() {
     if (supabase && !isDemoMode) {
       await supabase.auth.signOut();
     }
+    accessTokenRef.current = null;
+    accountRef.current = null;
+    setAccount(null);
     setIsAuthenticated(false);
   }, [isDemoMode]);
 
@@ -3205,6 +3463,16 @@ export function useTradingTerminal() {
     voiceEnabled,
     audioReady,
     crashGuards,
+    account,
+    accountApproved,
+    isAdmin,
+    refreshAccount,
+    adminUsers,
+    adminTotals,
+    adminLoading,
+    adminError,
+    refreshAdminUsers,
+    reviewUser,
     workspaceUser,
     apiKeyStatus,
     saveUserBinanceKeys,

@@ -1,4 +1,5 @@
 import {
+  AccountProfile,
   BinanceConfig,
   BotSettings,
   CandlePoint,
@@ -177,9 +178,116 @@ update public.settings set binance_api_key = null, binance_api_secret = null
 -- Anonymous sign-ins: ON). Workspace rows are still filtered by telegram_user_id in
 -- every query, and Binance secrets never leave the worker-only vault above.
 
+-- 7. ACCOUNTS, ADMIN APPROVAL & EMAIL+PASSWORD LOGIN
+create table if not exists public.users (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text unique not null,
+  full_name text,
+  telegram_chat_id text unique,
+  telegram_username text,
+  approval_status text not null default 'pending'
+    check (approval_status in ('pending', 'approved', 'rejected')),
+  is_admin boolean not null default false,
+  binance_api_key text,
+  binance_api_secret text,
+  trading_mode text not null default 'VIRTUAL',
+  bot_running boolean not null default false,
+  virtual_balance numeric not null default 10000,
+  realized_pnl_usd numeric not null default 0,
+  total_trades integer not null default 0,
+  win_trades integer not null default 0,
+  open_positions jsonb not null default '[]'::jsonb,
+  trade_history jsonb not null default '[]'::jsonb,
+  risk_settings jsonb not null default '{}'::jsonb,
+  admin_notified_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table public.users enable row level security;
+
+-- SECURITY DEFINER so policies can check admin without recursing into RLS.
+create or replace function public.is_admin()
+returns boolean language sql security definer stable set search_path = public as $$
+  select coalesce((select is_admin from public.users where id = auth.uid()), false);
+$$;
+
+drop policy if exists "users read own or admin" on public.users;
+create policy "users read own or admin" on public.users for select to authenticated
+  using (id = auth.uid() or public.is_admin());
+
+drop policy if exists "users insert self" on public.users;
+create policy "users insert self" on public.users for insert to authenticated
+  with check (id = auth.uid());
+
+drop policy if exists "users update own or admin" on public.users;
+create policy "users update own or admin" on public.users for update to authenticated
+  using (id = auth.uid() or public.is_admin())
+  with check (id = auth.uid() or public.is_admin());
+
+-- A user may edit their profile but never their own approval/admin flags.
+create or replace function public.guard_user_privileges()
+returns trigger language plpgsql security definer as $$
+begin
+  if coalesce(auth.role(), '') <> 'service_role'
+     and current_user not in ('service_role', 'postgres', 'supabase_admin')
+     and not public.is_admin()
+     and (new.approval_status is distinct from old.approval_status
+       or new.is_admin is distinct from old.is_admin) then
+    raise exception 'Only an admin can change approval_status or is_admin';
+  end if;
+  new.updated_at := now();
+  return new;
+end; $$;
+
+drop trigger if exists guard_user_privileges on public.users;
+create trigger guard_user_privileges before update on public.users
+  for each row execute function public.guard_user_privileges();
+
+-- Every Supabase Auth sign-up creates a PENDING profile automatically.
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.users (id, email, full_name, telegram_chat_id, telegram_username, approval_status)
+  values (
+    new.id,
+    coalesce(new.email, ''),
+    coalesce(new.raw_user_meta_data->>'full_name', ''),
+    nullif(new.raw_user_meta_data->>'telegram_chat_id', ''),
+    nullif(new.raw_user_meta_data->>'telegram_username', ''),
+    'pending'
+  )
+  on conflict (id) do nothing;
+  return new;
+end; $$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- Promote the bot owner (edit the email to yours). The worker also auto-promotes
+-- whichever account owns ADMIN_CHAT_ID / TELEGRAM_CHAT_ID on boot.
+update public.users set is_admin = true, approval_status = 'approved'
+  where email = 'billahtaseen@gmail.com';
+
 -- Leaderboard read model is exposed by the worker (/api/leaderboard), which returns
 -- aggregates only: names, mode, win rate and net PnL — no keys, no balances.
 alter table public.trades add column if not exists peak_price numeric;`;
+
+export const INITIAL_ACCOUNT: AccountProfile = {
+  id: '',
+  email: '',
+  full_name: '',
+  telegram_chat_id: null,
+  telegram_username: null,
+  approval_status: 'pending',
+  is_admin: false,
+  trading_mode: 'VIRTUAL',
+  bot_running: false,
+  virtual_balance: 10000,
+  realized_pnl_usd: 0,
+  total_trades: 0,
+  win_trades: 0,
+};
 
 export const INITIAL_DEMO_SETTINGS: BotSettings = {
   id: 1,

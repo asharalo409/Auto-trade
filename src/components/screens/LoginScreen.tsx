@@ -3,6 +3,7 @@ import { motion, useReducedMotion } from 'framer-motion';
 import { CheckCircle2, Lock, Play, ShieldAlert, Terminal, UserPlus } from 'lucide-react';
 import { audioSynth } from '../../lib/audioSynth';
 import { checkEmailWithApyhub } from '../../lib/emailValidation';
+import { resolveWorkspaceIdentity } from '../../lib/userIdentity';
 import { NeonButton } from '../ui/MotionPrimitives';
 
 interface LoginScreenProps {
@@ -11,7 +12,12 @@ interface LoginScreenProps {
   onSignIn: (email: string, password: string) => Promise<{ error: string | null }>;
   onSignUp: (
     email: string,
-    password: string
+    password: string,
+    profile?: {
+      fullName?: string;
+      telegramChatId?: string | null;
+      telegramUsername?: string | null;
+    }
   ) => Promise<{ error: string | null; message?: string }>;
   onResetPassword: (
     email: string
@@ -30,10 +36,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   onReplayBoot,
 }) => {
   const reducedMotion = useReducedMotion();
+  const telegramIdentity = resolveWorkspaceIdentity();
   const [authMode, setAuthMode] = useState<'SIGNIN' | 'SIGNUP'>('SIGNIN');
-  const [email, setEmail] = useState('billahtaseen@gmail.com');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [fullName, setFullName] = useState(telegramIdentity.displayName === 'Web Guest' ? '' : telegramIdentity.displayName);
+  const [telegramChatId, setTelegramChatId] = useState(telegramIdentity.chatId ?? '');
+  const telegramUsername = telegramIdentity.username;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
@@ -57,6 +67,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         setError('দুইটি পাসওয়ার্ড এক হতে হবে।');
         return;
       }
+      if (!fullName.trim()) {
+        setError('Full name is required for admin approval.');
+        return;
+      }
       setLoading(true);
       // Server-side ApyHub check (format, domain, disposable). Not a mailbox ownership check.
       const check = await checkEmailWithApyhub(email.trim(), { disposableChecks: true });
@@ -72,7 +86,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           'ApyHub ইমেইল যাচাই পাওয়া যায়নি — যাচাই ছাড়াই অ্যাকাউন্ট তৈরি হচ্ছে। (Validation service unavailable.)'
         );
       }
-      const res = await onSignUp(email.trim(), password);
+      const res = await onSignUp(email.trim(), password, {
+        fullName: fullName.trim(),
+        telegramChatId: telegramChatId.trim() || null,
+        telegramUsername,
+      });
       setLoading(false);
       if (res.error) setError(res.error);
       else if (res.message) setInfoMsg(res.message);
@@ -172,7 +190,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            Set Password / Register
+            Register
           </button>
         </div>
 
@@ -183,6 +201,27 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         )}
 
         <form onSubmit={handleSubmit} className="space-y-3.5">
+          {authMode === 'SIGNUP' && (
+            <div>
+              <label
+                htmlFor="operator-full-name"
+                className="mb-1.5 block font-mono-tech text-[11px] tracking-wider text-slate-300 uppercase"
+              >
+                Full Name
+              </label>
+              <input
+                id="operator-full-name"
+                type="text"
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+                placeholder="Your full name"
+                autoComplete="name"
+                disabled={!isSupabaseConfigured}
+                className="min-h-[44px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 py-2.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 transition-colors focus:border-emerald-400 focus:outline-none disabled:opacity-50"
+              />
+            </div>
+          )}
+
           <div>
             <label
               htmlFor="operator-email"
@@ -210,6 +249,33 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               </p>
             )}
           </div>
+
+          {authMode === 'SIGNUP' && (
+            <div>
+              <label
+                htmlFor="operator-chat-id"
+                className="mb-1.5 block font-mono-tech text-[11px] tracking-wider text-slate-300 uppercase"
+              >
+                Telegram Chat ID
+              </label>
+              <input
+                id="operator-chat-id"
+                type="text"
+                value={telegramChatId}
+                onChange={(e) => setTelegramChatId(e.target.value)}
+                placeholder="e.g. 123456789"
+                inputMode="numeric"
+                autoComplete="off"
+                disabled={!isSupabaseConfigured}
+                className="min-h-[44px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 py-2.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 transition-colors focus:border-emerald-400 focus:outline-none disabled:opacity-50"
+              />
+              <p className="mt-1.5 font-mono-tech text-[10px] leading-relaxed text-slate-500">
+                {telegramIdentity.isTelegram
+                  ? 'Auto-filled from your Telegram profile. Trade alerts will be sent here.'
+                  : 'Not in Telegram? Open @TaseenMarketBot, send /start, and copy the chat id it replies with. This is where your private alerts arrive.'}
+              </p>
+            </div>
+          )}
 
           <div>
             <label
@@ -277,7 +343,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 {loading
                   ? 'PROCESSING...'
                   : authMode === 'SIGNUP'
-                    ? 'Create Account & Set Password'
+                    ? 'Create Account (Pending Approval)'
                     : t.signInBtn}
               </NeonButton>
             )}

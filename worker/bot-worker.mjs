@@ -18,6 +18,12 @@ const ENV_TESTNET = (process.env.BINANCE_TESTNET || '').trim() === 'true';
 const BINANCE_ROUND_TRIP_FEE_PCT = 0.2; // 0.1% Buy + 0.1% Sell Spot taker fees
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
+/** Bot owner's Telegram chat: receives registration approvals. */
+const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || '').trim();
+/** Optional: promote this email to admin/approved on boot. */
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim();
+/** Account/approval table (one row per Supabase Auth user). */
+const USERS_TABLE = 'users';
 const TELEGRAM_MINI_APP_URL = (
   process.env.TELEGRAM_MINI_APP_URL || 'https://auto-trade-qxp7.onrender.com'
 ).trim();
@@ -172,6 +178,316 @@ async function loadUserApiKeys(scope) {
   };
 }
 
+function scopeForAccount(accountId) {
+  return `u:${String(accountId || '').trim()}`;
+}
+
+function accountIdFromScope(scope) {
+  const raw = String(scope || '');
+  return raw.startsWith('u:') ? raw.slice(2) : null;
+}
+
+/** Validates a Supabase access token from a browser request. */
+async function verifyAccessToken(req) {
+  const header = String(req?.headers?.authorization || '');
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return null;
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return null;
+    return data.user;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchAccountById(userId) {
+  const id = String(userId || '').trim();
+  if (!/^[0-9a-fA-F-]{36}$/.test(id)) return null;
+  const { data, error } = await supabase.from(USERS_TABLE).select('*').eq('id', id).maybeSingle();
+  if (error) {
+    if (!isMissingTableError(error)) console.warn('[USERS] account read failed:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function fetchAccountByChat(chatId) {
+  const clean = String(chatId || '').trim();
+  if (!clean) return null;
+  const { data, error } = await supabase
+    .from(USERS_TABLE)
+    .select('*')
+    .eq('telegram_chat_id', clean)
+    .maybeSingle();
+  if (error) {
+    if (!isMissingTableError(error)) console.warn('[USERS] chat lookup failed:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+let accountsTableAvailable = null;
+
+/** Cached probe: does this project have the accounts/approval table yet? */
+async function accountsEnabled() {
+  if (accountsTableAvailable !== null) return accountsTableAvailable;
+  const { error } = await supabase.from(USERS_TABLE).select('id').limit(1);
+  if (error && isMissingTableError(error)) {
+    accountsTableAvailable = false;
+    return false;
+  }
+  // Transient failure: fail closed (assume approval is required) without caching.
+  if (error) return true;
+  accountsTableAvailable = true;
+  return true;
+}
+
+const REGISTER_MARKUP = {
+  inline_keyboard: [
+    [{ text: '📝 Register / Login', web_app: { url: TELEGRAM_MINI_APP_URL } }],
+  ],
+};
+
+/** Prompt for a chat that has not registered an approved account yet. */
+function registrationPrompt(chatId) {
+  return [
+    '👋 <b>WELCOME TO AEGIS QUANT</b>',
+    '',
+    'This bot is the alert channel for a private multi-user trading platform.',
+    'Create an account (email + password) in the Mini App, then wait for admin approval:',
+    `<code>${TELEGRAM_MINI_APP_URL}</code>`,
+    '',
+    `Your Telegram chat id for the registration form:\n<code>${chatId}</code>`,
+    '',
+    'Once approved you can log in from any browser and this bot will send your private trade alerts.',
+  ].join('\n');
+}
+
+async function fetchApprovedAccounts() {
+  const { data, error } = await supabase
+    .from(USERS_TABLE)
+    .select('*')
+    .eq('approval_status', 'approved');
+  if (error) {
+    if (!isMissingTableError(error)) console.warn('[USERS] approved list failed:', error.message);
+    return null;
+  }
+  return data || [];
+}
+
+/** True when the Telegram sender owns an admin account or the ADMIN_CHAT_ID. */
+async function isAdminActor(from) {
+  const chatId = String(from?.id ?? '').trim();
+  if (!chatId) return false;
+  if (ADMIN_CHAT_ID && chatId === ADMIN_CHAT_ID) return true;
+  const account = await fetchAccountByChat(chatId);
+  return Boolean(account?.is_admin);
+}
+
+async function resolveAdminChatId() {
+  if (ADMIN_CHAT_ID) return ADMIN_CHAT_ID;
+  const { data } = await supabase
+    .from(USERS_TABLE)
+    .select('telegram_chat_id')
+    .eq('is_admin', true)
+    .not('telegram_chat_id', 'is', null)
+    .limit(1)
+    .maybeSingle();
+  return String(data?.telegram_chat_id || TELEGRAM_CHAT_ID || '').trim();
+}
+
+/**
+ * Every approved account gets its own settings row (its trading workspace),
+ * keyed `u:<auth uuid>` so both the worker and the web terminal use the same one.
+ */
+async function ensureWorkspaceForAccount(account) {
+  if (!account?.id) return null;
+  const scope = scopeForAccount(account.id);
+  const existing = await fetchUserSettings(scope);
+  if (existing) {
+    // Keep the alert chat pointed at the account's current Telegram chat id.
+    if (account.telegram_chat_id && String(existing.chat_id || '') !== String(account.telegram_chat_id)) {
+      await supabase
+        .from('settings')
+        .update({ chat_id: String(account.telegram_chat_id) })
+        .eq('id', existing.id);
+      existing.chat_id = String(account.telegram_chat_id);
+    }
+    return existing;
+  }
+
+  const live = String(account.trading_mode || 'VIRTUAL').toUpperCase() === 'LIVE';
+  const running = Boolean(account.bot_running);
+  const payload = {
+    [SCOPE_COLUMN]: scope,
+    telegram_username: account.telegram_username || null,
+    full_name: account.full_name || account.email || null,
+    chat_id: account.telegram_chat_id || null,
+    bot_enabled: running,
+    is_running: running,
+    bot_running: running,
+    trading_mode: live ? 'live' : 'virtual',
+    mode: live ? 'LIVE' : 'DEMO',
+    virtual_balance: Number(account.virtual_balance ?? DEMO_START_BALANCE),
+    telegram_enabled: true,
+    enabled_pairs: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'],
+    take_profit_pct: 2.4,
+    zero_loss_mode: true,
+    zero_loss_shield: true,
+    sell_only_in_profit: true,
+    dca_enabled: true,
+    dca_step_pct: 1.5,
+    dca_max_buys: 12,
+    max_open_trades: 5,
+    max_amount_per_pair: 500,
+    daily_loss_limit: 150,
+  };
+  let { data, error } = await supabase.from('settings').insert(payload).select('*').maybeSingle();
+  if (error && isMissingColumnError(error)) {
+    ({ data, error } = await supabase
+      .from('settings')
+      .insert({
+        [SCOPE_COLUMN]: scope,
+        chat_id: account.telegram_chat_id || null,
+        bot_enabled: running,
+      })
+      .select('*')
+      .maybeSingle());
+  }
+  if (error) {
+    console.warn('[USERS] workspace provisioning failed:', error.message);
+    return null;
+  }
+  console.log(`[USERS] Provisioned workspace ${scope} for ${account.email}.`);
+  return data || null;
+}
+
+/**
+ * Approves/rejects an application, provisions the workspace and tells the
+ * applicant privately. Used by both the Telegram buttons and the admin panel.
+ */
+async function applyApproval(userId, decision, actor = 'Admin') {
+  const account = await fetchAccountById(userId);
+  if (!account) return { ok: false, error: 'User not found' };
+  const status = decision === 'reject' ? 'rejected' : 'approved';
+  const { data: updated, error } = await supabase
+    .from(USERS_TABLE)
+    .update({ approval_status: status })
+    .eq('id', account.id)
+    .select('*')
+    .maybeSingle();
+  if (error) return { ok: false, error: error.message };
+  const user = updated || { ...account, approval_status: status };
+
+  if (status === 'approved') await ensureWorkspaceForAccount(user);
+
+  if (user.telegram_chat_id) {
+    const text =
+      status === 'approved'
+        ? [
+            '✅ <b>ACCOUNT APPROVED</b>',
+            '',
+            `Welcome, <b>${user.full_name || user.email || 'Trader'}</b>!`,
+            'Your Aegis Quant account is live. Log in with your email and password:',
+            `<code>${user.email || ''}</code>`,
+            '',
+            'Then set your Binance Spot API keys in Settings → Exchange Connection, and start the engine.',
+          ].join('\n')
+        : [
+            '❌ <b>ACCOUNT NOT APPROVED</b>',
+            '',
+            'Your Aegis Quant registration was rejected by the administrator.',
+            'Reply to the admin or register again with a different email.',
+          ].join('\n');
+    await sendTelegram(text, TELEGRAM_BOT_TOKEN, user.telegram_chat_id, {
+      replyMarkup: {
+        inline_keyboard: [[{ text: '📊 Open Terminal', web_app: { url: TELEGRAM_MINI_APP_URL } }]],
+      },
+    });
+  }
+
+  await appendLog(
+    'INFO',
+    `[ADMIN] ${actor} ${status} ${user.email || user.id}.`
+  );
+  return { ok: true, status, user };
+}
+
+/** Instant admin notification with one-tap approve/reject buttons. */
+async function notifyAdminOfPendingAccounts() {
+  if (!TELEGRAM_BOT_TOKEN) return 0;
+  const { data: pending, error } = await supabase
+    .from(USERS_TABLE)
+    .select('*')
+    .eq('approval_status', 'pending')
+    .is('admin_notified_at', null)
+    .order('created_at', { ascending: true })
+    .limit(10);
+  if (error) {
+    if (!isMissingTableError(error)) console.warn('[ADMIN] pending read failed:', error.message);
+    return 0;
+  }
+  if (!pending || pending.length === 0) return 0;
+  // First registration may be the owner: promote before looking for an admin chat.
+  await promoteConfiguredAdmin();
+  const adminChat = await resolveAdminChatId();
+  if (!adminChat) return 0;
+  let sent = 0;
+  for (const user of pending || []) {
+    const text = [
+      '🆕 <b>NEW REGISTRATION REQUEST</b>',
+      '',
+      `👤 Name: <b>${user.full_name || '—'}</b>`,
+      `📧 Email: <code>${user.email || '—'}</code>`,
+      `💬 Telegram: ${user.telegram_username ? `@${user.telegram_username}` : '—'} (${user.telegram_chat_id || 'no chat id'})`,
+      `🆔 User: <code>${user.id}</code>`,
+      '',
+      'Approve to grant access to the terminal and the 24/7 engine.',
+    ].join('\n');
+    const ok = await sendTelegram(text, TELEGRAM_BOT_TOKEN, adminChat, {
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: '✅ Approve User', callback_data: `approve_user:${user.id}` }],
+          [{ text: '❌ Reject User', callback_data: `reject_user:${user.id}` }],
+        ],
+      },
+    });
+    if (ok) {
+      sent += 1;
+      await supabase
+        .from(USERS_TABLE)
+        .update({ admin_notified_at: new Date().toISOString() })
+        .eq('id', user.id);
+    }
+  }
+  return sent;
+}
+
+/** Promotes the account that owns ADMIN_CHAT_ID / TELEGRAM_CHAT_ID on boot. */
+async function promoteConfiguredAdmin() {
+  const chatId = ADMIN_CHAT_ID || TELEGRAM_CHAT_ID;
+  if (!chatId && !ADMIN_EMAIL) return;
+  if (chatId) {
+    const { error } = await supabase
+      .from(USERS_TABLE)
+      .update({ is_admin: true, approval_status: 'approved', admin_notified_at: new Date().toISOString() })
+      .eq('telegram_chat_id', chatId);
+    if (error && !isMissingTableError(error)) {
+      console.warn('[ADMIN] auto-promote by chat failed:', error.message);
+    }
+  }
+  if (ADMIN_EMAIL) {
+    const { error } = await supabase
+      .from(USERS_TABLE)
+      .update({ is_admin: true, approval_status: 'approved', admin_notified_at: new Date().toISOString() })
+      .eq('email', ADMIN_EMAIL);
+    if (error && !isMissingTableError(error)) {
+      console.warn('[ADMIN] auto-promote by email failed:', error.message);
+    }
+  }
+}
+
 async function saveUserApiKeys(scope, apiKey, apiSecret, useTestnet) {
   if (!scope) return { ok: false, error: 'Missing workspace id' };
   const { error } = await supabase.from(USER_KEYS_TABLE).upsert(
@@ -185,6 +501,14 @@ async function saveUserApiKeys(scope, apiKey, apiSecret, useTestnet) {
     { onConflict: SCOPE_COLUMN }
   );
   if (error) return { ok: false, error: error.message };
+  // Mirror only a MASK onto the account row (admin roster shows "linked").
+  const accountId = accountIdFromScope(scope);
+  if (accountId) {
+    await supabase
+      .from(USERS_TABLE)
+      .update({ binance_api_key: maskSecret(apiKey) })
+      .eq('id', accountId);
+  }
   return { ok: true };
 }
 
@@ -229,8 +553,11 @@ function verifyTelegramInitData(initData) {
   }
 }
 
-/** Verified Telegram id wins over a claimed workspace id. */
-function resolveRequestScope(payload) {
+/** Verified Supabase session > verified Telegram initData > claimed workspace id. */
+function resolveRequestScope(payload, authUser = null) {
+  if (authUser?.id) {
+    return { scope: scopeForAccount(authUser.id), verified: null, error: null, accountScoped: true };
+  }
   const verified = verifyTelegramInitData(payload?.initData);
   if (verified) return { scope: verified.id, verified, error: null };
   const claimed = sanitiseScope(payload?.telegram_user_id ?? payload?.telegramUserId);
@@ -334,7 +661,7 @@ if (PORT > 0) {
               return;
             }
 
-            const { scope } = resolveRequestScope(data);
+            const { scope } = resolveRequestScope(data, await verifyAccessToken(req));
             if (scope) {
               // Keys are private to the requesting workspace: never written to a shared row.
               await saveUserApiKeys(scope, apiKey, apiSecret, testnet);
@@ -378,7 +705,10 @@ if (PORT > 0) {
       if ((req.method === 'GET' || req.method === 'POST') && (pathname === '/api/balance' || pathname === '/api/binance/balance')) {
         try {
           // Optional workspace scope: a user's terminal only ever sees its own account.
-          const scope = sanitiseScope(url.searchParams.get(SCOPE_COLUMN));
+          const authUser = await verifyAccessToken(req);
+          const scope = authUser?.id
+            ? scopeForAccount(authUser.id)
+            : sanitiseScope(url.searchParams.get(SCOPE_COLUMN));
           const ownerScope = !scope || scope === DEFAULT_OWNER_SCOPE;
           const { data: settingsRow } = scope
             ? { data: await fetchUserSettings(scope) }
@@ -464,7 +794,7 @@ if (PORT > 0) {
           try {
             const data = JSON.parse(body || '{}');
             // Manual orders execute against the CALLER'S workspace credentials only.
-            const { scope } = resolveRequestScope(data);
+            const { scope } = resolveRequestScope(data, await verifyAccessToken(req));
             const ownerScope = !scope || scope === DEFAULT_OWNER_SCOPE;
             const scopedRow = await fetchUserSettings(scope);
             const { data: settingsRow } = scopedRow
@@ -549,10 +879,13 @@ if (PORT > 0) {
       /** Per-user Binance key vault. Secrets are write-only; reads return a mask. */
       if (pathname === '/api/user/keys') {
         if (req.method === 'GET') {
-          const { scope } = resolveRequestScope({
-            telegram_user_id: url.searchParams.get('telegram_user_id'),
-            initData: url.searchParams.get('initData'),
-          });
+          const { scope } = resolveRequestScope(
+            {
+              telegram_user_id: url.searchParams.get('telegram_user_id'),
+              initData: url.searchParams.get('initData'),
+            },
+            await verifyAccessToken(req)
+          );
           const stored = await loadUserApiKeys(scope);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(
@@ -580,7 +913,7 @@ if (PORT > 0) {
                 res.end(JSON.stringify({ ok: false, error: 'API key and secret must be at least 16 characters' }));
                 return;
               }
-              const { scope, verified } = resolveRequestScope(data);
+              const { scope, verified } = resolveRequestScope(data, await verifyAccessToken(req));
               const saved = await saveUserApiKeys(
                 scope,
                 apiKey,
@@ -619,7 +952,7 @@ if (PORT > 0) {
         req.on('end', async () => {
           try {
             const data = JSON.parse(body || '{}');
-            const { scope } = resolveRequestScope(data);
+            const { scope } = resolveRequestScope(data, await verifyAccessToken(req));
             const stored = await loadUserApiKeys(scope);
             if (!stored?.apiKey || !stored?.apiSecret) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -676,6 +1009,124 @@ if (PORT > 0) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: err.message }));
         }
+        return;
+      }
+
+      /* ------------------------------------------------------------------ *
+       * Admin console API (Supabase session + is_admin required)
+       * ------------------------------------------------------------------ */
+
+      /** Lists every account with aggregates — never API secrets. */
+      if (req.method === 'GET' && pathname === '/api/admin/users') {
+        try {
+          const authUser = await verifyAccessToken(req);
+          if (!authUser) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Sign in required' }));
+            return;
+          }
+          const me = await fetchAccountById(authUser.id);
+          if (!me?.is_admin) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Admin access required' }));
+            return;
+          }
+
+          const { data: rows, error } = await supabase
+            .from(USERS_TABLE)
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(500);
+          if (error) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: error.message }));
+            return;
+          }
+          const { data: keyRows } = await supabase
+            .from(USER_KEYS_TABLE)
+            .select(SCOPE_COLUMN);
+          const linked = new Set((keyRows || []).map((row) => String(row[SCOPE_COLUMN] || '')));
+
+          const entries = (rows || []).map((row) => ({
+            id: row.id,
+            email: row.email,
+            full_name: row.full_name || '',
+            telegram_chat_id: row.telegram_chat_id || null,
+            telegram_username: row.telegram_username || null,
+            approval_status: row.approval_status || 'pending',
+            is_admin: Boolean(row.is_admin),
+            trading_mode: String(row.trading_mode || 'VIRTUAL').toUpperCase() === 'LIVE' ? 'LIVE' : 'VIRTUAL',
+            bot_running: Boolean(row.bot_running),
+            realized_pnl_usd: Number(row.realized_pnl_usd || 0),
+            total_trades: Number(row.total_trades || 0),
+            win_trades: Number(row.win_trades || 0),
+            has_keys: linked.has(scopeForAccount(row.id)),
+            created_at: row.created_at || null,
+          }));
+          const totals = entries.reduce(
+            (acc, entry) => {
+              acc.users += 1;
+              acc[entry.approval_status] = (acc[entry.approval_status] || 0) + 1;
+              acc.pnl_usd += entry.realized_pnl_usd;
+              return acc;
+            },
+            { users: 0, pending: 0, approved: 0, rejected: 0, pnl_usd: 0 }
+          );
+          totals.pnl_usd = Number(totals.pnl_usd.toFixed(2));
+          totals.pnl_bdt = Math.round(totals.pnl_usd * BDT_PER_USD);
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, entries, totals }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      /** Approve/reject from the web admin panel, with the same Telegram notice. */
+      if (req.method === 'POST' && pathname === '/api/admin/approval') {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const authUser = await verifyAccessToken(req);
+            if (!authUser) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Sign in required' }));
+              return;
+            }
+            const me = await fetchAccountById(authUser.id);
+            if (!me?.is_admin) {
+              res.writeHead(403, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Admin access required' }));
+              return;
+            }
+            const data = JSON.parse(body || '{}');
+            const decision = String(data.decision || '').toLowerCase() === 'reject' ? 'reject' : 'approve';
+            const result = await applyApproval(
+              data.user_id || data.userId,
+              decision,
+              me.email || String(authUser.id)
+            );
+            if (!result.ok) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(result));
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                status: result.status,
+                email: result.user?.email || null,
+              })
+            );
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
         return;
       }
 
@@ -1673,8 +2124,8 @@ async function ensureUserProfile({ telegramId, chatId, username, fullName }) {
   return data || null;
 }
 
-/** Every scoped workspace, falling back to the legacy single row. */
-async function fetchWorkspaceRows() {
+/** Pre-accounts project: scoped settings rows, else the legacy single row. */
+async function legacyWorkspaceRows() {
   const { data, error } = await supabase
     .from('settings')
     .select('*')
@@ -1689,9 +2140,23 @@ async function fetchWorkspaceRows() {
   }
   const rows = (data || []).filter((row) => scopeOf(row));
   if (rows.length > 0) return rows;
-  // A project upgraded from single-tenant keeps trading the original row.
   const legacy = await fetchSettingsRow();
   return legacy ? [legacy] : [];
+}
+
+/**
+ * Approved accounts only — the approval gate for the 24/7 engine. Each one is
+ * mapped to its own `u:<uuid>` settings workspace.
+ */
+async function fetchWorkspaceRows() {
+  const accounts = await fetchApprovedAccounts();
+  if (accounts === null) return legacyWorkspaceRows();
+  const rows = [];
+  for (const account of accounts) {
+    const row = await ensureWorkspaceForAccount(account);
+    if (row) rows.push(row);
+  }
+  return rows;
 }
 
 function isWorkspaceRunning(row) {
@@ -1763,10 +2228,61 @@ async function refreshUserStats(cfg) {
   if (upErr && !isMissingColumnError(upErr)) {
     console.warn('[USERS] stats sync failed:', upErr.message);
   }
+
+  // Mirror the same numbers onto the account row the admin panel and
+  // leaderboard read, so both channels always agree.
+  const accountId = accountIdFromScope(cfg.scope);
+  if (accountId) {
+    const { error: accountErr } = await supabase
+      .from(USERS_TABLE)
+      .update({
+        realized_pnl_usd: realized,
+        total_trades: total,
+        win_trades: wins,
+        open_positions: openPositions,
+        trade_history: tradeHistory,
+        bot_running: Boolean(cfg.isRunning),
+        trading_mode: cfg.mode === 'live' ? 'LIVE' : 'VIRTUAL',
+      })
+      .eq('id', accountId);
+    if (accountErr && !isMissingTableError(accountErr)) {
+      console.warn('[USERS] account mirror failed:', accountErr.message);
+    }
+  }
 }
 
 /** Ranked, key-free leaderboard rows shared by Telegram and the web terminal. */
 async function buildLeaderboardRows() {
+  // Accounts are the public leaderboard source: aggregates only, never keys.
+  const { data: accounts, error: accountsErr } = await supabase
+    .from(USERS_TABLE)
+    .select(
+      'id,email,full_name,telegram_username,trading_mode,approval_status,realized_pnl_usd,total_trades,win_trades,bot_running'
+    )
+    .eq('approval_status', 'approved');
+  if (!accountsErr && Array.isArray(accounts)) {
+    return accounts
+      .map((account) => {
+        const trades = Number(account.total_trades || 0);
+        const wins = Number(account.win_trades || 0);
+        const pnlUsd = Number(Number(account.realized_pnl_usd || 0).toFixed(2));
+        return {
+          telegram_user_id: scopeForAccount(account.id),
+          name: String(account.full_name || account.email || 'Trader'),
+          username:
+            String(account.telegram_username || '').replace(/^@/, '') || null,
+          mode: String(account.trading_mode || '').toUpperCase() === 'LIVE' ? 'LIVE' : 'DEMO',
+          running: Boolean(account.bot_running),
+          trades,
+          wins,
+          win_rate: trades > 0 ? Number(((wins / trades) * 100).toFixed(1)) : 0,
+          pnl_usd: pnlUsd,
+          pnl_bdt: Math.round(pnlUsd * BDT_PER_USD),
+        };
+      })
+      .sort((a, b) => b.pnl_usd - a.pnl_usd);
+  }
+
   const { data: users, error: usersErr } = await supabase
     .from('settings')
     .select('*')
@@ -2340,19 +2856,56 @@ async function handleTelegramCallback(callbackQuery, token) {
   const from = callbackQuery?.from || {};
   const incomingChatId = String(callbackQuery?.message?.chat?.id ?? '').trim();
 
-  // The tap belongs to whoever pressed it — resolve THEIR workspace, not the owner's.
-  const settings = await ensureUserProfile({
-    telegramId: from.id ? String(from.id) : '',
-    chatId: incomingChatId,
-    username: from.username || null,
-    fullName: [from.first_name, from.last_name].filter(Boolean).join(' '),
-  });
+  /* ---- Admin approval buttons: the only privileged callback actions ---- */
+  if (data.startsWith('approve_user:') || data.startsWith('reject_user:')) {
+    const decision = data.startsWith('approve_user:') ? 'approve' : 'reject';
+    const targetId = data.slice(data.indexOf(':') + 1).trim();
+    if (!(await isAdminActor(from))) {
+      await answerCallbackQuery(token, id, 'Admins only', true);
+      return;
+    }
+    const actor = from.username ? `@${from.username}` : String(from.id || 'admin');
+    const result = await applyApproval(targetId, decision, actor);
+    await answerCallbackQuery(
+      token,
+      id,
+      result.ok
+        ? `${decision === 'approve' ? '✅ Approved' : '❌ Rejected'}: ${result.user?.email || targetId}`
+        : result.error || 'Action failed',
+      !result.ok
+    );
+    const adminChat = await resolveAdminChatId();
+    if (result.ok && adminChat) {
+      await sendTelegram(
+        `${decision === 'approve' ? '✅' : '❌'} <b>${result.user?.email || targetId}</b> ${
+          result.status
+        } by ${actor}.`,
+        token,
+        adminChat,
+        { replyMarkup: null }
+      );
+    }
+    return;
+  }
+
+  // The tap belongs to whoever pressed it — resolve THEIR approved account.
+  const account = await fetchAccountByChat(incomingChatId);
+  if (!account) {
+    await answerCallbackQuery(token, id, 'Register in the Mini App first', true);
+    return;
+  }
+  if (account.approval_status !== 'approved') {
+    await answerCallbackQuery(token, id, `Account ${account.approval_status} — awaiting admin approval`, true);
+    return;
+  }
+  const settings = await ensureWorkspaceForAccount(account);
   if (!settings) {
     await answerCallbackQuery(token, id, 'Workspace not found', true);
     return;
   }
   const cfg = await buildUserCfg(settings);
-  const chatId = cfg.telegramChatId || incomingChatId;
+  cfg.telegramChatId = String(account.telegram_chat_id || cfg.telegramChatId || incomingChatId);
+  const chatId = cfg.telegramChatId;
   if (!chatId) {
     await answerCallbackQuery(token, id, 'No private chat linked to this workspace', true);
     return;
@@ -2470,13 +3023,47 @@ async function pollTelegramUpdates() {
       const senderName =
         [from.first_name, from.last_name].filter(Boolean).join(' ') ||
         (from.username ? `@${from.username}` : 'Trader');
-      // Each sender is provisioned/looked up independently — no shared owner chat.
-      const senderSettings = await ensureUserProfile({
-        telegramId: from.id ? String(from.id) : '',
-        chatId: incomingChatId,
-        username: from.username || null,
-        fullName: senderName,
-      });
+      // Approval gate: the sender's chat id must map to an approved account.
+      if (!(await accountsEnabled())) {
+        // Pre-accounts project: keep the previous auto-provision behaviour.
+        const legacySettings = await ensureUserProfile({
+          telegramId: from.id ? String(from.id) : '',
+          chatId: incomingChatId,
+          username: from.username || null,
+          fullName: senderName,
+        });
+        if (!legacySettings) continue;
+        await handleTelegramCommand(text, token, incomingChatId, senderName, legacySettings);
+        continue;
+      }
+
+      const account = await fetchAccountByChat(incomingChatId);
+      if (!account) {
+        await sendTelegram(registrationPrompt(incomingChatId), token, incomingChatId, {
+          replyMarkup: REGISTER_MARKUP,
+        });
+        continue;
+      }
+      if (account.approval_status !== 'approved') {
+        await sendTelegram(
+          [
+            account.approval_status === 'rejected'
+              ? '❌ <b>ACCOUNT REJECTED</b>'
+              : '⏳ <b>ACCOUNT PENDING APPROVAL</b>',
+            '',
+            `Account: <code>${account.email || 'unknown'}</code>`,
+            account.approval_status === 'rejected'
+              ? 'Your registration was declined. Contact the administrator.'
+              : 'The admin has been notified — you will get a message here the moment access is granted.',
+          ].join('\n'),
+          token,
+          incomingChatId,
+          { replyMarkup: REGISTER_MARKUP }
+        );
+        continue;
+      }
+
+      const senderSettings = await ensureWorkspaceForAccount(account);
       if (!senderSettings) {
         console.warn(`[TELEGRAM BOT] No workspace resolved for chat ${incomingChatId} — ignored.`);
         continue;
@@ -3090,6 +3677,11 @@ async function runCycle() {
     const stamp = new Date().toISOString();
     for (const row of rows.filter((r) => !isWorkspaceRunning(r))) {
       await supabase.from('settings').update({ last_heartbeat: stamp }).eq('id', row.id);
+      // Keep the account mirror honest for stopped engines too.
+      const stoppedAccountId = accountIdFromScope(scopeOf(row));
+      if (stoppedAccountId) {
+        await supabase.from(USERS_TABLE).update({ bot_running: false }).eq('id', stoppedAccountId);
+      }
     }
 
     const active = rows.filter(isWorkspaceRunning);
@@ -3117,6 +3709,10 @@ async function startWorker() {
     '[AEGIS WORKER] Started — multi-user 24/7 engine. Each telegram_user_id runs with its own mode, keys and risk profile; polling every 15s...'
   );
   await logServerPublicIp();
+  await promoteConfiguredAdmin();
+  // Registration approvals: notify the admin instantly, then keep watching.
+  void notifyAdminOfPendingAccounts();
+  setInterval(() => void notifyAdminOfPendingAccounts(), 30_000);
   void startTelegramCommandLoop();
   // Midnight Asia/Dhaka PnL report — checked every minute, sent once per day.
   setInterval(() => void dailyReportLoop(), 60_000);
