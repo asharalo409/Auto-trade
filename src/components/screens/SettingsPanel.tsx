@@ -57,6 +57,10 @@ interface SettingsPanelProps {
   ) => Promise<{ ok: boolean; detail: string }>;
   onSaveBinance: (cfg: BinanceConfig) => void;
   onVerifyBinance: (cfg: BinanceConfig) => Promise<{ ok: boolean; detail: string }>;
+  voiceEnabled: boolean;
+  onToggleVoice: (enabled: boolean) => void;
+  onTestVoice: () => void;
+  onSpeakBalance: () => void;
 }
 
 const LOT_PRESETS = [1, 5, 10, 25, 50, 100, 250];
@@ -79,6 +83,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   onSendBalanceTelegram,
   onSaveBinance,
   onVerifyBinance,
+  voiceEnabled,
+  onToggleVoice,
+  onTestVoice,
+  onSpeakBalance,
 }) => {
   const [draft, setDraft] = useState<BotSettings>(settings);
   const [tgDraft, setTgDraft] = useState<TelegramConfig>(telegramConfig);
@@ -332,6 +340,57 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 >
                   {audioSilent ? t.soundMutedBadge : t.soundOnBadge}
                 </span>
+              </div>
+            </div>
+
+            {/* Built-in Browser Voice & SFX Announcer (Web Audio + speechSynthesis) */}
+            <div className="rounded-xl border border-cyan-500/35 bg-[#05070d] p-3.5 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  {voiceEnabled ? (
+                    <Volume2 className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
+                  ) : (
+                    <VolumeX className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
+                  )}
+                  <div>
+                    <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-slate-100 uppercase">
+                      <span>{t.voiceSfxTitle}</span>
+                      <InfoTip text={t.voiceSfxHint} label={t.voiceSfxTitle} />
+                    </div>
+                    <p className="mt-0.5 text-[11px] text-slate-400">{t.voiceSfxHint}</p>
+                  </div>
+                </div>
+                <SciFiSwitch
+                  checked={voiceEnabled}
+                  onChange={(v) => {
+                    audioSynth.playToggle(v);
+                    onToggleVoice(v);
+                  }}
+                  label={t.voiceSfxTitle}
+                  accent="cyan"
+                />
+              </div>
+              <div className="flex flex-wrap justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    audioSynth.playClick();
+                    onTestVoice();
+                  }}
+                  className="cursor-pointer rounded border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1 font-mono-tech text-[10px] font-semibold text-cyan-200 hover:bg-cyan-500/20"
+                >
+                  🔊 {t.testVoiceBtn}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    audioSynth.playClick();
+                    onSpeakBalance();
+                  }}
+                  className="cursor-pointer rounded border border-slate-600/60 bg-slate-800/40 px-2.5 py-1 font-mono-tech text-[10px] font-semibold text-slate-200 hover:bg-slate-700/40"
+                >
+                  🗣️ {t.speakBalanceBtn}
+                </button>
               </div>
             </div>
 

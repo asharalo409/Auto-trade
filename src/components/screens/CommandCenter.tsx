@@ -15,6 +15,8 @@ import {
   ShieldAlert,
   ShieldCheck,
   TrendingUp,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import {
@@ -35,6 +37,7 @@ import {
   sendDesktopNotification,
 } from '../../lib/desktopNotifications';
 import { TERMINAL_THEMES } from '../../lib/themes';
+import { voiceAnnouncer } from '../../lib/voiceAnnouncer';
 import {
   BinanceAccountSummary,
   BotSettings,
@@ -87,6 +90,9 @@ interface CommandCenterProps {
   binanceAccount: BinanceAccountSummary | null;
   syncingBalance: boolean;
   alertEnabledPairs: string[];
+  voiceEnabled: boolean;
+  onToggleVoice: (enabled: boolean) => void;
+  onTestVoice: () => void;
   getEquitySeries: (tf: EquityTimeframe) => EquityPoint[];
   onToggleBot: () => Promise<void>;
   onToggleTelegram: (enabled: boolean) => Promise<void>;
@@ -137,6 +143,9 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   binanceAccount,
   syncingBalance,
   alertEnabledPairs,
+  voiceEnabled,
+  onToggleVoice,
+  onTestVoice,
   getEquitySeries,
   onToggleBot,
   onToggleTelegram,
@@ -152,6 +161,20 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   const reducedMotion = useReducedMotion();
   const [timeframe, setTimeframe] = useState<EquityTimeframe>('1D');
   const [chartPair, setChartPair] = useState<string>('BTCUSDT');
+  const lastChartTickRef = useRef<{ symbol: string; price: number } | null>(null);
+
+  // Subtle Web Audio tick when the charted pair moves meaningfully. The announcer
+  // rate-limits these so a fast feed can never turn into a chirping machine gun.
+  useEffect(() => {
+    const pair = marketPairs.find((p) => p.symbol === chartPair);
+    if (!pair || pair.price <= 0) return;
+    const prev = lastChartTickRef.current;
+    lastChartTickRef.current = { symbol: chartPair, price: pair.price };
+    if (!prev || prev.symbol !== chartPair || !voiceAnnouncer.isEnabled()) return;
+    const deltaPct = ((pair.price - prev.price) / prev.price) * 100;
+    if (deltaPct >= 0.05) voiceAnnouncer.candleUp();
+    else if (deltaPct <= -0.05) voiceAnnouncer.candleDown();
+  }, [chartPair, marketPairs]);
   const [toggling, setToggling] = useState(false);
 
   // Profit/Loss Calculator Overlay State
@@ -1007,6 +1030,56 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 void onToggleTelegram(v);
               }}
               label={t.telegramSignalsTitle}
+              accent="cyan"
+            />
+          </div>
+        </div>
+
+        {/* Master Voice & SFX switch + audio unlock test for mobile Chrome */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/80 pt-2.5">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <div
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+                voiceEnabled
+                  ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-300'
+                  : 'border-slate-700 bg-slate-900/60 text-slate-500'
+              }`}
+            >
+              {voiceEnabled ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-display text-xs font-bold tracking-wider text-slate-100 uppercase">
+                <span>{t.voiceSfxTitle}</span>
+              </div>
+              <p className="truncate font-mono-tech text-[11px] text-slate-400">
+                {voiceEnabled ? t.voiceSfxOnHint : t.voiceSfxOffHint}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                audioSynth.playClick();
+                onTestVoice();
+              }}
+              className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-cyan-500/45 bg-cyan-500/12 px-3 py-1 font-mono-tech text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/22"
+            >
+              <Volume2 className="h-3.5 w-3.5" />
+              <span>{t.testVoiceBtn}</span>
+            </button>
+            <span
+              className={`font-mono-tech text-[11px] font-bold ${
+                voiceEnabled ? 'text-cyan-300' : 'text-slate-500'
+              }`}
+            >
+              {voiceEnabled ? t.voiceOn : t.voiceOff}
+            </span>
+            <SciFiSwitch
+              checked={voiceEnabled}
+              onChange={onToggleVoice}
+              label={t.voiceSfxTitle}
               accent="cyan"
             />
           </div>

@@ -445,7 +445,12 @@ export default function App() {
                   }
                   onQuickTrade={terminal.placeQuickTrade}
                   onResetVirtual={() => terminal.resetVirtualBalance(10000)}
-                  onRefreshBalance={terminal.refreshBinanceBalance}
+                  voiceEnabled={terminal.voiceEnabled}
+                  onToggleVoice={terminal.toggleVoice}
+                  onTestVoice={terminal.testVoice}
+                  onRefreshBalance={() =>
+                    terminal.refreshBinanceBalance(undefined, { announce: true })
+                  }
                   onSendSignalTelegram={terminal.sendSignalToTelegram}
                   onSendBalanceTelegram={terminal.sendTelegramBalanceSnapshot}
                   onNavigateTab={(tab) => handleTabChange(tab)}
@@ -525,6 +530,10 @@ export default function App() {
                   onSendBalanceTelegram={terminal.sendTelegramBalanceSnapshot}
                   onSaveBinance={terminal.setBinanceConfig}
                   onVerifyBinance={terminal.verifyBinanceCredentials}
+                  voiceEnabled={terminal.voiceEnabled}
+                  onToggleVoice={terminal.toggleVoice}
+                  onTestVoice={terminal.testVoice}
+                  onSpeakBalance={terminal.speakBalance}
                 />
               )}
             </motion.div>

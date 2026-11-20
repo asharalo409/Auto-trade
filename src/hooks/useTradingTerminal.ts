@@ -20,6 +20,13 @@ import { dispatchTelegramAlert } from '../lib/telegram';
 import { MIN_TRADEABLE_USDT } from '../lib/tradeLimits';
 import { getTimeBasedTheme } from '../lib/themes';
 import {
+  balanceSentence,
+  buySentence,
+  catchUpSentence,
+  sellSentence,
+  voiceAnnouncer,
+} from '../lib/voiceAnnouncer';
+import {
   BinanceAccountSummary,
   BinanceConfig,
   BotSettings,
@@ -366,6 +373,8 @@ export function useTradingTerminal() {
   );
   const [binanceAccount, setBinanceAccount] = useState<BinanceAccountSummary | null>(null);
   const [syncingBalance, setSyncingBalance] = useState(false);
+  // Master Voice & SFX switch. Mirrors the announcer module so the UI can render it.
+  const [voiceEnabled, setVoiceEnabled] = useState<boolean>(() => voiceAnnouncer.isEnabled());
 
   const [alertEnabledPairs, setAlertEnabledPairs] = useState<string[]>(() =>
     loadJson<string[]>(STORAGE_ALERT_PAIRS_KEY, [...SUPPORTED_PAIRS])
@@ -392,6 +401,15 @@ export function useTradingTerminal() {
   const demoTradesRef = useRef<Trade[]>(demoTrades);
   const liveTradesRef = useRef<Trade[]>(liveTrades);
   const binanceAccountRef = useRef<BinanceAccountSummary | null>(binanceAccount);
+  const demoSettingsRef = useRef<BotSettings>(demoSettings);
+  const liveSettingsRef = useRef<BotSettings>(liveSettings);
+  const activeWorkspaceRef = useRef<TradingMode>(activeWorkspace);
+  // Trades/ids the announcer already knows about, so a reload, a hydration batch or a
+  // realtime echo never re-reads old fills out loud.
+  const seenTradeIdsRef = useRef<Set<string>>(new Set());
+  const seenClosedIdsRef = useRef<Set<string>>(new Set());
+  const voiceHydratedRef = useRef(false);
+  const balanceAnnouncedRef = useRef(false);
   useEffect(() => {
     marketPairsRef.current = marketPairs;
   }, [marketPairs]);
@@ -404,6 +422,31 @@ export function useTradingTerminal() {
   useEffect(() => {
     binanceAccountRef.current = binanceAccount;
   }, [binanceAccount]);
+  useEffect(() => {
+    demoSettingsRef.current = demoSettings;
+  }, [demoSettings]);
+  useEffect(() => {
+    liveSettingsRef.current = liveSettings;
+  }, [liveSettings]);
+  useEffect(() => {
+    activeWorkspaceRef.current = activeWorkspace;
+  }, [activeWorkspace]);
+
+  const balanceForVoice = useCallback((workspace: TradingMode): number => {
+    if (workspace === 'LIVE') {
+      const account = binanceAccountRef.current;
+      return account?.connected
+        ? pickPortfolioUsd(account)
+        : Number(liveSettingsRef.current.balance_usdt ?? 0);
+    }
+    return Number(demoSettingsRef.current.balance_usdt ?? 10000);
+  }, []);
+
+  // Unlock Web Audio / speechSynthesis on the very first tap, click or keypress so
+  // Android Chrome does not silently drop every later announcement.
+  useEffect(() => {
+    voiceAnnouncer.installUnlockHandlers();
+  }, []);
 
   const settings = activeWorkspace === 'DEMO' ? demoSettings : liveSettings;
   const trades = activeWorkspace === 'DEMO' ? demoTrades : liveTrades;
@@ -805,9 +848,26 @@ export function useTradingTerminal() {
           const closedSince = (t: Trade) =>
             new Date(t.closed_at ?? t.opened_at).getTime() > lastHydratedAtRef.current;
           const missed = rows.filter(closedSince);
+          // Everything in a bulk fetch is history, not a fresh fill: mark it spoken so
+          // the announcer only reads the single catch-up summary below.
+          for (const t of rows) {
+            seenTradeIdsRef.current.add(t.id);
+            if (t.status === 'CLOSED') seenClosedIdsRef.current.add(t.id);
+          }
           setLiveTrades(rows.filter((t) => t.mode !== 'DEMO'));
           setDemoTrades(rows.filter((t) => t.mode === 'DEMO'));
           if (missed.length > 0 && hasHydratedRef.current) {
+            // One concise catch-up summary beats reading 20 restored trades one by one.
+            for (const t of missed) {
+              seenTradeIdsRef.current.add(t.id);
+              if (t.status === 'CLOSED') seenClosedIdsRef.current.add(t.id);
+            }
+            const netPnl = missed.reduce((acc, t) => acc + (t.profit_usdt || 0), 0);
+            const mode = activeWorkspaceRef.current;
+            const rowVirtual = Number(settingsRow?.virtual_balance ?? settingsRow?.demo_balance);
+            const balance =
+              mode === 'DEMO' && Number.isFinite(rowVirtual) ? rowVirtual : balanceForVoice(mode);
+            voiceAnnouncer.speak(catchUpSentence(missed.length, netPnl, balance));
             const summary: LogEntry = {
               id: `catchup-${Date.now()}`,
               level: 'INFO',
@@ -821,7 +881,18 @@ export function useTradingTerminal() {
         }
       }
       lastHydratedAtRef.current = Date.now();
+      const firstHydration = !hasHydratedRef.current;
       hasHydratedRef.current = true;
+
+      // Login hydration: announce the exact balance once, not on every refetch.
+      if (firstHydration && !balanceAnnouncedRef.current) {
+        balanceAnnouncedRef.current = true;
+        const mode = activeWorkspaceRef.current;
+        const rowVirtual = Number(settingsRow?.virtual_balance ?? settingsRow?.demo_balance);
+        const amount =
+          mode === 'DEMO' && Number.isFinite(rowVirtual) ? rowVirtual : balanceForVoice(mode);
+        voiceAnnouncer.speak(balanceSentence(mode, amount));
+      }
 
       const combinedLogs: LogEntry[] = [
         ...(logsRes.data
@@ -846,7 +917,7 @@ export function useTradingTerminal() {
     } finally {
       setDataLoading(false);
     }
-  }, [isAuthenticated, isDemoMode]);
+  }, [balanceForVoice, isAuthenticated, isDemoMode]);
 
   useEffect(() => {
     if (!supabase || isDemoMode || !isAuthenticated) return;
@@ -1385,6 +1456,64 @@ export function useTradingTerminal() {
     };
   }, [trades, settings.balance_usdt, activeWorkspace, binanceAccount]);
 
+  const speakBalance = useCallback(() => {
+    voiceAnnouncer.unlock();
+    voiceAnnouncer.speak(balanceSentence(activeWorkspaceRef.current, stats.balance));
+  }, [stats.balance]);
+
+  const toggleVoice = useCallback((enabled: boolean) => {
+    voiceAnnouncer.setEnabled(enabled);
+    setVoiceEnabled(enabled);
+    // The switch itself is a user gesture, so enabling it is the natural moment to
+    // unlock audio and confirm the announcer works.
+    if (enabled) voiceAnnouncer.test();
+  }, []);
+
+  const testVoice = useCallback(() => {
+    if (!voiceAnnouncer.isEnabled()) {
+      voiceAnnouncer.setEnabled(true);
+      setVoiceEnabled(true);
+    }
+    voiceAnnouncer.test();
+  }, []);
+
+  // Speaks every new fill once: BUY on arrival, SELL when an open trade closes. The
+  // first run only records what is already on screen (reload) and hydrated catch-up
+  // batches are pre-marked in fetchSupabaseData so they get one summary instead.
+  useEffect(() => {
+    const announce = (next: Trade[], workspace: TradingMode) => {
+      for (const trade of next) {
+        const isNew = !seenTradeIdsRef.current.has(trade.id);
+        if (isNew) {
+          seenTradeIdsRef.current.add(trade.id);
+          if (
+            voiceHydratedRef.current &&
+            voiceAnnouncer.isEnabled() &&
+            trade.side === 'BUY' &&
+            trade.status === 'OPEN'
+          ) {
+            voiceAnnouncer.tradeChime();
+            voiceAnnouncer.speak(buySentence(trade.pair, trade.entry_price, trade.invested_usdt));
+          }
+        }
+        if (trade.status === 'CLOSED' && !seenClosedIdsRef.current.has(trade.id)) {
+          seenClosedIdsRef.current.add(trade.id);
+          if (voiceHydratedRef.current && voiceAnnouncer.isEnabled() && !isNew) {
+            const pnl = trade.profit_usdt;
+            if (Math.abs(pnl) >= 0.005) {
+              if (pnl > 0) voiceAnnouncer.successChime();
+              else voiceAnnouncer.lossTone();
+            }
+            voiceAnnouncer.speak(sellSentence(trade.pair, pnl, balanceForVoice(workspace)));
+          }
+        }
+      }
+    };
+    announce(demoTrades, 'DEMO');
+    announce(liveTrades, 'LIVE');
+    voiceHydratedRef.current = true;
+  }, [demoTrades, liveTrades, balanceForVoice]);
+
   const getEquitySeries = useCallback(
     (timeframe: EquityTimeframe): EquityPoint[] => {
       if (activeWorkspace === 'LIVE') {
@@ -1878,7 +2007,10 @@ export function useTradingTerminal() {
   );
 
   const refreshBinanceBalance = useCallback(
-    async (cfgOverride?: BinanceConfig): Promise<BinanceAccountSummary & { ok: boolean }> => {
+    async (
+      cfgOverride?: BinanceConfig,
+      options?: { announce?: boolean }
+    ): Promise<BinanceAccountSummary & { ok: boolean }> => {
       const activeCfg = cfgOverride ?? binanceConfig;
       const apiKey = activeCfg.api_key.trim();
       const apiSecret = activeCfg.api_secret.trim();
@@ -1954,6 +2086,10 @@ export function useTradingTerminal() {
           };
           setBinanceAccount(summary);
           setLiveSettings((prev) => ({ ...prev, balance_usdt: usdtBal }));
+          if (options?.announce) {
+            voiceAnnouncer.unlock();
+            voiceAnnouncer.speak(balanceSentence('LIVE', usdtBal));
+          }
           return summary;
         }
 
@@ -2128,6 +2264,8 @@ export function useTradingTerminal() {
         assetsLines;
 
       const res = await dispatchTelegramAlert(activeTg, payloadText);
+      voiceAnnouncer.unlock();
+      voiceAnnouncer.speak(balanceSentence(activeWorkspace, liveUsd));
       if (res.ok) {
         console.info('[useTradingTerminal] sendTelegramBalanceSnapshot succeeded:', res);
       } else {
@@ -2415,6 +2553,10 @@ export function useTradingTerminal() {
     closeTrade,
     placeQuickTrade,
     resetVirtualBalance,
+    voiceEnabled,
+    toggleVoice,
+    testVoice,
+    speakBalance,
     testTelegramConnection,
     sendTelegramBalanceSnapshot,
     sendSignalToTelegram,
