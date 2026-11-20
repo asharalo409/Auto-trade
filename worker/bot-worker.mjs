@@ -333,14 +333,19 @@ async function ensureWorkspaceForAccount(account) {
 
   const live = String(account.trading_mode || 'VIRTUAL').toUpperCase() === 'LIVE';
   const running = Boolean(account.bot_running);
+  // Independent switches, seeded from the account row when it already has them.
+  const demoRunning = Boolean(account.demo_bot_running ?? (!live && running));
+  const liveRunning = Boolean(account.live_bot_running ?? (live && running));
   const payload = {
     [SCOPE_COLUMN]: scope,
     telegram_username: account.telegram_username || null,
     full_name: account.full_name || account.email || null,
     chat_id: account.telegram_chat_id || null,
     bot_enabled: running,
-    is_running: running,
-    bot_running: running,
+    is_running: demoRunning || liveRunning,
+    bot_running: demoRunning || liveRunning,
+    demo_bot_running: demoRunning,
+    live_bot_running: liveRunning,
     trading_mode: live ? 'live' : 'virtual',
     mode: live ? 'LIVE' : 'DEMO',
     virtual_balance: Number(account.virtual_balance ?? DEMO_START_BALANCE),
@@ -600,24 +605,19 @@ async function buildUserCfg(settings) {
   cfg.displayName = cfg.account?.full_name || userLabel(settings);
   cfg.avatarUrl = cfg.account?.avatar_url || null;
   cfg.email = cfg.account?.email || null;
+  // STRICT ISOLATION: only this workspace's vault row. No global env keys and no
+  // settings-row key ever stand in for a user who has not linked their own pair.
   const stored = await loadUserApiKeys(cfg.scope);
-  const ownerScope = !cfg.scope || cfg.scope === DEFAULT_OWNER_SCOPE;
-  cfg.apiKey = (
-    stored?.apiKey ||
-    (ownerScope ? ENV_BINANCE_KEY : '') ||
-    settings.binance_api_key ||
-    ''
-  ).trim();
-  cfg.apiSecret = (
-    stored?.apiSecret ||
-    (ownerScope ? ENV_BINANCE_SECRET : '') ||
-    settings.binance_api_secret ||
-    ''
-  ).trim();
+  cfg.apiKey = String(stored?.apiKey || '').trim();
+  cfg.apiSecret = String(stored?.apiSecret || '').trim();
   cfg.useTestnet =
     process.env.BINANCE_TESTNET === 'false'
       ? false
       : ENV_TESTNET || Boolean(stored?.useTestnet ?? settings.use_testnet);
+  // A signed-in workspace always alerts its own Telegram chat, never the admin's.
+  cfg.telegramChatId = String(
+    cfg.account?.telegram_chat_id || settings.chat_id || settings.telegram_chat_id || ''
+  ).trim();
   cfg.hasCredentials = Boolean(cfg.apiKey && cfg.apiSecret);
   return cfg;
 }
@@ -807,7 +807,6 @@ if (PORT > 0) {
           const scope = authUser?.id
             ? scopeForAccount(authUser.id)
             : sanitiseScope(url.searchParams.get(SCOPE_COLUMN));
-          const ownerScope = !scope || scope === DEFAULT_OWNER_SCOPE;
           const { data: settingsRow } = scope
             ? { data: await fetchUserSettings(scope) }
             : await supabase.from('settings').select('*').limit(1).maybeSingle();
@@ -817,19 +816,10 @@ if (PORT > 0) {
             return;
           }
 
+          // Only the requesting workspace's own vault keys are ever used here.
           const stored = scope ? await loadUserApiKeys(scope) : null;
-          const apiKey = (
-            stored?.apiKey ||
-            (ownerScope ? ENV_BINANCE_KEY : '') ||
-            settingsRow.binance_api_key ||
-            ''
-          ).trim();
-          const apiSecret = (
-            stored?.apiSecret ||
-            (ownerScope ? ENV_BINANCE_SECRET : '') ||
-            settingsRow.binance_api_secret ||
-            ''
-          ).trim();
+          const apiKey = String(stored?.apiKey || '').trim();
+          const apiSecret = String(stored?.apiSecret || '').trim();
           const useTestnet =
             process.env.BINANCE_TESTNET === 'false'
               ? false
@@ -903,26 +893,14 @@ if (PORT > 0) {
             const data = JSON.parse(body || '{}');
             // Manual orders execute against the CALLER'S workspace credentials only.
             const { scope } = resolveRequestScope(data, await verifyAccessToken(req));
-            const ownerScope = !scope || scope === DEFAULT_OWNER_SCOPE;
             const scopedRow = await fetchUserSettings(scope);
             const { data: settingsRow } = scopedRow
               ? { data: scopedRow }
               : await supabase.from('settings').select('*').limit(1).maybeSingle();
             const stored = await loadUserApiKeys(scope);
-            const apiKey = (
-              data.apiKey ||
-              stored?.apiKey ||
-              (ownerScope ? ENV_BINANCE_KEY : '') ||
-              settingsRow?.binance_api_key ||
-              ''
-            ).trim();
-            const apiSecret = (
-              data.apiSecret ||
-              stored?.apiSecret ||
-              (ownerScope ? ENV_BINANCE_SECRET : '') ||
-              settingsRow?.binance_api_secret ||
-              ''
-            ).trim();
+            // Strictly the caller's own vault pair — no global env or shared row fallback.
+            const apiKey = String(stored?.apiKey || '').trim();
+            const apiSecret = String(stored?.apiSecret || '').trim();
             const useTestnet =
               process.env.BINANCE_TESTNET === 'false'
                 ? false
@@ -2173,19 +2151,29 @@ function resolveTradingConfig(settings) {
   const runFlag = settings.is_running ?? settings.bot_running ?? settings.engine_running;
   const isRunning =
     runFlag === null || runFlag === undefined ? Boolean(settings.bot_enabled) : Boolean(runFlag);
+  const mode = normalizeTradingMode(
+    settings.workspace_mode ?? settings.trading_mode ?? settings.mode
+  );
+  // DEMO and LIVE each own an independent power switch. Rows written before those
+  // columns existed fall back to the single legacy flag scoped to their own mode.
+  const demoFlag = settings.demo_bot_running;
+  const liveFlag = settings.live_bot_running;
+  const demoRunning =
+    demoFlag === null || demoFlag === undefined ? isRunning && mode === 'virtual' : Boolean(demoFlag);
+  const liveRunning =
+    liveFlag === null || liveFlag === undefined ? isRunning && mode === 'live' : Boolean(liveFlag);
   return {
-    isRunning,
-    mode: normalizeTradingMode(
-      settings.workspace_mode ?? settings.trading_mode ?? settings.mode
-    ),
+    isRunning: demoRunning || liveRunning,
+    demoRunning,
+    liveRunning,
+    mode,
     telegramEnabled: settings.telegram_enabled !== false,
     // One shared @TaseenMarketBot talks to every user; only the chat differs.
     telegramToken: String(
       TELEGRAM_BOT_TOKEN || settings.telegram_bot_token || settings.bot_token || ''
     ).trim(),
-    telegramChatId: String(
-      settings.chat_id || settings.telegram_chat_id || TELEGRAM_CHAT_ID || ''
-    ).trim(),
+    // Strictly this workspace's own chat — never the global TELEGRAM_CHAT_ID.
+    telegramChatId: String(settings.chat_id || settings.telegram_chat_id || '').trim(),
     lotRequested: Math.max(1, Number(settings.trade_amount ?? settings.amount_per_trade ?? 10)),
     pairs: normalizePairList(settings.enabled_pairs),
     tpPct: Number(settings.take_profit_pct || 2.4),
@@ -2471,6 +2459,8 @@ async function ensureUserProfile({ telegramId, chatId, username, fullName }) {
     bot_enabled: false,
     is_running: false,
     bot_running: false,
+    demo_bot_running: false,
+    live_bot_running: false,
     trading_mode: 'virtual',
     mode: 'DEMO',
     virtual_balance: DEMO_START_BALANCE,
@@ -2543,8 +2533,37 @@ async function fetchWorkspaceRows() {
 }
 
 function isWorkspaceRunning(row) {
+  if (!row) return false;
+  // Once the per-mode switches exist they are authoritative: both OFF means the
+  // workspace is idle even if a legacy aggregate column still says otherwise.
+  const hasModeFlags =
+    (row.demo_bot_running !== undefined && row.demo_bot_running !== null) ||
+    (row.live_bot_running !== undefined && row.live_bot_running !== null);
+  if (hasModeFlags) return Boolean(row.demo_bot_running) || Boolean(row.live_bot_running);
   const flag = row?.is_running ?? row?.bot_running ?? row?.engine_running;
   return flag === null || flag === undefined ? Boolean(row?.bot_enabled) : Boolean(flag);
+}
+
+/** Mirrors the two independent power switches onto the account row. */
+async function mirrorAccountRunState(scope, demoRunning, liveRunning) {
+  const accountId = accountIdFromScope(scope);
+  if (!accountId) return;
+  const payload = {
+    bot_running: Boolean(demoRunning || liveRunning),
+    demo_bot_running: Boolean(demoRunning),
+    live_bot_running: Boolean(liveRunning),
+  };
+  let { error } = await supabase.from(USERS_TABLE).update(payload).eq('id', accountId);
+  if (error && isMissingColumnError(error)) {
+    // Pre-migration project: keep the legacy aggregate in step.
+    ({ error } = await supabase
+      .from(USERS_TABLE)
+      .update({ bot_running: payload.bot_running })
+      .eq('id', accountId));
+  }
+  if (error && !isMissingTableError(error)) {
+    console.warn('[USERS] run-state mirror failed:', error.message);
+  }
 }
 
 /**
@@ -2624,11 +2643,18 @@ async function refreshUserStats(cfg) {
         win_trades: wins,
         open_positions: openPositions,
         trade_history: tradeHistory,
-        bot_running: Boolean(cfg.isRunning),
+        bot_running: Boolean(cfg.demoRunning || cfg.liveRunning),
+        demo_bot_running: Boolean(cfg.demoRunning),
+        live_bot_running: Boolean(cfg.liveRunning),
         trading_mode: cfg.mode === 'live' ? 'LIVE' : 'VIRTUAL',
       })
       .eq('id', accountId);
-    if (accountErr && !isMissingTableError(accountErr)) {
+    if (accountErr && isMissingColumnError(accountErr)) {
+      await supabase
+        .from(USERS_TABLE)
+        .update({ bot_running: Boolean(cfg.demoRunning || cfg.liveRunning) })
+        .eq('id', accountId);
+    } else if (accountErr && !isMissingTableError(accountErr)) {
       console.warn('[USERS] account mirror failed:', accountErr.message);
     }
   }
@@ -2771,13 +2797,14 @@ async function buildPersonalPnlMessage(settings) {
 
 async function resolveTelegramBridge() {
   if (TELEGRAM_BOT_TOKEN) {
-    return { token: TELEGRAM_BOT_TOKEN, chatId: TELEGRAM_CHAT_ID };
+    // Chat routing is always per workspace; the bridge only supplies the bot token.
+    return { token: TELEGRAM_BOT_TOKEN, chatId: '' };
   }
   if (telegramBridgeCache?.token) return telegramBridgeCache;
   const settings = await fetchSettingsRow();
   telegramBridgeCache = {
     token: (settings?.telegram_bot_token || settings?.bot_token || '').trim(),
-    chatId: (TELEGRAM_CHAT_ID || settings?.telegram_chat_id || settings?.chat_id || '').trim(),
+    chatId: String(settings?.telegram_chat_id || settings?.chat_id || '').trim(),
   };
   return telegramBridgeCache;
 }
@@ -2968,7 +2995,10 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName, userS
 
     case '/start_bot': {
       const modeLabel = settingsModeLabel(settings);
+      const isLive = modeLabel === 'LIVE';
+      // Only this mode's own switch flips — the other engine keeps its state.
       const result = await updateSettingsWithFallback(settings.id, {
+        [isLive ? 'live_bot_running' : 'demo_bot_running']: true,
         engine_running: true,
         is_running: true,
         bot_running: true,
@@ -2992,11 +3022,16 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName, userS
     }
 
     case '/stop_bot': {
+      const isLive = settingsModeLabel(settings) === 'LIVE';
+      // Pausing VIRTUAL must leave the LIVE engine untouched (and vice versa).
+      const flags = resolveTradingConfig(settings);
+      const otherRunning = isLive ? flags.demoRunning : flags.liveRunning;
       const result = await updateSettingsWithFallback(settings.id, {
-        engine_running: false,
-        is_running: false,
-        bot_running: false,
-        bot_enabled: false,
+        [isLive ? 'live_bot_running' : 'demo_bot_running']: false,
+        engine_running: otherRunning,
+        is_running: otherRunning,
+        bot_running: otherRunning,
+        bot_enabled: otherRunning,
       });
       if (!result.ok) {
         await sendTelegram(
@@ -3593,12 +3628,38 @@ async function writeVirtualBalance(settingsId, balance, cfg = null) {
 }
 
 /**
- * Runs the full trading engine for ONE workspace using that user's own mode,
- * credentials, risk settings and trade history. Nothing is shared across users.
+ * Drives BOTH independent power switches of one workspace. `demo_bot_running` and
+ * `live_bot_running` are completely separate: turning VIRTUAL on/off never touches
+ * the LIVE engine and vice versa, so each mode gets its own cycle pass.
  */
 async function runCycleForUser(settings) {
+  const cfg = await buildUserCfg(settings);
+  const modes = [];
+  if (cfg.demoRunning) modes.push('virtual');
+  if (cfg.liveRunning) modes.push('live');
+  if (modes.length === 0) {
+    // Standby workspace: heartbeat so the terminal shows a live engine clock.
+    await supabase
+      .from('settings')
+      .update({ last_heartbeat: new Date().toISOString() })
+      .eq('id', settings.id);
+    return;
+  }
+  for (const mode of modes) {
+    await runCycleForUserMode(settings, mode);
+  }
+}
+
+/**
+ * Runs the full trading engine for ONE workspace in ONE mode using that user's own
+ * credentials, risk settings and trade history. Nothing is shared across users.
+ */
+async function runCycleForUserMode(settings, mode) {
   try {
     const cfg = await buildUserCfg(settings);
+    cfg.mode = mode;
+    cfg.isRunning = mode === 'live' ? cfg.liveRunning : cfg.demoRunning;
+    if (!cfg.isRunning) return;
     const label = MODE_LABEL[cfg.mode];
 
     const heartbeatPatch = { last_heartbeat: new Date().toISOString() };
@@ -4046,7 +4107,10 @@ async function runCycleForUser(settings) {
     await refreshUserStats(cfg);
   } catch (err) {
     console.error('[CYCLE ERROR]', err.message);
-    await appendLog('ERROR', `Worker cycle error for ${userLabel(settings)}: ${err.message}`);
+    await appendLog(
+      'ERROR',
+      `Worker cycle error for ${userLabel(settings)} (${MODE_LABEL[mode]}): ${err.message}`
+    );
   }
 }
 
@@ -4063,10 +4127,7 @@ async function runCycle() {
     for (const row of rows.filter((r) => !isWorkspaceRunning(r))) {
       await supabase.from('settings').update({ last_heartbeat: stamp }).eq('id', row.id);
       // Keep the account mirror honest for stopped engines too.
-      const stoppedAccountId = accountIdFromScope(scopeOf(row));
-      if (stoppedAccountId) {
-        await supabase.from(USERS_TABLE).update({ bot_running: false }).eq('id', stoppedAccountId);
-      }
+      await mirrorAccountRunState(scopeOf(row), false, false);
     }
 
     const active = rows.filter(isWorkspaceRunning);
@@ -4077,6 +4138,8 @@ async function runCycle() {
       );
     }
     for (const row of active) {
+      const flags = resolveTradingConfig(row);
+      await mirrorAccountRunState(scopeOf(row), flags.demoRunning, flags.liveRunning);
       try {
         await runCycleForUser(row);
       } catch (err) {

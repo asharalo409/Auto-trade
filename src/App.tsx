@@ -185,7 +185,7 @@ export default function App() {
   };
 
   const dockTabClass = (active: boolean) =>
-    `relative flex min-h-[44px] flex-1 cursor-pointer flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
+    `relative flex min-h-[52px] min-w-[64px] shrink-0 cursor-pointer flex-col items-center justify-center gap-1 rounded-xl px-3 transition-colors ${
       active ? activeTheme.accentText : 'text-slate-500 active:text-slate-200'
     }`;
 
@@ -209,8 +209,8 @@ export default function App() {
             className="absolute inset-x-1 inset-y-0.5 rounded-xl bg-white/[0.07] ring-1 ring-inset ring-white/10"
           />
         )}
-        <Icon className="relative z-10 h-[17px] w-[17px]" />
-        <span className="relative z-10 max-w-full truncate px-0.5 font-mono-tech text-[8px] font-semibold tracking-tight uppercase">
+        <Icon className="relative z-10 h-[18px] w-[18px]" />
+        <span className="relative z-10 font-mono-tech text-[9px] font-semibold tracking-tight uppercase">
           {item.shortLabel ?? item.label}
         </span>
       </button>
@@ -884,41 +884,68 @@ export default function App() {
 
             <nav
               aria-label="Mobile Navigation"
-              className="mini-dock relative mb-2 flex items-center gap-1 rounded-[26px] border border-white/10 px-1.5 py-2 backdrop-blur-2xl"
+              className="mini-dock relative mb-2 flex flex-col rounded-[26px] border border-white/10 pt-2 backdrop-blur-2xl"
             >
-              <div className="flex flex-1 items-center justify-around">
-                {navItems.slice(0, 3).map(renderDockTab)}
+              {/* Distinct engine power control — never squeezed between tabs */}
+              <div className="flex items-center justify-center gap-3 px-4 pb-2">
+                <span className="font-mono-tech text-[9px] font-semibold tracking-[0.18em] text-slate-500 uppercase">
+                  {terminal.activeWorkspace === 'LIVE' ? 'Live Engine' : 'Virtual Engine'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void handleEngineToggle()}
+                  disabled={engineToggling}
+                  aria-label={engineRunning ? 'Stop trading engine' : 'Start trading engine'}
+                  aria-pressed={engineRunning}
+                  className={`relative flex h-14 w-14 shrink-0 cursor-pointer flex-col items-center justify-center gap-0 rounded-full border transition-all active:scale-95 disabled:opacity-70 ${
+                    engineRunning
+                      ? 'dock-fab-on border-emerald-300/70 bg-gradient-to-br from-emerald-300 via-emerald-400 to-teal-600 text-[#04120c]'
+                      : 'dock-fab-off border-white/15 bg-gradient-to-br from-slate-700 to-slate-900 text-slate-300'
+                  }`}
+                >
+                  {engineRunning && !reducedMotion && (
+                    <motion.span
+                      aria-hidden="true"
+                      animate={{ scale: [1, 1.35, 1], opacity: [0.45, 0, 0.45] }}
+                      transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
+                      className="pointer-events-none absolute inset-0 rounded-full border border-emerald-300/60"
+                    />
+                  )}
+                  <Power className="h-[18px] w-[18px]" />
+                  <span className="font-mono-tech text-[8px] font-black tracking-widest">
+                    {engineToggling ? '···' : engineRunning ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+                <span
+                  className={`font-mono-tech text-[9px] font-bold tracking-widest uppercase ${
+                    engineRunning ? 'text-emerald-300' : 'text-slate-500'
+                  }`}
+                >
+                  {engineToggling ? '…' : engineRunning ? 'Running' : 'Stopped'}
+                </span>
               </div>
 
-              {/* Highlighted center engine action */}
-              <button
-                type="button"
-                onClick={() => void handleEngineToggle()}
-                disabled={engineToggling}
-                aria-label={engineRunning ? 'Stop trading engine' : 'Start trading engine'}
-                aria-pressed={engineRunning}
-                className={`relative -my-5 flex h-14 w-14 shrink-0 cursor-pointer flex-col items-center justify-center gap-0 rounded-full border transition-all active:scale-95 disabled:opacity-70 ${
-                  engineRunning
-                    ? 'dock-fab-on border-emerald-300/70 bg-gradient-to-br from-emerald-300 via-emerald-400 to-teal-600 text-[#04120c]'
-                    : 'dock-fab-off border-white/15 bg-gradient-to-br from-slate-700 to-slate-900 text-slate-300'
-                }`}
+              {/* Spacious, swipeable tab rail — off-screen tabs scroll into view */}
+              <div
+                className="no-scrollbar flex items-center gap-4 overflow-x-auto whitespace-nowrap px-4 pt-1 pb-3"
+                role="tablist"
+                aria-label="Terminal sections"
               >
-                {engineRunning && !reducedMotion && (
-                  <motion.span
-                    aria-hidden="true"
-                    animate={{ scale: [1, 1.35, 1], opacity: [0.45, 0, 0.45] }}
-                    transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
-                    className="pointer-events-none absolute inset-0 rounded-full border border-emerald-300/60"
-                  />
-                )}
-                <Power className="h-[18px] w-[18px]" />
-                <span className="font-mono-tech text-[8px] font-black tracking-widest">
-                  {engineToggling ? '···' : engineRunning ? 'ON' : 'OFF'}
-                </span>
-              </button>
-
-              <div className="flex flex-1 items-center justify-around">
-                {navItems.slice(3).map(renderDockTab)}
+                {navItems.map(renderDockTab)}
+                <button
+                  type="button"
+                  onClick={() => {
+                    audioSynth.playClick();
+                    setShowLeaderboard(true);
+                  }}
+                  aria-label="Community leaderboard"
+                  className={dockTabClass(showLeaderboard)}
+                >
+                  <Trophy className="relative z-10 h-[18px] w-[18px] text-amber-300" />
+                  <span className="relative z-10 font-mono-tech text-[9px] font-semibold tracking-tight uppercase">
+                    Leaderboard
+                  </span>
+                </button>
               </div>
             </nav>
           </div>

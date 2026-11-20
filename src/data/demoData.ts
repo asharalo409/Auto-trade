@@ -135,6 +135,9 @@ alter table public.settings add column if not exists telegram_username text;
 alter table public.settings add column if not exists full_name text;
 alter table public.settings add column if not exists chat_id text;
 alter table public.settings add column if not exists bot_running boolean default false;
+-- Independent DEMO / LIVE power switches (each engine owns its own flag).
+alter table public.settings add column if not exists demo_bot_running boolean default false;
+alter table public.settings add column if not exists live_bot_running boolean default false;
 alter table public.settings add column if not exists realized_pnl_usd numeric default 0;
 alter table public.settings add column if not exists total_trades integer default 0;
 alter table public.settings add column if not exists win_trades integer default 0;
@@ -194,6 +197,8 @@ create table if not exists public.users (
   binance_api_secret text,
   trading_mode text not null default 'VIRTUAL',
   bot_running boolean not null default false,
+  demo_bot_running boolean not null default false,
+  live_bot_running boolean not null default false,
   virtual_balance numeric not null default 10000,
   realized_pnl_usd numeric not null default 0,
   total_trades integer not null default 0,

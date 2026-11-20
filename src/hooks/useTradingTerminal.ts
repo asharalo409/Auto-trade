@@ -196,6 +196,17 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
   };
 }
 
+/**
+ * Each workspace owns an independent power switch (`demo_bot_running` /
+ * `live_bot_running`). Rows written before those columns existed fall back to the
+ * single legacy aggregate so the toggle still reflects the worker.
+ */
+function modeRunFlag(row: Record<string, unknown>, mode: TradingMode, legacy: boolean): boolean {
+  const raw = mode === 'DEMO' ? row.demo_bot_running : row.live_bot_running;
+  if (raw === null || raw === undefined) return legacy;
+  return raw === 'false' || raw === '0' || raw === 0 ? false : Boolean(raw);
+}
+
 function normalizeAccount(row: Record<string, unknown>): AccountProfile {
   const rawStatus = String(row.approval_status ?? 'pending').toLowerCase();
   const approval_status: ApprovalStatus =
@@ -396,6 +407,17 @@ export function useTradingTerminal() {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (accessTokenRef.current) headers.Authorization = `Bearer ${accessTokenRef.current}`;
     return headers;
+  }, []);
+
+  /**
+   * A browser is shared hardware: wipe any Exchange API key material another
+   * trader left behind and reload purely from THIS account's server vault.
+   */
+  const resetLocalApiKeys = useCallback(() => {
+    saveJson(STORAGE_BN_KEY, INITIAL_BINANCE_CONFIG);
+    setBinanceConfig({ ...INITIAL_BINANCE_CONFIG });
+    setApiKeyStatus({ linked: false, api_key_masked: null, use_testnet: false });
+    setBinanceAccount(null);
   }, []);
 
   const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
@@ -1011,6 +1033,8 @@ export function useTradingTerminal() {
         if (data.session) {
           setIsDemoMode(false);
           setUserEmail(data.session.user.email ?? null);
+          // Never inherit the previous browser user's Binance keys.
+          resetLocalApiKeys();
           // Load the approval profile BEFORE unlocking data fetches.
           await loadAccountProfile(data.session.user);
           setIsAuthenticated(true);
@@ -1026,6 +1050,7 @@ export function useTradingTerminal() {
       if (session) {
         setIsDemoMode(false);
         setUserEmail(session.user.email ?? null);
+        resetLocalApiKeys();
         void loadAccountProfile(session.user).then(() => setIsAuthenticated(true));
       } else {
         setIsAuthenticated(false);
@@ -1039,7 +1064,7 @@ export function useTradingTerminal() {
       mounted = false;
       sub.subscription.unsubscribe();
     };
-  }, [loadAccountProfile]);
+  }, [loadAccountProfile, resetLocalApiKeys]);
 
   /**
    * Creates this browser/Telegram user's own settings row on first contact.
@@ -1059,6 +1084,8 @@ export function useTradingTerminal() {
       bot_enabled: false,
       is_running: false,
       bot_running: false,
+      demo_bot_running: false,
+      live_bot_running: false,
       trading_mode: activeWorkspace === 'LIVE' ? 'live' : 'virtual',
       mode: activeWorkspace,
       virtual_balance: 10000,
@@ -1153,6 +1180,8 @@ export function useTradingTerminal() {
         const normalized = normalizeSettings(settingsRow, INITIAL_LIVE_SETTINGS);
         setLiveSettings((prev) => ({
           ...normalized,
+          // The LIVE toggle follows ONLY the live switch, never the DEMO one.
+          bot_enabled: modeRunFlag(settingsRow, 'LIVE', normalized.bot_enabled),
           sound_enabled: prev.sound_enabled,
           theme: prev.theme,
           core_visual: prev.core_visual,
@@ -1164,15 +1193,20 @@ export function useTradingTerminal() {
         // The DEMO workspace mirrors the worker's virtual configuration so the
         // paper account shown here is the one actually trading on the server.
         const virtualBalance = Number(settingsRow.virtual_balance ?? settingsRow.demo_balance);
-        setDemoSettings((prev) => ({
-          ...normalizeSettings(settingsRow, prev),
-          mode: 'DEMO',
-          sound_enabled: prev.sound_enabled,
+        setDemoSettings((prev) => {
+          const demoNormalized = normalizeSettings(settingsRow, prev);
+          return {
+            ...demoNormalized,
+            mode: 'DEMO',
+            // The VIRTUAL toggle follows ONLY the demo switch.
+            bot_enabled: modeRunFlag(settingsRow, 'DEMO', demoNormalized.bot_enabled),
+            sound_enabled: prev.sound_enabled,
           theme: prev.theme,
-          core_visual: prev.core_visual,
-          candle_style: prev.candle_style,
-          balance_usdt: Number.isFinite(virtualBalance) ? virtualBalance : prev.balance_usdt,
-        }));
+            core_visual: prev.core_visual,
+            candle_style: prev.candle_style,
+            balance_usdt: Number.isFinite(virtualBalance) ? virtualBalance : prev.balance_usdt,
+          };
+        });
 
         // Only follow the persisted workspace on the first load, never while the
         // operator is actively looking at the other workspace.
@@ -1304,6 +1338,7 @@ export function useTradingTerminal() {
               const next = normalizeSettings(row, prev);
               return {
                 ...next,
+                bot_enabled: modeRunFlag(row, 'LIVE', next.bot_enabled),
                 balance_usdt: binanceAccountRef.current?.connected ? prev.balance_usdt : 0,
               };
             });
@@ -1312,9 +1347,11 @@ export function useTradingTerminal() {
             // for the next focus/visibility refetch.
             setDemoSettings((prev) => {
               const virtualBalance = Number(row.virtual_balance ?? row.demo_balance);
+              const demoNormalized = normalizeSettings(row, prev);
               return {
-                ...normalizeSettings(row, prev),
+                ...demoNormalized,
                 mode: 'DEMO',
+                bot_enabled: modeRunFlag(row, 'DEMO', demoNormalized.bot_enabled),
                 balance_usdt: Number.isFinite(virtualBalance) ? virtualBalance : prev.balance_usdt,
               };
             });
@@ -2008,11 +2045,17 @@ export function useTradingTerminal() {
         // starts or stops this workspace. Writing it on every unrelated save meant a
         // theme toggle on the DEMO tab could flip `trading_mode` and stop LIVE trading.
         const runStateTouched = patch.bot_enabled !== undefined;
-        const runStatePayload = runStateTouched
+        // The other workspace keeps its own switch: toggling VIRTUAL must never start
+        // or stop the LIVE Binance engine (and the reverse).
+        const otherWorkspaceRunning =
+          activeWorkspace === 'LIVE' ? Boolean(demoSettings.bot_enabled) : Boolean(liveSettings.bot_enabled);
+        const aggregateRunning = next.bot_enabled || otherWorkspaceRunning;
+        const runStatePayload: Record<string, unknown> = runStateTouched
           ? {
-              is_running: next.bot_enabled,
-              // Multi-user worker reads bot_running; keep both flags in lockstep.
-              bot_running: next.bot_enabled,
+              [activeWorkspace === 'LIVE' ? 'live_bot_running' : 'demo_bot_running']: next.bot_enabled,
+              // Legacy aggregate stays honest for older worker versions.
+              is_running: aggregateRunning,
+              bot_running: aggregateRunning,
               trading_mode: activeWorkspace === 'LIVE' ? 'live' : 'virtual',
               mode: activeWorkspace,
             }
@@ -3488,11 +3531,13 @@ export function useTradingTerminal() {
       setIsDemoMode(false);
       setIsGuest(false);
       setUserEmail(data.session.user.email ?? null);
+      // This account starts from an EMPTY vault until its own keys are read back.
+      resetLocalApiKeys();
       await loadAccountProfile(data.session.user);
       setIsAuthenticated(true);
     }
     return { error: error ? error.message : null };
-  }, [loadAccountProfile]);
+  }, [loadAccountProfile, resetLocalApiKeys]);
 
   const signUp = useCallback(
     async (
@@ -3530,6 +3575,7 @@ export function useTradingTerminal() {
         setIsDemoMode(false);
         setIsGuest(false);
         setUserEmail(data.session.user.email ?? null);
+        resetLocalApiKeys();
         await loadAccountProfile(data.session.user);
         setIsAuthenticated(true);
         return { error: null };
@@ -3540,7 +3586,7 @@ export function useTradingTerminal() {
           'Account created and submitted for admin approval. Confirm your email if Supabase asks, then sign in to see your approval status.',
       };
     },
-    [loadAccountProfile]
+    [loadAccountProfile, resetLocalApiKeys]
   );
 
   const resetPassword = useCallback(async (email: string) => {
@@ -3562,8 +3608,9 @@ export function useTradingTerminal() {
     setIsAuthenticated(false);
     setIsGuest(false);
     setIsDemoMode(false);
-    setApiKeyStatus({ linked: false, api_key_masked: null, use_testnet: false });
-  }, [isDemoMode]);
+    // Leaving the session must leave no trace of this trader's exchange keys.
+    resetLocalApiKeys();
+  }, [isDemoMode, resetLocalApiKeys]);
 
   const enterDemoMode = useCallback(() => {
     setIsDemoMode(true);
