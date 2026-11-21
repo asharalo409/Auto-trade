@@ -2273,6 +2273,55 @@ async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret,
 const lastLoggedBalance = new Map();
 /** Last FEED scan heartbeat per workspace+mode (throttles the per-cycle log). */
 const lastScanLogAt = new Map();
+/**
+ * Bounded DEMO fallback for the 1h trend veto. A paper workspace whose price sits far
+ * below the 1h EMA20 would otherwise be vetoed on every single cycle and sit idle for
+ * hours. DEMO tolerates a limited veto streak (or a limited wait) and then takes the
+ * paper entry anyway, at most once per cooldown. LIVE never uses this fallback, and
+ * volume/momentum, crash guard, daily-loss and open-trade limits still apply.
+ */
+const DEMO_MTF_FALLBACK_VETO_LIMIT = 3;
+const DEMO_MTF_FALLBACK_WAIT_MS = 30 * 60_000;
+const DEMO_MTF_FALLBACK_COOLDOWN_MS = 20 * 60_000;
+const demoMtfFallbackState = new Map();
+
+function demoMtfFallbackKey(cfg, symbol) {
+  return `${cfg.scope || cfg.id || 'owner'}:${symbol}`;
+}
+
+/**
+ * Records one 1h-trend veto for a DEMO symbol and reports whether the bounded fallback
+ * should let this paper entry through anyway.
+ */
+function trackDemoMtfVeto(cfg, symbol, nowMs) {
+  const key = demoMtfFallbackKey(cfg, symbol);
+  const prev = demoMtfFallbackState.get(key) || { vetos: 0, firstVetoAt: nowMs, lastOverrideAt: 0 };
+  const state = { ...prev, vetos: prev.vetos + 1, firstVetoAt: prev.firstVetoAt || nowMs };
+  const waitedMs = nowMs - state.firstVetoAt;
+  const isDemo = cfg.mode === 'virtual';
+  const enoughVetos = state.vetos >= DEMO_MTF_FALLBACK_VETO_LIMIT;
+  const waitedLongEnough = waitedMs >= DEMO_MTF_FALLBACK_WAIT_MS;
+  const coolingDown = nowMs - state.lastOverrideAt < DEMO_MTF_FALLBACK_COOLDOWN_MS;
+  const override = isDemo && (enoughVetos || waitedLongEnough) && !coolingDown;
+  if (override) {
+    demoMtfFallbackState.set(key, { vetos: 0, firstVetoAt: nowMs, lastOverrideAt: nowMs });
+  } else {
+    demoMtfFallbackState.set(key, state);
+  }
+  return { override, vetos: state.vetos, waitedMs };
+}
+
+/** Clears a symbol's veto streak after a healthy trend read or a taken entry. */
+function clearDemoMtfVeto(cfg, symbol) {
+  const key = demoMtfFallbackKey(cfg, symbol);
+  const prev = demoMtfFallbackState.get(key);
+  if (!prev) return;
+  if (prev.lastOverrideAt) {
+    demoMtfFallbackState.set(key, { vetos: 0, firstVetoAt: 0, lastOverrideAt: prev.lastOverrideAt });
+  } else {
+    demoMtfFallbackState.delete(key);
+  }
+}
 
 const MODE_LABEL = { live: 'LIVE', virtual: 'DEMO' };
 
@@ -4193,13 +4242,27 @@ async function runCycleForUserMode(settings, mode) {
             const trend = await checkHigherTimeframeTrend(symbol, cfg);
             if (!trend.ok) {
               filteredSignals += 1;
-              await warnThrottled(
-                `mtf-filter-${symbol}`,
-                `MTF FILTER skipped ${symbol} entry — ${trend.reason}.`,
-                symbol,
-                null
+              const fallback = trackDemoMtfVeto(cfg, symbol, Date.now());
+              if (!fallback.override) {
+                await warnThrottled(
+                  `mtf-filter-${symbol}`,
+                  `MTF FILTER skipped ${symbol} entry — ${trend.reason}.`,
+                  symbol,
+                  null
+                );
+                continue;
+              }
+              // Bounded DEMO fallback: the paper engine must not sit idle for hours
+              // because one symbol's 1h trend never recovers.
+              await appendLog(
+                'WARNING',
+                `[${label}] DEMO MTF fallback — taking the ${symbol} paper entry after ${fallback.vetos} consecutive 1h trend veto(s) (${Math.round(
+                  fallback.waitedMs / 60_000
+                )}m): ${trend.reason}.`,
+                symbol
               );
-              continue;
+            } else {
+              clearDemoMtfVeto(cfg, symbol);
             }
           }
 
