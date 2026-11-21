@@ -18,6 +18,7 @@ import { fetchBinance24hrTickers, openBinanceStream } from '../lib/binanceMarket
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { dispatchTelegramAlert } from '../lib/telegram';
 import { describeAuthError } from '../lib/authErrors';
+import { hasOwnerAdminAccess, isReservedAdminChatId } from '../lib/adminAccess';
 import { resolveWorkspaceIdentity } from '../lib/userIdentity';
 import { MIN_TRADEABLE_USDT } from '../lib/tradeLimits';
 import { getTimeBasedTheme } from '../lib/themes';
@@ -220,7 +221,8 @@ function normalizeAccount(row: Record<string, unknown>): AccountProfile {
     telegram_chat_id: row.telegram_chat_id ? String(row.telegram_chat_id) : null,
     telegram_username: row.telegram_username ? String(row.telegram_username) : null,
     approval_status,
-    is_admin: Boolean(row.is_admin),
+    // Only the single owner email may carry admin access, whatever the DB flag says.
+    is_admin: hasOwnerAdminAccess(String(row.email ?? ''), row.is_admin),
     trading_mode:
       String(row.trading_mode ?? 'VIRTUAL').toUpperCase() === 'LIVE' ? 'LIVE' : 'VIRTUAL',
     bot_running: Boolean(row.bot_running),
@@ -401,7 +403,7 @@ export function useTradingTerminal() {
   );
 
   const accountApproved = account === null || account.approval_status === 'approved';
-  const isAdmin = Boolean(account?.is_admin);
+  const isAdmin = hasOwnerAdminAccess(account?.email, account?.is_admin);
 
   /** Worker calls carry the Supabase session so scope/authority is server-verified. */
   const workerAuthHeaders = useCallback(() => {
@@ -688,6 +690,14 @@ export function useTradingTerminal() {
     saveJson(STORAGE_TG_KEY, telegramConfig);
   }, [telegramConfig]);
 
+  // A shared browser can still hold the owner's chat id from a previous session.
+  // Scrub it for every non-owner account so it can never be saved or used.
+  useEffect(() => {
+    if (!isReservedAdminChatId(telegramConfig.chat_id)) return;
+    if (hasOwnerAdminAccess(account?.email, account?.is_admin)) return;
+    setTelegramConfig((prev) => ({ ...prev, chat_id: '' }));
+  }, [account?.email, account?.is_admin, telegramConfig.chat_id]);
+
   // The worker cannot read localStorage, so Telegram credentials must also live in
   // the Supabase settings row for server-side push notifications. Nothing is written
   // before the row id is known, and blank local fields never overwrite credentials
@@ -699,7 +709,13 @@ export function useTradingTerminal() {
     const timeout = window.setTimeout(() => {
       const patch: Record<string, unknown> = { telegram_enabled: settings.telegram_enabled };
       const botToken = telegramConfig.bot_token.trim();
-      const chatId = telegramConfig.chat_id.trim();
+      const rawChatId = telegramConfig.chat_id.trim();
+      // Never copy the owner's private chat id onto another trader's account.
+      const chatId =
+        isReservedAdminChatId(rawChatId) &&
+        !hasOwnerAdminAccess(accountRef.current?.email, accountRef.current?.is_admin)
+          ? ''
+          : rawChatId;
       if (botToken) patch.telegram_bot_token = botToken;
       if (chatId) {
         patch.telegram_chat_id = chatId;
@@ -2119,7 +2135,12 @@ export function useTradingTerminal() {
             }
           : {};
         const telegramToken = telegramConfig.bot_token.trim();
-        const telegramChatId = telegramConfig.chat_id.trim();
+        const rawTelegramChatId = telegramConfig.chat_id.trim();
+        const telegramChatId =
+          isReservedAdminChatId(rawTelegramChatId) &&
+          !hasOwnerAdminAccess(accountRef.current?.email, accountRef.current?.is_admin)
+            ? ''
+            : rawTelegramChatId;
         const corePayload = {
           bot_enabled: next.bot_enabled,
           amount_per_trade: next.amount_per_trade,
@@ -3651,6 +3672,14 @@ export function useTradingTerminal() {
       // Telegram chat ids are numeric; an @username typed in that field must not
       // become the alert recipient (the trigger also normalizes this).
       const chatId = /^-?\d{4,20}$/.test(rawChat) ? rawChat : '';
+      // The owner's private chat id can only be claimed by the owner's own Telegram
+      // account — a browser visitor can never register it into their profile.
+      if (chatId && isReservedAdminChatId(chatId) && String(me.chatId ?? '').trim() !== chatId) {
+        return {
+          error:
+            'That Telegram chat ID belongs to the platform administrator. Open @TaseenMarketBot, send /start, and register with the chat ID it replies with.',
+        };
+      }
       const chatHandle = String(
         profile?.telegramUsername ?? me.username ?? (chatId ? '' : rawChat.replace(/^@+/, ''))
       ).trim();

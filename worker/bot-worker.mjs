@@ -22,6 +22,22 @@ const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || '').trim();
 /** Optional: promote this email to admin/approved on boot. */
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim();
+/** The ONE owner account allowed to hold the admin seat (badge, tab, approvals). */
+const OWNER_ADMIN_EMAIL = (process.env.OWNER_ADMIN_EMAIL || 'taseenbillah409@gmail.com')
+  .trim()
+  .toLowerCase();
+/** The owner's private Telegram chat — never a valid alert recipient for anyone else. */
+const OWNER_ADMIN_CHAT_ID = (process.env.OWNER_ADMIN_CHAT_ID || '7741119923').trim();
+/**
+ * Strict admin check: the Supabase flag alone is not enough. An account promoted
+ * by a stale chat id (or an old bootstrap trigger) never becomes an admin.
+ */
+function isOwnerAdminAccount(account) {
+  return (
+    Boolean(account?.is_admin) &&
+    String(account?.email || '').trim().toLowerCase() === OWNER_ADMIN_EMAIL
+  );
+}
 /** Account/approval table (one row per Supabase Auth user). */
 const USERS_TABLE = 'users';
 /** Short-lived 6-digit Telegram password-reset codes (service-role only). */
@@ -292,27 +308,29 @@ async function fetchApprovedAccounts() {
   return data || [];
 }
 
-/** True when the Telegram sender owns an admin account or the ADMIN_CHAT_ID. */
+/** True only when the Telegram sender owns the single owner admin account. */
 async function isAdminActor(from) {
   const chatId = String(from?.id ?? '').trim();
   if (!chatId) return false;
-  if (ADMIN_CHAT_ID && chatId === ADMIN_CHAT_ID) return true;
   const account = await fetchAccountByChat(chatId);
-  return Boolean(account?.is_admin);
+  return isOwnerAdminAccount(account);
 }
 
 async function resolveAdminChatId() {
-  if (ADMIN_CHAT_ID) return ADMIN_CHAT_ID;
+  // Approvals go to the owner row only — a promoted impostor must not receive them.
   const { data } = await supabase
     .from(USERS_TABLE)
     .select('telegram_chat_id')
     .eq('is_admin', true)
+    .ilike('email', OWNER_ADMIN_EMAIL)
     .not('telegram_chat_id', 'is', null)
     .limit(1)
     .maybeSingle();
+  if (data?.telegram_chat_id) return String(data.telegram_chat_id).trim();
+  if (ADMIN_CHAT_ID) return ADMIN_CHAT_ID;
   // Approvals only. Never fall back to the legacy global TELEGRAM_CHAT_ID here:
   // that is how a trader's private alerts used to end up in the admin's inbox.
-  return String(data?.telegram_chat_id || '').trim();
+  return '';
 }
 
 /**
@@ -502,27 +520,45 @@ async function notifyAdminOfPendingAccounts() {
   return sent;
 }
 
-/** Promotes the account that owns ADMIN_CHAT_ID / TELEGRAM_CHAT_ID on boot. */
+/**
+ * Enforces the single-owner policy on boot: only OWNER_ADMIN_EMAIL keeps the admin
+ * seat, every other row is demoted. Promotion by chat id is gone — copying the
+ * owner's Telegram chat id into another account must never grant privileges.
+ */
 async function promoteConfiguredAdmin() {
-  const chatId = ADMIN_CHAT_ID || TELEGRAM_CHAT_ID;
-  if (!chatId && !ADMIN_EMAIL) return;
-  if (chatId) {
+  const { data: admins, error: listError } = await supabase
+    .from(USERS_TABLE)
+    .select('id,email,is_admin')
+    .eq('is_admin', true);
+  if (listError) {
+    if (!isMissingTableError(listError)) {
+      console.warn('[ADMIN] admin list failed:', listError.message);
+    }
+    return;
+  }
+  for (const row of admins || []) {
+    if (String(row.email || '').trim().toLowerCase() === OWNER_ADMIN_EMAIL) continue;
     const { error } = await supabase
       .from(USERS_TABLE)
-      .update({ is_admin: true, approval_status: 'approved', admin_notified_at: new Date().toISOString() })
-      .eq('telegram_chat_id', chatId);
+      .update({ is_admin: false })
+      .eq('id', row.id);
     if (error && !isMissingTableError(error)) {
-      console.warn('[ADMIN] auto-promote by chat failed:', error.message);
+      console.warn('[ADMIN] demote failed:', error.message);
+    } else {
+      await appendLog(
+        'WARNING',
+        `[ADMIN] Revoked the admin seat from non-owner account ${row.email || row.id}.`
+      );
     }
   }
-  if (ADMIN_EMAIL) {
-    const { error } = await supabase
-      .from(USERS_TABLE)
-      .update({ is_admin: true, approval_status: 'approved', admin_notified_at: new Date().toISOString() })
-      .eq('email', ADMIN_EMAIL);
-    if (error && !isMissingTableError(error)) {
-      console.warn('[ADMIN] auto-promote by email failed:', error.message);
-    }
+  const ownerEmail = OWNER_ADMIN_EMAIL;
+  if (!ownerEmail) return;
+  const { error } = await supabase
+    .from(USERS_TABLE)
+    .update({ is_admin: true, approval_status: 'approved', admin_notified_at: new Date().toISOString() })
+    .ilike('email', ownerEmail);
+  if (error && !isMissingTableError(error)) {
+    console.warn('[ADMIN] owner promotion failed:', error.message);
   }
 }
 
@@ -1218,7 +1254,7 @@ if (PORT > 0) {
             return;
           }
           const me = await fetchAccountById(authUser.id);
-          if (!me?.is_admin) {
+          if (!isOwnerAdminAccount(me)) {
             res.writeHead(403, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'Admin access required' }));
             return;
@@ -1247,7 +1283,7 @@ if (PORT > 0) {
             telegram_chat_id: row.telegram_chat_id || null,
             telegram_username: row.telegram_username || null,
             approval_status: row.approval_status || 'pending',
-            is_admin: Boolean(row.is_admin),
+            is_admin: isOwnerAdminAccount(row),
             trading_mode: String(row.trading_mode || 'VIRTUAL').toUpperCase() === 'LIVE' ? 'LIVE' : 'VIRTUAL',
             bot_running: Boolean(row.bot_running),
             realized_pnl_usd: Number(row.realized_pnl_usd || 0),
@@ -1290,7 +1326,7 @@ if (PORT > 0) {
               return;
             }
             const me = await fetchAccountById(authUser.id);
-            if (!me?.is_admin) {
+            if (!isOwnerAdminAccount(me)) {
               res.writeHead(403, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ ok: false, error: 'Admin access required' }));
               return;
@@ -1950,6 +1986,8 @@ async function checkCrashGuard(symbol, cfg) {
  * stops buying dips inside a macro downtrend.
  */
 async function checkHigherTimeframeTrend(symbol, cfg) {
+  // Operator switched the confirmation filter OFF: never veto a fresh entry.
+  if (!cfg.multiTimeframeFilter) return { ok: true, reason: 'MTF filter off' };
   try {
     const klines = await fetchKlines(symbol, '1h', 120, cfg.useTestnet);
     const closes = klines.map((row) => row.close);
@@ -1957,16 +1995,22 @@ async function checkHigherTimeframeTrend(symbol, cfg) {
     const rsi = computeRsi(closes, 14);
     if (ema20 === null || rsi === null) return { ok: true, reason: 'insufficient 1h history' };
     const lastClose = closes[closes.length - 1];
-    const bullish = lastClose > ema20;
-    const healthyRsi = rsi >= 40 && rsi <= 72;
+    // DEMO uses a responsive band: ordinary in-trend movement (up to 2.5% below
+    // the 1h EMA20) and a wider RSI ceiling still count as a healthy entry, so the
+    // 24/7 paper engine keeps scanning and trading instead of vetoing every cycle.
+    const relaxed = cfg.mode === 'virtual' || !cfg.multiTimeframeFilter;
+    const emaFloor = relaxed ? ema20 * 0.975 : ema20;
+    const bullish = lastClose >= emaFloor;
+    const healthyRsi = relaxed ? rsi <= 78 : rsi >= 40 && rsi <= 72;
     return {
       ok: bullish && healthyRsi,
       close: lastClose,
       ema20,
       rsi,
+      relaxed,
       reason: !bullish
-        ? `1h close ${lastClose.toFixed(4)} below 1h EMA20 ${ema20.toFixed(4)}`
-        : `1h RSI ${rsi.toFixed(1)} outside the 40-72 buy band`,
+        ? `1h close ${lastClose.toFixed(4)} more than 2.5% below 1h EMA20 ${ema20.toFixed(4)}`
+        : `1h RSI ${rsi.toFixed(1)} above the ${relaxed ? '78' : '72'} buy ceiling`,
     };
   } catch (err) {
     console.warn(`[MTF FILTER] ${symbol} 1h trend check skipped:`, err.message);
@@ -2227,6 +2271,8 @@ async function buyWithGuards(symbol, label, quoteQty, livePx, apiKey, apiSecret,
 
 /** Last portfolio value logged, per workspace (so users don't stomp each other). */
 const lastLoggedBalance = new Map();
+/** Last FEED scan heartbeat per workspace+mode (throttles the per-cycle log). */
+const lastScanLogAt = new Map();
 
 const MODE_LABEL = { live: 'LIVE', virtual: 'DEMO' };
 
@@ -3808,6 +3854,23 @@ async function runCycleForUserMode(settings, mode) {
     );
     const prices = await fetchBinancePrices(symbolsToFetch, cfg.useTestnet);
 
+    // Visible heartbeat for the FEED tab: once a minute per workspace, so the user
+    // can always see the 24/7 engine scanning instead of a silent cycle.
+    const scanKey = `${cfg.scope || 'owner'}:${cfg.mode}`;
+    const nowMs = Date.now();
+    const shouldLogScan = nowMs - (lastScanLogAt.get(scanKey) || 0) >= 60_000;
+    if (shouldLogScan) {
+      lastScanLogAt.set(scanKey, nowMs);
+      await appendLog(
+        'INFO',
+        `[${label}] SCANNING ${cfg.pairs.length} pairs (${cfg.pairs.join(', ')}) — ${
+          activeTrades.length
+        } open trade(s) · balance ${money(
+          cfg.mode === 'live' ? liveSpot : virtualBalance
+        )} · MTF ${cfg.multiTimeframeFilter ? 'ON' : 'OFF'}`
+      );
+    }
+
     // 2. Refresh open-trade PnL for this workspace's positions only.
     for (const tr of activeTrades) {
       const livePx = prices[tr.pair];
@@ -3876,9 +3939,13 @@ async function runCycleForUserMode(settings, mode) {
     }
 
     // 3. Strategy: batch sell-all (fee-aware zero-loss), DCA re-buy, fresh entries.
+    let scannedPairs = 0;
+    let enteredTrades = 0;
+    let filteredSignals = 0;
     for (const symbol of cfg.pairs) {
       const livePx = prices[symbol];
       if (!livePx) continue;
+      scannedPairs += 1;
       const pairOpen = activeTrades.filter((t) => t.pair === symbol);
       // Flash-Crash & Volatility Guard: pause NEW entries and DCA re-buys for a
       // pair that just lost >=4% in five minutes. Exits below still run normally.
@@ -4114,8 +4181,10 @@ async function runCycleForUserMode(settings, mode) {
 
         const priceChangePercent = ticker24h ? Number(ticker24h.priceChangePercent || 0) : 0;
         const quoteVolume = ticker24h ? Number(ticker24h.quoteVolume || 0) : 100000;
-        const hasHealthyVolume = quoteVolume > 200000;
-        const favorableMomentum = priceChangePercent > -5.0;
+        // DEMO keeps a relaxed but still liquid signal; LIVE stays conservative.
+        const relaxedDemo = cfg.mode === 'virtual';
+        const hasHealthyVolume = quoteVolume > (relaxedDemo ? 50_000 : 200_000);
+        const favorableMomentum = priceChangePercent > (relaxedDemo ? -8.0 : -5.0);
 
         if (hasHealthyVolume && favorableMomentum) {
           // Multi-timeframe confirmation: a 1m/5m BUY is vetoed when the 1h trend
@@ -4123,6 +4192,7 @@ async function runCycleForUserMode(settings, mode) {
           if (cfg.multiTimeframeFilter) {
             const trend = await checkHigherTimeframeTrend(symbol, cfg);
             if (!trend.ok) {
+              filteredSignals += 1;
               await warnThrottled(
                 `mtf-filter-${symbol}`,
                 `MTF FILTER skipped ${symbol} entry — ${trend.reason}.`,
@@ -4191,6 +4261,7 @@ async function runCycleForUserMode(settings, mode) {
           }
 
           activeTrades.push(row);
+          enteredTrades += 1;
           const msg = `ENTRY BUY ${symbol} @ $${livePx} | ${money(
             row.invested_usdt
           )} USDT | 24h ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(
@@ -4210,6 +4281,17 @@ async function runCycleForUserMode(settings, mode) {
           });
         }
       }
+    }
+
+    if (shouldLogScan) {
+      await appendLog(
+        'INFO',
+        `[${label}] Scan complete — ${scannedPairs}/${cfg.pairs.length} pairs priced · ${
+          enteredTrades
+        } new entr${enteredTrades === 1 ? 'y' : 'ies'} · ${
+          filteredSignals
+        } signal(s) filtered · ${activeTrades.length} open.`
+      );
     }
 
     // One snapshot per cycle keeps open_positions / trade_history in step with

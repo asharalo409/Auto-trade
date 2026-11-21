@@ -15,6 +15,7 @@ import { audioSynth } from '../../lib/audioSynth';
 import { avatarInitials, fileToAvatarDataUrl } from '../../lib/avatar';
 import { checkEmailWithApyhub } from '../../lib/emailValidation';
 import { resolveWorkspaceIdentity } from '../../lib/userIdentity';
+import { isReservedAdminChatId } from '../../lib/adminAccess';
 import { NeonButton } from '../ui/MotionPrimitives';
 
 interface LoginScreenProps {
@@ -66,7 +67,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [fullName, setFullName] = useState(telegramIdentity.displayName === 'Web Guest' ? '' : telegramIdentity.displayName);
-  const [telegramChatId, setTelegramChatId] = useState(telegramIdentity.chatId ?? '');
+  // Only a real Telegram WebApp session may auto-fill this field. A plain browser
+  // visitor always starts blank — never with the admin's chat id.
+  const [telegramChatId, setTelegramChatId] = useState(
+    telegramIdentity.isTelegram ? (telegramIdentity.chatId ?? '') : ''
+  );
   const [avatarUrl, setAvatarUrl] = useState(telegramIdentity.photoUrl ?? '');
   const [avatarError, setAvatarError] = useState<string | null>(null);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
@@ -107,6 +112,16 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       }
       if (!fullName.trim()) {
         setError('Full name is required for admin approval.');
+        return;
+      }
+      const typedChatId = telegramChatId.trim();
+      if (
+        isReservedAdminChatId(typedChatId) &&
+        String(telegramIdentity.chatId ?? '') !== typedChatId
+      ) {
+        setError(
+          'That Telegram chat ID belongs to the platform administrator. Open @TaseenMarketBot, send /start, and use the chat ID it replies with.'
+        );
         return;
       }
       setLoading(true);

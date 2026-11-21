@@ -326,13 +326,14 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert on auth.users
   for each row execute function public.handle_new_user();
 
--- The very first account bootstraps the admin seat, so a fresh project is usable
--- before ADMIN_CHAT_ID is configured. The worker then promotes whichever account
--- owns ADMIN_CHAT_ID / TELEGRAM_CHAT_ID on boot.
+-- The admin seat belongs to exactly ONE account. Bootstrapping only promotes the
+-- owner email, and the guard trigger below revokes the flag from every other row,
+-- so a copied Telegram chat id can never leak admin privileges.
 create or replace function public.bootstrap_first_admin()
 returns trigger language plpgsql security definer set search_path = public as $func$
 begin
-  if not exists (select 1 from public.users u where u.is_admin = true) then
+  if lower(btrim(coalesce(new.email, ''))) = 'taseenbillah409@gmail.com'
+     and not exists (select 1 from public.users u where u.is_admin = true) then
     update public.users set is_admin = true, approval_status = 'approved' where id = new.id;
   end if;
   return new;
@@ -342,9 +343,30 @@ drop trigger if exists users_bootstrap_first_admin on public.users;
 create trigger users_bootstrap_first_admin after insert on public.users
   for each row execute function public.bootstrap_first_admin();
 
--- Promote the bot owner (edit the email to yours).
+create or replace function public.enforce_owner_admin()
+returns trigger language plpgsql security definer set search_path = public as $func$
+begin
+  if lower(btrim(coalesce(new.email, ''))) <> 'taseenbillah409@gmail.com' then
+    new.is_admin := false;
+    if btrim(coalesce(new.telegram_chat_id, '')) = '7741119923' then
+      new.telegram_chat_id := null;
+    end if;
+  else
+    new.is_admin := true;
+    new.approval_status := 'approved';
+  end if;
+  return new;
+end; $func$;
+
+drop trigger if exists enforce_owner_admin on public.users;
+create trigger enforce_owner_admin before insert or update on public.users
+  for each row execute function public.enforce_owner_admin();
+
+-- Promote only the owner (edit the email to yours).
 update public.users set is_admin = true, approval_status = 'approved'
-  where email in ('billahtaseen@gmail.com', 'taseenbillah409@gmail.com');
+  where lower(btrim(email)) = 'taseenbillah409@gmail.com';
+update public.users set is_admin = false
+  where is_admin = true and lower(btrim(email)) <> 'taseenbillah409@gmail.com';
 
 -- Telegram password-reset codes: hashed, 10-minute lifetime, worker-only access.
 -- RLS is on with NO policy, so no browser can ever read a code.
