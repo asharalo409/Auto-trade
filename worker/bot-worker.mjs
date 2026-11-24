@@ -996,17 +996,44 @@ if (PORT > 0) {
           let assets = [];
           let fundingUsd = 0;
           let earnUsd = 0;
-          if (apiKey && apiSecret) {
-            const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
-            if (portfolio) {
-              spotUsdt = portfolio.spot;
-              usdtFree = portfolio.usdtFree;
-              usdtLocked = portfolio.usdtLocked;
-              spotCoins = portfolio.spotCoins;
-              assets = portfolio.assets;
-              fundingUsd = portfolio.funding;
-              earnUsd = portfolio.earn;
-            }
+          // 30s per-workspace cache: the engine cycle and every terminal poll/refresh
+          // share ONE Binance read, and a 418/429 ban serves the last good snapshot.
+          const balanceRead = await fetchBinancePortfolioCached(
+            scope,
+            apiKey,
+            apiSecret,
+            useTestnet
+          );
+          const portfolio = balanceRead.portfolio;
+          const retryAfterMs = Math.max(0, Number(balanceRead.retryAfterMs || 0));
+          if (portfolio) {
+            spotUsdt = portfolio.spot;
+            usdtFree = portfolio.usdtFree;
+            usdtLocked = portfolio.usdtLocked;
+            spotCoins = portfolio.spotCoins;
+            assets = portfolio.assets;
+            fundingUsd = portfolio.funding;
+            earnUsd = portfolio.earn;
+          }
+          if (!portfolio && balanceRead.rateLimited) {
+            // Banned and nothing cached yet: tell the client to back off instead of
+            // reporting a fake $0.00 balance.
+            const waitSec = Math.ceil(Math.max(retryAfterMs, 1000) / 1000);
+            res.writeHead(429, {
+              'Content-Type': 'application/json',
+              'Retry-After': String(waitSec),
+            });
+            res.end(
+              JSON.stringify({
+                ok: false,
+                rateLimited: true,
+                retryAfterMs: Math.max(retryAfterMs, 1000),
+                error: `Binance rate limited (HTTP ${
+                  binanceBan.status || 418
+                }) — balance checks paused for ${waitSec}s`,
+              })
+            );
+            return;
           }
           const totalPortfolioUsd = Number((spotUsdt + fundingUsd + earnUsd).toFixed(2));
           const walletBreakdown = [
@@ -1030,6 +1057,10 @@ if (PORT > 0) {
               earnUsd,
               walletBreakdown,
               assets,
+              cached: Boolean(balanceRead.cached),
+              cacheAgeMs: balanceRead.ageMs,
+              rateLimited: Boolean(balanceRead.rateLimited),
+              retryAfterMs: balanceRead.rateLimited ? retryAfterMs : 0,
             })
           );
         } catch (err) {
@@ -1870,6 +1901,119 @@ function signBinanceQuery(queryString, apiSecret) {
     .digest('hex');
 }
 
+/* ------------------------------------------------------------------------- *
+ * Binance IP rate-limit guard (HTTP 418 / 429) + per-workspace balance cache
+ *
+ * Binance bans an IP for minutes to hours once its request weight is exhausted,
+ * and every retry inside that window extends the ban. All signed calls therefore
+ * share ONE ban window: on 418/429 we honour Retry-After, stop rotating through
+ * endpoints (the ban is IP-wide, not per host) and pause signed traffic until it
+ * lifts. Balance reads are cached per workspace for 30s so the 15s engine cycle
+ * and the terminal's refresh button reuse one call instead of each hitting Binance.
+ * ------------------------------------------------------------------------- */
+const BINANCE_BALANCE_CACHE_MS = 30_000;
+const BINANCE_DEFAULT_BAN_MS = 60_000;
+const BINANCE_MAX_BAN_MS = 24 * 3600_000;
+
+const binanceBan = { until: 0, endpoint: null, status: null, retryAfterMs: null, hitAt: 0 };
+/** cacheKey -> { portfolio, fetchedAt } */
+const binanceBalanceCache = new Map();
+
+function binanceBanRemainingMs() {
+  const remaining = binanceBan.until - Date.now();
+  return remaining > 0 ? remaining : 0;
+}
+
+/** Retry-After is delta-seconds or an HTTP date; Binance sometimes omits it. */
+function parseRetryAfterMs(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  const dateMs = Date.parse(value);
+  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  return 0;
+}
+
+function noteBinanceRateLimit(status, base, retryAfterHeader) {
+  const retryAfterMs = parseRetryAfterMs(retryAfterHeader) || BINANCE_DEFAULT_BAN_MS;
+  const waitMs = Math.min(retryAfterMs, BINANCE_MAX_BAN_MS);
+  const now = Date.now();
+  const until = now + waitMs;
+  if (until > binanceBan.until) {
+    binanceBan.until = until;
+    binanceBan.endpoint = base;
+    binanceBan.status = status;
+    binanceBan.retryAfterMs = waitMs;
+  }
+  // One FEED line per ban window, not one per rejected request.
+  if (now - binanceBan.hitAt > 5 * 60_000) {
+    binanceBan.hitAt = now;
+    const line = `[BINANCE RATE LIMIT] HTTP ${status} from ${base} — pausing signed Binance calls for ${Math.ceil(
+      waitMs / 1000
+    )}s (Retry-After honoured).`;
+    console.warn(line);
+    appendLog('WARNING', line).catch(() => {});
+  }
+  return binanceBanRemainingMs();
+}
+
+function rateLimitedError(retryAfterMs) {
+  const waitMs = Math.max(retryAfterMs || 0, 1000);
+  const err = new Error(
+    `Binance rate limited (HTTP ${binanceBan.status || 418}) — retry in ${Math.ceil(waitMs / 1000)}s`
+  );
+  err.code = 'BINANCE_RATE_LIMITED';
+  err.retryAfterMs = waitMs;
+  err.rateLimited = true;
+  return err;
+}
+
+function balanceCacheKey(scope, apiKey, useTestnet) {
+  return `${scope || 'owner'}:${useTestnet ? 'testnet' : 'mainnet'}:${String(apiKey || '').slice(-8)}`;
+}
+
+/**
+ * Cached portfolio read for ONE workspace. Inside a ban window Binance is never
+ * called: the last good snapshot is served instead (possibly stale) and
+ * `{ portfolio: null, rateLimited: true }` is returned when nothing was cached yet.
+ */
+async function fetchBinancePortfolioCached(scope, apiKey, apiSecret, useTestnet, options = {}) {
+  const maxAgeMs = Number.isFinite(options.maxAgeMs) ? options.maxAgeMs : BINANCE_BALANCE_CACHE_MS;
+  const key = balanceCacheKey(scope, apiKey, useTestnet);
+  const entry = binanceBalanceCache.get(key);
+  const ageMs = entry ? Date.now() - entry.fetchedAt : null;
+  if (entry && ageMs !== null && ageMs < maxAgeMs) {
+    return { portfolio: entry.portfolio, cached: true, ageMs, rateLimited: false, retryAfterMs: 0 };
+  }
+  const banMs = binanceBanRemainingMs();
+  if (banMs > 0) {
+    return {
+      portfolio: entry ? entry.portfolio : null,
+      cached: Boolean(entry),
+      ageMs,
+      rateLimited: true,
+      retryAfterMs: banMs,
+    };
+  }
+  try {
+    const portfolio = await fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet);
+    if (portfolio) binanceBalanceCache.set(key, { portfolio, fetchedAt: Date.now() });
+    return { portfolio, cached: false, ageMs: 0, rateLimited: false, retryAfterMs: 0 };
+  } catch (err) {
+    if (err && err.code === 'BINANCE_RATE_LIMITED') {
+      return {
+        portfolio: entry ? entry.portfolio : null,
+        cached: Boolean(entry),
+        ageMs,
+        rateLimited: true,
+        retryAfterMs: err.retryAfterMs || binanceBanRemainingMs(),
+      };
+    }
+    throw err;
+  }
+}
+
 async function fetchPublicWithFallback(pathAndQuery, useTestnet) {
   const endpoints = useTestnet
     ? ['https://testnet.binance.vision']
@@ -1909,6 +2053,11 @@ async function signedBinanceRequest(method, path, apiKey, apiSecret, useTestnet,
     ? ['https://testnet.binance.vision']
     : ['https://api1.binance.com', 'https://api2.binance.com', 'https://api3.binance.com'];
 
+  // An open ban window means Binance already refused this IP: retrying only
+  // extends it, so fail fast and let the caller serve its cached snapshot.
+  const bannedMs = binanceBanRemainingMs();
+  if (bannedMs > 0) throw rateLimitedError(bannedMs);
+
   let lastErr = null;
   for (const base of endpoints) {
     try {
@@ -1925,7 +2074,12 @@ async function signedBinanceRequest(method, path, apiKey, apiSecret, useTestnet,
         headers: { 'X-MBX-APIKEY': apiKey },
       });
 
-      if (res.status === 418 || res.status === 429 || res.status >= 500) {
+      if (res.status === 418 || res.status === 429) {
+        // Ban is IP-wide: honour Retry-After, stop here instead of trying the
+        // next endpoint (which would only add weight to an already-banned IP).
+        throw rateLimitedError(noteBinanceRateLimit(res.status, base, res.headers.get('Retry-After')));
+      }
+      if (res.status >= 500) {
         lastErr = new Error(`Binance signed HTTP ${res.status} (${base})`);
         continue;
       }
@@ -1936,9 +2090,10 @@ async function signedBinanceRequest(method, path, apiKey, apiSecret, useTestnet,
       }
       return data;
     } catch (err) {
+      if (err && err.code === 'BINANCE_RATE_LIMITED') throw err;
       lastErr = err;
       const msg = String(err.message || '');
-      if (!msg.includes('HTTP 418') && !msg.includes('HTTP 429') && !msg.includes('HTTP 5')) {
+      if (!msg.includes('HTTP 5')) {
         throw err;
       }
     }
@@ -3915,9 +4070,16 @@ async function runCycleForUserMode(settings, mode) {
     let virtualBalance = readVirtualBalance(settings);
 
     // 1. Always sync the real Binance balance for the LIVE readout (even on standby).
+    // Cached 30s per workspace so the 15s cycle plus terminal polls cost one call,
+    // and a Binance 418/429 ban keeps serving the last good snapshot.
     if (cfg.hasCredentials) {
       try {
-        const portfolio = await fetchBinancePortfolioUsdt(cfg.apiKey, cfg.apiSecret, cfg.useTestnet);
+        const { portfolio } = await fetchBinancePortfolioCached(
+          cfg.scope,
+          cfg.apiKey,
+          cfg.apiSecret,
+          cfg.useTestnet
+        );
         if (portfolio) {
           liveSpot = portfolio.spot;
           heartbeatPatch.balance_usdt = portfolio.total;

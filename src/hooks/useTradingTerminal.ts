@@ -340,6 +340,29 @@ function pickPortfolioUsd(
   return Number.isFinite(value) ? Number(value) : fallback;
 }
 
+/**
+ * Live balance reads go through the 24/7 worker's whitelisted static IP only, so
+ * a banned browser IP can never be the source of truth. One request per workspace
+ * per 10s keeps rapid taps on "আসল টাকা রিফ্রেশ" away from Binance entirely.
+ */
+const BALANCE_REFRESH_COOLDOWN_MS = 10_000;
+const BINANCE_RATE_LIMIT_FALLBACK_MS = 60_000;
+
+function emptyBinanceSummary(errorDetail: string): BinanceAccountSummary & { ok: boolean } {
+  return {
+    ok: false,
+    connected: false,
+    usdtFree: 0,
+    usdtLocked: 0,
+    totalUsdt: 0,
+    totalPortfolioUsd: 0,
+    assets: [],
+    canTrade: false,
+    lastSyncedAt: new Date().toISOString(),
+    errorDetail,
+  };
+}
+
 function mergeAndDedupeLogs(entries: LogEntry[]): LogEntry[] {
   const sorted = [...entries].sort(
     (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
@@ -573,6 +596,10 @@ export function useTradingTerminal() {
   const demoTradesRef = useRef<Trade[]>(demoTrades);
   const liveTradesRef = useRef<Trade[]>(liveTrades);
   const binanceAccountRef = useRef<BinanceAccountSummary | null>(binanceAccount);
+  // Last time a balance request actually reached the worker (button cooldown), and
+  // the end of the window Binance asked us to stay away (HTTP 418/429 Retry-After).
+  const lastBalanceRequestAtRef = useRef(0);
+  const binanceCooldownUntilRef = useRef(0);
   const demoSettingsRef = useRef<BotSettings>(demoSettings);
   const liveSettingsRef = useRef<BotSettings>(liveSettings);
   const activeWorkspaceRef = useRef<TradingMode>(activeWorkspace);
@@ -2862,21 +2889,31 @@ export function useTradingTerminal() {
 
       if (isGuest) {
         // Never ask the worker for the shared demo vault as an anonymous guest.
-        const errSummary: BinanceAccountSummary & { ok: boolean } = {
-          ok: false,
-          connected: false,
-          usdtFree: 0,
-          usdtLocked: 0,
-          totalUsdt: 0,
-          totalPortfolioUsd: 0,
-          assets: [],
-          canTrade: false,
-          lastSyncedAt: new Date().toISOString(),
-          errorDetail: 'Create an account to link real Binance keys',
-        };
+        const errSummary = emptyBinanceSummary('Create an account to link real Binance keys');
         setBinanceAccount(errSummary);
         return errSummary;
       }
+
+      const requestedAt = Date.now();
+      // Cooldown: a repeat tap inside 10s re-renders the known account instead of
+      // asking the worker again. A Binance 418/429 window blocks requests outright.
+      if (requestedAt - lastBalanceRequestAtRef.current < BALANCE_REFRESH_COOLDOWN_MS) {
+        return (
+          (binanceAccountRef.current as BinanceAccountSummary & { ok: boolean }) ??
+          emptyBinanceSummary('Balance refresh cooling down — try again in a few seconds')
+        );
+      }
+      if (requestedAt < binanceCooldownUntilRef.current) {
+        return (
+          (binanceAccountRef.current as BinanceAccountSummary & { ok: boolean }) ??
+          emptyBinanceSummary(
+            `Binance rate limited — pausing balance checks for ${Math.ceil(
+              (binanceCooldownUntilRef.current - requestedAt) / 1000
+            )}s`
+          )
+        );
+      }
+      lastBalanceRequestAtRef.current = requestedAt;
 
       setSyncingBalance(true);
       try {
@@ -2894,7 +2931,41 @@ export function useTradingTerminal() {
         const text = await res.text();
         const data = text ? JSON.parse(text) : {};
 
-        if (res.ok && (data.ok || data.usdtBalance !== undefined || data.totalUsdt !== undefined)) {
+        // Binance 418/429: honour Retry-After and stop polling this endpoint until
+        // it expires. The worker keeps serving its cached snapshot, so a payload is
+        // still rendered; only the pause window and its note are added here.
+        const rateLimited = res.status === 429 || res.status === 418 || Boolean(data.rateLimited);
+        let rateLimitNote: string | null = null;
+        if (rateLimited) {
+          const headerRetryMs = Number(res.headers.get('Retry-After') ?? 0) * 1000;
+          const retryMs = Math.min(
+            Math.max(
+              Number(data.retryAfterMs ?? 0) || headerRetryMs || BINANCE_RATE_LIMIT_FALLBACK_MS,
+              1000
+            ),
+            24 * 3600_000
+          );
+          binanceCooldownUntilRef.current = Date.now() + retryMs;
+          rateLimitNote =
+            data.error ||
+            `Binance rate limited — balance checks paused for ${Math.ceil(retryMs / 1000)}s`;
+        }
+
+        const hasBalancePayload =
+          res.ok && (data.ok || data.usdtBalance !== undefined || data.totalUsdt !== undefined);
+
+        if (rateLimited && !hasBalancePayload) {
+          // Banned and nothing cached: keep the last known account instead of $0.00.
+          const paused: BinanceAccountSummary & { ok: boolean } = {
+            ...(binanceAccountRef.current ?? emptyBinanceSummary('')),
+            ok: false,
+            errorDetail: rateLimitNote,
+          };
+          setBinanceAccount(paused);
+          return paused;
+        }
+
+        if (hasBalancePayload) {
           const usdtBal = pickPortfolioUsd(data);
           // usdtFree is the only spendable cash (Spot USDT). Never fall back to the
           // portfolio total here, or coins/Funding would look like tradeable cash.
@@ -2916,6 +2987,8 @@ export function useTradingTerminal() {
             assets: Array.isArray(data.assets) ? data.assets : [],
             canTrade: usdtFree >= MIN_TRADEABLE_USDT,
             lastSyncedAt: new Date().toISOString(),
+            // A cached snapshot during a 418/429 pause is still a valid balance:
+            // keep the pill green and let the worker log the ban instead.
             errorDetail: null,
           };
           setBinanceAccount(summary);
@@ -2927,18 +3000,9 @@ export function useTradingTerminal() {
           return summary;
         }
 
-        const errSummary: BinanceAccountSummary & { ok: boolean } = {
-          ok: false,
-          connected: false,
-          usdtFree: 0,
-          usdtLocked: 0,
-          totalUsdt: 0,
-          totalPortfolioUsd: 0,
-          assets: [],
-          canTrade: false,
-          lastSyncedAt: new Date().toISOString(),
-          errorDetail: data.error || data.detail || `Binance HTTP ${res.status}`,
-        };
+        const errSummary = emptyBinanceSummary(
+          data.error || data.detail || `Binance HTTP ${res.status}`
+        );
         setBinanceAccount(errSummary);
         setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
         return errSummary;
@@ -2948,20 +3012,22 @@ export function useTradingTerminal() {
             ? err.message
             : 'Live balance service unreachable — check VITE_WORKER_URL and that the worker is awake';
         console.warn('[useTradingTerminal] Binance balance fetch failed:', msg);
+        // Worker unreachable: show the balance the 24/7 worker last synced into
+        // Supabase instead of reporting $0.00 for a funded account.
+        const cachedBalance = Number(liveSettingsRef.current.balance_usdt ?? 0);
         const errSummary: BinanceAccountSummary & { ok: boolean } = {
+          ...(binanceAccountRef.current ?? emptyBinanceSummary('')),
           ok: false,
-          connected: false,
-          usdtFree: 0,
-          usdtLocked: 0,
-          totalUsdt: 0,
-          totalPortfolioUsd: 0,
-          assets: [],
-          canTrade: false,
           lastSyncedAt: new Date().toISOString(),
-          errorDetail: msg,
+          errorDetail:
+            cachedBalance > 0
+              ? `${msg} — showing last synced balance $${cachedBalance.toFixed(2)}`
+              : msg,
         };
         setBinanceAccount(errSummary);
-        setLiveSettings((prev) => ({ ...prev, balance_usdt: 0 }));
+        if (cachedBalance > 0) {
+          setLiveSettings((prev) => ({ ...prev, balance_usdt: cachedBalance }));
+        }
         return errSummary;
       } finally {
         setSyncingBalance(false);
@@ -2983,7 +3049,9 @@ export function useTradingTerminal() {
     }
     void refreshBinanceBalance();
     const timer = window.setInterval(() => {
-      if (!document.hidden) {
+      // Pause polling while Binance's Retry-After window is open: retrying a banned
+      // IP only extends the ban, and the engine's cached balance is still shown.
+      if (!document.hidden && Date.now() >= binanceCooldownUntilRef.current) {
         void refreshBinanceBalance();
       }
     }, 30_000);
