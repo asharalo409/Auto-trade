@@ -368,15 +368,15 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     audioSynth.playClick();
     setPwFeedback(null);
     if (!pwCurrent || !pwNext) {
-      setPwFeedback({ ok: false, text: 'Enter your current and new password.' });
+      setPwFeedback({ ok: false, text: t.pwErrMissing });
       return;
     }
     if (pwNext.length < 8) {
-      setPwFeedback({ ok: false, text: 'New password must be at least 8 characters.' });
+      setPwFeedback({ ok: false, text: t.loginErrNewPasswordMin });
       return;
     }
     if (pwNext !== pwConfirm) {
-      setPwFeedback({ ok: false, text: 'The two new passwords do not match.' });
+      setPwFeedback({ ok: false, text: t.pwErrMismatch });
       return;
     }
     setPwBusy(true);
@@ -425,8 +425,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       {account && (
         <TerminalPanel
           accent="emerald"
-          title="MY PROFILE"
-          subtitle="Shown on your PnL cards, the header and the traders leaderboard"
+          title={t.profileTitle}
+          subtitle={t.profileSubtitle}
           rightSlot={
             <NeonButton
               type="button"
@@ -436,7 +436,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               className="min-h-[34px] px-3 py-1 text-[11px]"
             >
               {profileFeedback?.ok ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
-              {profileSaving ? 'SAVING...' : profileFeedback?.ok ? 'SAVED' : 'SAVE PROFILE'}
+              {profileSaving ? t.savingEllipsis : profileFeedback?.ok ? t.savedBadge : t.saveProfileBtn}
             </NeonButton>
           }
         >
@@ -446,12 +446,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 type="button"
                 onClick={() => profileFileRef.current?.click()}
                 className="group relative h-20 w-20 shrink-0 cursor-pointer overflow-hidden rounded-full border border-emerald-400/45 bg-[#05070d]"
-                aria-label="Change profile photo"
+                aria-label={t.changeProfilePhotoAria}
               >
                 {profileAvatar ? (
                   <img
                     src={profileAvatar}
-                    alt={profileName || 'Profile photo'}
+                    alt={profileName || t.profilePhotoAlt}
                     className="h-full w-full object-cover"
                     referrerPolicy="no-referrer"
                   />
@@ -471,10 +471,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   className="flex items-center gap-1.5 rounded border border-slate-700 px-2.5 py-1 font-mono-tech text-[10px] text-slate-200 hover:border-emerald-400/60 hover:text-emerald-300"
                 >
                   <Camera className="h-3.5 w-3.5" />
-                  {profileAvatar ? 'CHANGE PHOTO' : 'UPLOAD PHOTO'}
+                  {profileAvatar ? t.changePhotoBtn : t.uploadPhotoBtn}
                 </button>
                 <p className="mt-1 max-w-[170px] font-mono-tech text-[9px] leading-relaxed text-slate-500">
-                  Auto-resized to 160×160. JPG, PNG or WebP.
+                  {t.profilePhotoHint}
                 </p>
               </div>
               <input
@@ -495,14 +495,14 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   htmlFor="profile-full-name"
                   className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
                 >
-                  Full Name
+                  {t.loginFullName}
                 </label>
                 <input
                   id="profile-full-name"
                   type="text"
                   value={profileName}
                   onChange={(event) => setProfileName(event.target.value)}
-                  placeholder="Your full name"
+                  placeholder={t.loginFullNamePlaceholder}
                   className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-emerald-400 focus:outline-none"
                 />
               </div>
@@ -546,8 +546,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       {account && (
         <TerminalPanel
           accent="crimson"
-          title="ACCOUNT SECURITY"
-          subtitle="Change the password you sign in with"
+          title={t.securityTitle}
+          subtitle={t.securitySubtitle}
         >
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
             <div>
@@ -555,7 +555,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 htmlFor="pw-current"
                 className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
               >
-                Current Password
+                {t.currentPasswordLabel}
               </label>
               <input
                 id="pw-current"
@@ -572,7 +572,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 htmlFor="pw-new"
                 className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
               >
-                New Password
+                {t.newPasswordLabel}
               </label>
               <input
                 id="pw-new"
@@ -580,7 +580,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 value={pwNext}
                 onChange={(e) => setPwNext(e.target.value)}
                 autoComplete="new-password"
-                placeholder="Min. 8 characters"
+                placeholder={t.newPasswordPlaceholder}
                 className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-rose-400 focus:outline-none"
               />
             </div>
@@ -589,7 +589,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 htmlFor="pw-confirm"
                 className="mb-1 block font-mono-tech text-[10px] tracking-wider text-slate-400 uppercase"
               >
-                Confirm New Password
+                {t.confirmNewPasswordLabel}
               </label>
               <input
                 id="pw-confirm"
@@ -597,7 +597,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 value={pwConfirm}
                 onChange={(e) => setPwConfirm(e.target.value)}
                 autoComplete="new-password"
-                placeholder="Repeat new password"
+                placeholder={t.repeatPasswordPlaceholder}
                 className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-rose-400 focus:outline-none"
               />
             </div>
@@ -612,14 +612,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               className="min-h-[36px] px-3 py-1 text-[11px]"
             >
               <KeyRound className="h-3.5 w-3.5" />
-              {pwBusy ? 'UPDATING PASSWORD...' : 'CHANGE PASSWORD'}
+              {pwBusy ? t.updatingPasswordBtn : t.changePasswordBtn}
             </NeonButton>
           </div>
 
           <p className="mt-2 font-mono-tech text-[10px] leading-relaxed text-slate-500">
-            The current password is verified first; the new one is hashed and stored by Supabase
-            Auth against your account row. Forgot it instead? Use Forgot Password? on the sign-in
-            screen — @TaseenMarketBot DMs a 6-digit reset code.
+            {t.securityHint}
           </p>
 
           {pwFeedback && (
@@ -1210,7 +1208,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   </div>
                   <div className="font-mono-tech text-[11px] text-rose-400">
                     {draft.zero_loss_mode
-                      ? 'DISABLED BY ZERO-LOSS SHIELD'
+                      ? t.disabledByZeroLoss
                       : `-${draft.stop_loss_pct.toFixed(1)}%`}
                   </div>
                 </div>
@@ -1342,11 +1340,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               <div className="rounded-xl border border-slate-800/80 bg-[#05070d] p-4">
                 <div className="mb-2 flex items-center justify-between font-mono-tech text-xs">
                   <span className="flex items-center gap-1.5 text-slate-300">
-                    <span>Trailing Stop</span>
-                    <InfoTip
-                      text="Closes an open position once price retraces this % from its highest watermark, locking in profit."
-                      label="Trailing Stop"
-                    />
+                    <span>{t.trailingStopLabel}</span>
+                    <InfoTip text={t.trailingStopHint} label={t.trailingStopLabel} />
                   </span>
                   <span className="font-bold text-emerald-300">
                     {(draft.trailing_stop_pct ?? 1.5).toFixed(1)}%
@@ -1361,22 +1356,19 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   onChange={(e) =>
                     setDraft((p) => ({ ...p, trailing_stop_pct: Number(e.target.value) }))
                   }
-                  aria-label="Trailing stop percentage"
+                  aria-label={t.trailingStopAria}
                   className="w-full accent-emerald-400"
                 />
                 <p className="mt-1 font-mono-tech text-[10px] text-slate-500">
-                  Peak-price trailing exit · 0% disables it
+                  {t.trailingStopFoot}
                 </p>
               </div>
 
               <div className="rounded-xl border border-slate-800/80 bg-[#05070d] p-4">
                 <div className="mb-2 flex items-center justify-between font-mono-tech text-xs">
                   <span className="flex items-center gap-1.5 text-slate-300">
-                    <span>Daily Max Loss</span>
-                    <InfoTip
-                      text="Pauses new entries for the rest of the Asia/Dhaka day once realized losses reach this % of the day's opening equity."
-                      label="Daily Max Loss"
-                    />
+                    <span>{t.dailyMaxLossLabel}</span>
+                    <InfoTip text={t.dailyMaxLossHint} label={t.dailyMaxLossLabel} />
                   </span>
                   <span className="font-bold text-rose-400">
                     {(draft.daily_max_loss_pct ?? 5).toFixed(1)}%
@@ -1391,11 +1383,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   onChange={(e) =>
                     setDraft((p) => ({ ...p, daily_max_loss_pct: Number(e.target.value) }))
                   }
-                  aria-label="Daily maximum loss percentage"
+                  aria-label={t.dailyMaxLossAria}
                   className="w-full accent-rose-400"
                 />
                 <p className="mt-1 font-mono-tech text-[10px] text-slate-500">
-                  Resets at 00:00 Asia/Dhaka · 0% disables it
+                  {t.dailyMaxLossFoot}
                 </p>
               </div>
             </div>
@@ -1408,14 +1400,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                     <DollarSign className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
                     <div>
                       <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-amber-200 uppercase">
-                        <span>Auto-Compounding</span>
-                        <InfoTip
-                          text="Sizes every new entry and DCA ticket as a % of the current workspace balance, so position sizes grow with profit instead of a fixed dollar lot."
-                          label="Auto-Compounding"
-                        />
+                        <span>{t.autoCompoundingLabel}</span>
+                        <InfoTip text={t.autoCompoundingHint} label={t.autoCompoundingLabel} />
                       </div>
                       <p className="mt-0.5 text-[11px] text-slate-300">
-                        Scales each ticket with balance
+                        {t.autoCompoundingFoot}
                       </p>
                     </div>
                   </div>
@@ -1426,7 +1415,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                       setDraft((p) => ({ ...p, auto_compounding: v }));
                       void onSave({ auto_compounding: v });
                     }}
-                    label="Auto-Compounding"
+                    label={t.autoCompoundingLabel}
                     accent="amber"
                   />
                 </div>
@@ -1434,7 +1423,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 {(draft.auto_compounding ?? false) && (
                   <div className="mt-3 border-t border-amber-500/20 pt-3">
                     <div className="mb-1 flex justify-between font-mono-tech text-[11px]">
-                      <span className="text-slate-300">Allocation per trade</span>
+                      <span className="text-slate-300">{t.allocationPerTradeLabel}</span>
                       <span className="font-bold text-amber-300">
                         {(draft.compound_allocation_pct ?? 5).toFixed(1)}%
                       </span>
@@ -1454,7 +1443,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                       className="w-full accent-amber-400"
                     />
                     <p className="mt-1 font-mono-tech text-[10px] text-slate-500">
-                      Clamped to Binance&apos;s $5.50 minimum in LIVE
+                      {t.compoundMinLotFoot}
                     </p>
                   </div>
                 )}
@@ -1466,14 +1455,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                     <Activity className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
                     <div>
                       <div className="flex items-center gap-1.5 font-mono-tech text-xs font-bold text-cyan-200 uppercase">
-                        <span>Multi-Timeframe Filter</span>
-                        <InfoTip
-                          text="Blocks a 1m/5m/15m BUY unless the 1h candle closes above its EMA20 with 1h RSI between 40 and 72, so the engine stops buying into macro downtrends."
-                          label="Multi-Timeframe Filter"
-                        />
+                        <span>{t.mtfFilterLabel}</span>
+                        <InfoTip text={t.mtfFilterHint} label={t.mtfFilterLabel} />
                       </div>
                       <p className="mt-0.5 text-[11px] text-slate-300">
-                        1h trend confirmation · RSI 40-72
+                        {t.mtfFilterFoot}
                       </p>
                     </div>
                   </div>
@@ -1484,12 +1470,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                       setDraft((p) => ({ ...p, multi_timeframe_filter: v }));
                       void onSave({ multi_timeframe_filter: v });
                     }}
-                    label="Multi-Timeframe Filter"
+                    label={t.mtfFilterLabel}
                     accent="cyan"
                   />
                 </div>
                 <p className="mt-3 border-t border-cyan-500/20 pt-2 font-mono-tech text-[10px] text-slate-500">
-                  Crash Guard (±4% / 5m) and trailing exits always stay armed.
+                  {t.crashGuardFoot}
                 </p>
               </div>
             </div>
@@ -1545,7 +1531,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded border border-slate-700 px-2.5 py-1 font-mono-tech text-[11px] text-slate-300 hover:border-cyan-400/60"
             >
               {showSecrets ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-              <span>{showSecrets ? 'HIDE' : 'SHOW'}</span>
+              <span>{showSecrets ? t.hideBtn : t.showBtn}</span>
             </button>
           </div>
         }
@@ -1556,8 +1542,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="flex items-center gap-2 font-mono-tech text-xs font-bold text-amber-200">
                 <ShieldCheck className="h-4 w-4" />
-                <span>BINANCE SPOT API &amp; SECRET VAULT</span>
-                <InfoTip text={t.helpBinance} label="BINANCE SPOT API" />
+                <span>{t.vaultTitle}</span>
+                <InfoTip text={t.helpBinance} label={t.vaultBadgeLabel} />
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <button
@@ -1573,7 +1559,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                       : 'border-emerald-400/60 bg-emerald-500/15 text-emerald-300'
                   }`}
                 >
-                  {bnDraft.use_testnet ? 'TESTNET' : 'SPOT MAINNET'}
+                  {bnDraft.use_testnet ? t.testnetBadge : t.mainnetBadge}
                 </button>
                 <span
                   className={`rounded border px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider uppercase ${
@@ -1583,19 +1569,23 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   }`}
                 >
                   {apiKeyStatus.linked
-                    ? `LINKED${apiKeyStatus.api_key_masked ? ` · ${apiKeyStatus.api_key_masked}` : ''}`
-                    : 'NO KEYS LINKED'}
+                    ? `${t.keysLinkedPrefix}${apiKeyStatus.api_key_masked ? ` · ${apiKeyStatus.api_key_masked}` : ''}`
+                    : t.noKeysLinked}
                 </span>
               </div>
             </div>
 
             <div className="grid grid-cols-1 gap-2 font-mono-tech text-[11px] sm:grid-cols-3">
               <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
-                <div className="text-[9px] tracking-wider text-slate-500 uppercase">Workspace ID</div>
+                <div className="text-[9px] tracking-wider text-slate-500 uppercase">
+                  {t.workspaceIdLabel}
+                </div>
                 <div className="truncate text-slate-100">{workspaceUser.telegramUserId}</div>
               </div>
               <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
-                <div className="text-[9px] tracking-wider text-slate-500 uppercase">Trader</div>
+                <div className="text-[9px] tracking-wider text-slate-500 uppercase">
+                  {t.traderLabel}
+                </div>
                 <div className="truncate text-slate-100">
                   {workspaceUser.displayName}
                   {workspaceUser.username ? ` (@${workspaceUser.username})` : ''}
@@ -1603,10 +1593,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               </div>
               <div className="rounded-lg border border-slate-800 bg-[#090d16] px-3 py-2">
                 <div className="text-[9px] tracking-wider text-slate-500 uppercase">
-                  Binance API Key
+                  {t.binanceKeyLabel}
                 </div>
                 <div className="truncate text-amber-200">
-                  {apiKeyStatus.api_key_masked ?? 'not saved yet'}
+                  {apiKeyStatus.api_key_masked ?? t.notSavedYet}
                 </div>
               </div>
             </div>
@@ -1617,7 +1607,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 <div className="min-w-0">
                   <div className="flex items-center gap-1.5 font-mono-tech text-[10px] font-bold tracking-wider text-cyan-300 uppercase">
                     <Server className="h-3.5 w-3.5" />
-                    <span>24/7 Server IP · whitelist this</span>
+                    <span>{t.serverIpTitle}</span>
                   </div>
                   <code className="mt-1 block truncate font-mono-tech text-sm font-bold text-cyan-100">
                     {serverIp}
@@ -1630,13 +1620,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   className="min-h-[34px] px-3 py-1 text-[11px]"
                 >
                   {copiedIp ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                  <span>{copiedIp ? 'COPIED!' : 'COPY IP'}</span>
+                  <span>{copiedIp ? t.copiedExclaimBtn : t.copyIpBtn}</span>
                 </NeonButton>
               </div>
               <p className="mt-2 font-mono-tech text-[10px] leading-relaxed text-slate-300">
-                Add this Server IP under{' '}
-                <span className="text-cyan-200">“Restrict access to trusted IPs only”</span> in your
-                Binance API Management settings.
+                {t.serverIpHintBefore}{' '}
+                <span className="text-cyan-200">{t.serverIpQuote}</span> {t.serverIpHintAfter}
               </p>
             </div>
 
@@ -1644,18 +1633,21 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             <div className="rounded-xl border border-emerald-400/40 bg-emerald-500/[0.07] p-3">
               <div className="mb-1.5 flex items-center gap-1.5 font-mono-tech text-[10px] font-bold tracking-wider text-emerald-300 uppercase">
                 <ShieldCheck className="h-4 w-4" />
-                <span>100% Non-Custodial &amp; Safe</span>
+                <span>{t.nonCustodialTitle}</span>
               </div>
               <ul className="space-y-1 font-mono-tech text-[10px] leading-relaxed text-slate-300">
                 <li>
-                  • Keep <span className="font-bold text-emerald-200">Enable Withdrawals</span> and{' '}
-                  <span className="font-bold text-emerald-200">Universal Transfer</span> OFF on
-                  Binance. Our bot can ONLY place Spot trades inside your account — it can never
-                  withdraw or transfer your funds.
+                  {t.ncKeepPrefix}{' '}
+                  <span className="font-bold text-emerald-200">{t.ncEnableWithdrawals}</span>{' '}
+                  {t.ncAnd}{' '}
+                  <span className="font-bold text-emerald-200">{t.ncUniversalTransfer}</span>{' '}
+                  {t.ncOffSuffix}
                 </li>
                 <li>
-                  • Enable only <span className="font-bold text-emerald-200">Enable Reading</span>{' '}
-                  and <span className="font-bold text-emerald-200">Enable Spot &amp; Margin Trading</span>.
+                  {t.ncEnableOnlyPrefix}{' '}
+                  <span className="font-bold text-emerald-200">{t.ncEnableReading}</span>{' '}
+                  {t.ncAnd}{' '}
+                  <span className="font-bold text-emerald-200">{t.ncEnableSpot}</span>.
                 </li>
               </ul>
             </div>
@@ -1666,7 +1658,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   htmlFor="binance-api-key"
                   className="mb-1 block font-mono-tech text-[11px] text-slate-400"
                 >
-                  Binance API Key
+                  {t.binanceKeyLabel}
                 </label>
                 <input
                   id="binance-api-key"
@@ -1677,7 +1669,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                     setBnDraft(next);
                     onSaveBinance(next);
                   }}
-                  placeholder="Paste your Binance Spot API Key"
+                  placeholder={t.apiKeyPlaceholder}
                   autoComplete="off"
                   spellCheck={false}
                   className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
@@ -1688,7 +1680,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   htmlFor="binance-api-secret"
                   className="mb-1 block font-mono-tech text-[11px] text-slate-400"
                 >
-                  Binance API Secret
+                  {t.binanceSecretLabel}
                 </label>
                 <input
                   id="binance-api-secret"
@@ -1699,7 +1691,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                     setBnDraft(next);
                     onSaveBinance(next);
                   }}
-                  placeholder="Paste your Binance Spot API Secret"
+                  placeholder={t.apiSecretPlaceholder}
                   autoComplete="off"
                   spellCheck={false}
                   className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-amber-400 focus:outline-none"
@@ -1716,7 +1708,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 className="min-h-[36px] px-3 py-1 text-[11px]"
               >
                 <KeyRound className="h-3.5 w-3.5" />
-                {savingVault ? 'SAVING & VERIFYING...' : 'SAVE & VERIFY KEYS'}
+                {savingVault ? t.savingVerifyingBtn : t.saveVerifyKeysBtn}
               </NeonButton>
               <NeonButton
                 type="button"
@@ -1726,7 +1718,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 className="min-h-[36px] px-3 py-1 text-[11px]"
               >
                 <Activity className="h-3.5 w-3.5" />
-                {testingVault ? 'TESTING...' : 'TEST CONNECTION'}
+                {testingVault ? t.testingBtn : t.testConnectionBtn}
               </NeonButton>
               <NeonButton
                 type="button"
@@ -1735,7 +1727,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 onClick={handleVerifyBn}
                 className="min-h-[36px] px-3 py-1 text-[11px]"
               >
-                {savingVault ? 'VERIFYING...' : 'VERIFY KEYS'}
+                {savingVault ? t.verifyingBtn : t.verifyKeysShortBtn}
               </NeonButton>
               <NeonButton
                 type="button"
@@ -1745,14 +1737,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 className="min-h-[36px] px-3 py-1 text-[11px]"
               >
                 <Send className="h-3.5 w-3.5" />
-                {sendingBalTg ? 'SENDING...' : 'VIEW BALANCE IN TELEGRAM'}
+                {sendingBalTg ? t.sendingEllipsis : t.tgSendBalanceNowBtn}
               </NeonButton>
             </div>
 
             <p className="font-mono-tech text-[10px] leading-relaxed text-slate-400">
-              {isGuest
-                ? 'Guest mode: register an account to save real Binance keys. Virtual Demo trading stays free without an account.'
-                : 'Both values are written to the worker’s private vault and never returned to a browser — only the mask above is. Saving verifies the keys, flips the badge to LINKED and loads your real portfolio (Spot USDT + held coins, converted to USD & BDT) immediately.'}
+              {isGuest ? t.vaultGuestHint : t.vaultHint}
             </p>
 
             {vaultFeedback && (
@@ -1770,7 +1760,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             {binanceAccount?.connected && (
               <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-2.5 font-mono-tech text-[10px]">
                 <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 font-bold">
-                  <span className="text-emerald-300">REAL BINANCE PORTFOLIO</span>
+                  <span className="text-emerald-300">{t.realPortfolioTitle}</span>
                   <span className="text-emerald-200">
                     ${binanceAccount.totalPortfolioUsd.toFixed(2)} USD · ৳
                     {Math.round(binanceAccount.totalPortfolioUsd * BDT_PER_USD).toLocaleString(
@@ -1780,8 +1770,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   </span>
                 </div>
                 <div className="mb-1.5 flex flex-wrap gap-x-3 gap-y-1 text-slate-300">
-                  <span>Spot USDT ${(binanceAccount.spotUsd ?? 0).toFixed(2)}</span>
-                  <span>Held coins ${(binanceAccount.spotCoinsUsd ?? 0).toFixed(2)}</span>
+                  <span>
+                    {t.spotUsdtLabel} ${(binanceAccount.spotUsd ?? 0).toFixed(2)}
+                  </span>
+                  <span>
+                    {t.heldCoinsLabel} ${(binanceAccount.spotCoinsUsd ?? 0).toFixed(2)}
+                  </span>
                   <span className={canFundOrders ? 'text-emerald-300' : 'text-amber-300'}>
                     {t.tradeableUsdtLabel}: ${tradeableUsdt.toFixed(2)}
                   </span>
@@ -1888,7 +1882,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 className="min-h-[36px] px-3 py-1 text-[11px]"
               >
                 <Send className="h-3.5 w-3.5" />
-                {testingTg ? 'DISPATCHING...' : t.testTelegramBtn}
+                {testingTg ? t.dispatchEllipsis : t.testTelegramBtn}
               </NeonButton>
 
               <NeonButton
@@ -1899,7 +1893,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 className="min-h-[36px] px-3 py-1 text-[11px]"
               >
                 <DollarSign className="h-3.5 w-3.5" />
-                {sendingBalTg ? 'SENDING...' : t.tgSendBalanceNowBtn}
+                {sendingBalTg ? t.sendingEllipsis : t.tgSendBalanceNowBtn}
               </NeonButton>
             </div>
 
@@ -1940,7 +1934,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
               onClick={() => setShowGuideSql((v) => !v)}
               className="min-h-[34px] cursor-pointer rounded border border-slate-700 px-2.5 py-1 font-mono-tech text-[11px] text-slate-300 hover:border-cyan-400"
             >
-              {showGuideSql ? 'HIDE SQL' : 'VIEW SQL'}
+              {showGuideSql ? t.hideSqlBtn : t.viewSqlBtn}
             </button>
           </div>
         }
@@ -1949,17 +1943,17 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           <div className="rounded-xl border border-slate-800 bg-[#05070d] p-3">
             <div className="mb-1 flex items-center gap-1.5 font-bold text-cyan-300 uppercase">
               <Database className="h-3.5 w-3.5" />
-              <span>1. Supabase SQL</span>
+              <span>{t.guideSqlStep}</span>
             </div>
             <p className="text-slate-300 leading-relaxed">
-              Supabase &gt; SQL Editor-এ উপরের Copy SQL Schema বাটনে ক্লিক করে কোড Run করুন। এতে settings, trades, logs টেবিল ও Realtime তৈরি হবে।
+              {t.guideSqlBody}
             </p>
           </div>
 
           <div className="rounded-xl border border-slate-800 bg-[#05070d] p-3">
-            <div className="mb-1 font-bold text-emerald-300 uppercase">2. Vercel (Frontend)</div>
+            <div className="mb-1 font-bold text-emerald-300 uppercase">{t.guideVercelStep}</div>
             <p className="text-slate-300 leading-relaxed">
-              GitHub push করে Vercel-এ Import করুন। Environment Variables-এ শুধু বসান:
+              {t.guideVercelBody}
               <br />
               <code className="text-amber-300">VITE_SUPABASE_URL</code>
               <br />
@@ -1968,17 +1962,17 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           </div>
 
           <div className="rounded-xl border border-slate-800 bg-[#05070d] p-3">
-            <div className="mb-1 font-bold text-amber-300 uppercase">3. Render (24/7 Bot Worker)</div>
+            <div className="mb-1 font-bold text-amber-300 uppercase">{t.guideRenderStep}</div>
             <p className="text-slate-300 leading-relaxed">
-              Render Background Worker-এ বসান: <code className="text-cyan-300">SUPABASE_URL</code>,{' '}
+              {t.guideRenderBodyLead} <code className="text-cyan-300">SUPABASE_URL</code>,{' '}
               <code className="text-cyan-300">SUPABASE_SERVICE_ROLE_KEY</code>,{' '}
               <code className="text-cyan-300">BINANCE_API_KEY</code>,{' '}
               <code className="text-cyan-300">BINANCE_API_SECRET</code>,{' '}
               <code className="text-cyan-300">TELEGRAM_BOT_TOKEN</code>,{' '}
               <code className="text-cyan-300">TELEGRAM_CHAT_ID</code>।
               <br />
-              Server IP: <code className="text-cyan-300">{serverIp}</code> — Binance API-এ “Restrict
-              access to trusted IPs only”-তে যোগ করুন। Withdrawals ও Universal Transfer বন্ধ রাখুন।
+              {t.serverIpPrefix} <code className="text-cyan-300">{serverIp}</code>{' '}
+              {t.guideRenderBodyTail}
             </p>
           </div>
         </div>

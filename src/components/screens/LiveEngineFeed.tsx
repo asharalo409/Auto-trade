@@ -236,7 +236,7 @@ export const LiveEngineFeed: React.FC<LiveEngineFeedProps> = ({ t, logs, loading
                       }`}
                     >
                       {isIpCopied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-                      {isIpCopied ? 'Copied' : `Copy ${matchedIp}`}
+                      {isIpCopied ? t.feedCopied : `${t.feedCopyIp} ${matchedIp}`}
                     </button>
                   )}
                 </motion.div>

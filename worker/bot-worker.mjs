@@ -8,6 +8,22 @@ import http from 'node:http';
 import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
 import { renderPnlCard } from './pnl-card.mjs';
+// Strategy decisions are shared with the replay harness (worker/replay.mjs) so the
+// invariants covered by tests/worker-trading-loop.test.ts are the ones this loop runs.
+import {
+  BINANCE_MIN_ORDER_USDT,
+  BINANCE_ROUND_TRIP_FEE_PCT,
+  canOpenAnotherTrade,
+  createMtfFallbackTracker,
+  evaluateDailyLossGuard,
+  evaluateHigherTimeframeTrend,
+  normalizePairList,
+  normalizeTradingMode,
+  planDcaRebuy,
+  resolveEntryNotional,
+  resolveReportWorkspaceMode,
+  resolveTradingConfig,
+} from './strategy-core.mjs';
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -15,7 +31,6 @@ const ENV_BINANCE_KEY = (process.env.BINANCE_API_KEY || '').trim();
 const ENV_BINANCE_SECRET = (process.env.BINANCE_API_SECRET || '').trim();
 const ENV_TESTNET = (process.env.BINANCE_TESTNET || '').trim() === 'true';
 
-const BINANCE_ROUND_TRIP_FEE_PCT = 0.2; // 0.1% Buy + 0.1% Sell Spot taker fees
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 /** Bot owner's Telegram chat: receives registration approvals. */
@@ -640,7 +655,7 @@ function resolveRequestScope(payload, authUser = null) {
 
 /** Resolves the effective config (settings + that user's own credentials). */
 async function buildUserCfg(settings) {
-  const cfg = resolveTradingConfig(settings);
+  const cfg = resolveTradingConfigFor(settings);
   cfg.id = settings.id;
   cfg.scope = scopeOf(settings);
   cfg.account = settings.__account || null;
@@ -732,6 +747,7 @@ if (PORT > 0) {
             status: 'ok',
             timestamp: new Date().toISOString(),
             guards: describeCrashGuards(),
+            schema: describeSchemaHealth(),
           })
         );
         return;
@@ -763,6 +779,7 @@ if (PORT > 0) {
             dropPctTrigger: CRASH_GUARD_DROP_PCT,
             pauseMinutes: CRASH_GUARD_PAUSE_MINUTES,
             guards: describeCrashGuards(),
+            schema: describeSchemaHealth(),
           })
         );
         return;
@@ -1957,37 +1974,6 @@ async function fetchKlines(symbol, interval, limit, useTestnet) {
     .filter((row) => Number.isFinite(row.close) && row.close > 0);
 }
 
-function computeEma(values, period) {
-  if (!Array.isArray(values) || values.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = values.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
-  for (let i = period; i < values.length; i += 1) {
-    ema = values[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
-
-function computeRsi(values, period = 14) {
-  if (!Array.isArray(values) || values.length <= period) return null;
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i <= period; i += 1) {
-    const diff = values[i] - values[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses -= diff;
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  for (let i = period + 1; i < values.length; i += 1) {
-    const diff = values[i] - values[i - 1];
-    avgGain = (avgGain * (period - 1) + Math.max(0, diff)) / period;
-    avgLoss = (avgLoss * (period - 1) + Math.max(0, -diff)) / period;
-  }
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
-}
-
 /** Snapshot of every pair currently paused by the flash-crash guard. */
 function describeCrashGuards() {
   const now = Date.now();
@@ -2065,47 +2051,14 @@ async function checkHigherTimeframeTrend(symbol, cfg) {
   try {
     const klines = await fetchKlines(symbol, '1h', 120, cfg.useTestnet);
     const closes = klines.map((row) => row.close);
-    const ema20 = computeEma(closes, 20);
-    const rsi = computeRsi(closes, 14);
-    if (ema20 === null || rsi === null) return { ok: true, reason: 'insufficient 1h history' };
-    const lastClose = closes[closes.length - 1];
-    // DEMO uses a responsive band: ordinary in-trend movement (up to 2.5% below
-    // the 1h EMA20) and a wider RSI ceiling still count as a healthy entry, so the
-    // 24/7 paper engine keeps scanning and trading instead of vetoing every cycle.
-    // A one-tap strategy preset pins the exact RSI band, so Safe stays strict in
-    // DEMO too. Without a preset the legacy relaxed DEMO band still applies.
-    const relaxed = !cfg.strategyPreset && cfg.mode === 'virtual';
-    const emaFloor = relaxed ? ema20 * 0.975 : ema20;
-    const bullish = lastClose >= emaFloor;
-    const rsiMin = Number(cfg.rsiMin ?? 40);
-    const rsiMax = Number(cfg.rsiMax ?? (relaxed ? 78 : 72));
-    const healthyRsi = rsi >= rsiMin && rsi <= rsiMax;
-    return {
-      ok: bullish && healthyRsi,
-      close: lastClose,
-      ema20,
-      rsi,
-      relaxed,
-      reason: !bullish
-        ? `1h close ${lastClose.toFixed(4)} below 1h EMA20 ${ema20.toFixed(4)}`
-        : `1h RSI ${rsi.toFixed(1)} outside the ${rsiMin}-${rsiMax} buy band`,
-    };
+    // The band logic (preset-authoritative) lives in strategy-core.mjs so the
+    // replay harness exercises the exact same decision.
+    const trend = evaluateHigherTimeframeTrend({ closes, cfg });
+    return { ...trend, close: trend.lastClose };
   } catch (err) {
     console.warn(`[MTF FILTER] ${symbol} 1h trend check skipped:`, err.message);
     return { ok: true, reason: '1h data unavailable' };
   }
-}
-
-/**
- * Smart auto-compounding position sizing: a % of the live workspace balance,
- * clamped above the Binance notional floor so LIVE orders stay valid.
- */
-function resolveEntryNotional(cfg, balance) {
-  if (!cfg.autoCompounding) return cfg.lotRequested;
-  const pct = Math.min(100, Math.max(0.5, cfg.compoundAllocationPct));
-  const sized = (Number(balance) || 0) * (pct / 100);
-  const floor = cfg.mode === 'live' ? BINANCE_MIN_ORDER_USDT : 1;
-  return Math.max(floor, Number(sized.toFixed(2)));
 }
 
 /**
@@ -2241,7 +2194,6 @@ async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity, ap
 // Binance rejects any Spot order below the symbol's MIN_NOTIONAL (usually $5) with
 // "Filter failure: NOTIONAL" and below LOT_SIZE stepSize with "Filter failure: LOT_SIZE".
 // These helpers keep every live entry compliant instead of aborting the whole cycle.
-const BINANCE_MIN_ORDER_USDT = 5.5;
 let exchangeFiltersCache = { at: 0, data: null };
 const lastWarnAt = new Map();
 
@@ -2252,6 +2204,54 @@ async function warnThrottled(key, message, pair = null, cfg = null) {
   console.warn(message);
   await appendLog('WARNING', cfg ? `[${MODE_LABEL[cfg.mode]}] ${message}` : message, pair);
   if (cfg) await sendWarningTelegram(cfg, message);
+}
+
+// `trades.peak_price` holds the trailing-stop high-water mark. A pre-upgrade schema
+// rejects that column, and the PnL fallback patch below drops it silently — PnL keeps
+// updating, but the peak is never saved, so a restart disarms the trailing stop until
+// price prints a new high. Track and surface that instead of swallowing it.
+const peakPricePersistence = { missing: false, scope: null, detail: null, detectedAt: null };
+const peakPriceWarnedScopes = new Set();
+
+async function notePeakPriceNotPersisted(scope, error) {
+  const key = scope || 'owner';
+  const firstForScope = !peakPriceWarnedScopes.has(key);
+  peakPricePersistence.missing = true;
+  peakPricePersistence.scope = key;
+  peakPricePersistence.detail = String(error?.message || error || 'unknown error');
+  if (!peakPricePersistence.detectedAt) {
+    peakPricePersistence.detectedAt = new Date().toISOString();
+  }
+  if (!firstForScope) return;
+  peakPriceWarnedScopes.add(key);
+  const message =
+    '[TRAILING STOP DEGRADED] trades.peak_price is missing from the database — the high-water mark is not stored, so after a restart the trailing stop stays disarmed until price makes a new high. Fix: alter table public.trades add column if not exists peak_price numeric;';
+  console.warn(`${message} (${peakPricePersistence.detail})`);
+  await appendLog('WARNING', message);
+}
+
+async function notePeakPricePersisted() {
+  if (!peakPricePersistence.missing) return;
+  peakPricePersistence.missing = false;
+  peakPricePersistence.detail = null;
+  peakPricePersistence.detectedAt = null;
+  const message =
+    '[TRAILING STOP RESTORED] trades.peak_price now accepts writes — the high-water mark persists again and the trailing stop survives restarts.';
+  console.log(message);
+  await appendLog('INFO', message);
+}
+
+function describeSchemaHealth() {
+  return {
+    schema_degraded: peakPricePersistence.missing,
+    trailing_watermark: peakPricePersistence.missing ? 'not_persisted' : 'ok',
+    missing_columns: peakPricePersistence.missing ? ['trades.peak_price'] : [],
+    detected_at: peakPricePersistence.detectedAt,
+    detail: peakPricePersistence.detail,
+    fix: peakPricePersistence.missing
+      ? 'alter table public.trades add column if not exists peak_price numeric;'
+      : null,
+  };
 }
 
 async function getSymbolFilters(symbol, useTestnet) {
@@ -2358,143 +2358,24 @@ const lastScanLogAt = new Map();
  * paper entry anyway, at most once per cooldown. LIVE never uses this fallback, and
  * volume/momentum, crash guard, daily-loss and open-trade limits still apply.
  */
-const DEMO_MTF_FALLBACK_VETO_LIMIT = 3;
-const DEMO_MTF_FALLBACK_WAIT_MS = 30 * 60_000;
-const DEMO_MTF_FALLBACK_COOLDOWN_MS = 20 * 60_000;
-const demoMtfFallbackState = new Map();
+// The bounded fallback lives in strategy-core.mjs (shared with the replay harness),
+// keyed by workspace+symbol+preset so a preset is never overridden by it.
+const demoMtfFallback = createMtfFallbackTracker();
 
-function demoMtfFallbackKey(cfg, symbol) {
-  // The preset is part of the streak key: switching strategy starts from a clean
-  // veto count instead of inheriting the previous preset's tolerated streak.
-  return `${cfg.scope || cfg.id || 'owner'}:${symbol}:${cfg.strategyPreset || 'auto'}`;
-}
-
-/**
- * Records one 1h-trend veto for a DEMO symbol and reports whether the bounded fallback
- * should let this paper entry through anyway. A selected strategy preset is
- * authoritative: its RSI band (Safe's strict 40-65) is never overridden, so the
- * fallback only exists for workspaces that have not chosen a preset.
- */
 function trackDemoMtfVeto(cfg, symbol, nowMs) {
-  const key = demoMtfFallbackKey(cfg, symbol);
-  const prev = demoMtfFallbackState.get(key) || { vetos: 0, firstVetoAt: nowMs, lastOverrideAt: 0 };
-  const state = { ...prev, vetos: prev.vetos + 1, firstVetoAt: prev.firstVetoAt || nowMs };
-  const waitedMs = nowMs - state.firstVetoAt;
-  const isDemo = cfg.mode === 'virtual' && !cfg.strategyPreset;
-  const enoughVetos = state.vetos >= DEMO_MTF_FALLBACK_VETO_LIMIT;
-  const waitedLongEnough = waitedMs >= DEMO_MTF_FALLBACK_WAIT_MS;
-  const coolingDown = nowMs - state.lastOverrideAt < DEMO_MTF_FALLBACK_COOLDOWN_MS;
-  const override = isDemo && (enoughVetos || waitedLongEnough) && !coolingDown;
-  if (override) {
-    demoMtfFallbackState.set(key, { vetos: 0, firstVetoAt: nowMs, lastOverrideAt: nowMs });
-  } else {
-    demoMtfFallbackState.set(key, state);
-  }
-  return { override, vetos: state.vetos, waitedMs };
+  return demoMtfFallback.track(cfg, symbol, nowMs);
 }
 
 /** Clears a symbol's veto streak after a healthy trend read or a taken entry. */
 function clearDemoMtfVeto(cfg, symbol) {
-  const key = demoMtfFallbackKey(cfg, symbol);
-  const prev = demoMtfFallbackState.get(key);
-  if (!prev) return;
-  if (prev.lastOverrideAt) {
-    demoMtfFallbackState.set(key, { vetos: 0, firstVetoAt: 0, lastOverrideAt: prev.lastOverrideAt });
-  } else {
-    demoMtfFallbackState.delete(key);
-  }
+  demoMtfFallback.clear(cfg, symbol);
 }
 
 const MODE_LABEL = { live: 'LIVE', virtual: 'DEMO' };
 
-function normalizeTradingMode(value) {
-  const v = String(value ?? '').trim().toLowerCase();
-  return v === 'live' || v === 'real' ? 'live' : 'virtual';
-}
-
-function normalizePairList(raw) {
-  if (Array.isArray(raw)) return raw.map((p) => String(p).trim().toUpperCase()).filter(Boolean);
-  if (typeof raw === 'string' && raw.trim()) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed.map((p) => String(p).trim().toUpperCase()).filter(Boolean);
-    } catch {
-      return raw.split(',').map((p) => p.trim().toUpperCase()).filter(Boolean);
-    }
-  }
-  return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
-}
-
-/**
- * Everything the 15s cycle needs comes from the Supabase settings row, so the bot
- * keeps running with zero browser tabs open. `is_running`/`trading_mode` are the
- * canonical columns; the legacy `bot_enabled`/`mode` pair is still honoured.
- */
-function resolveTradingConfig(settings) {
-  const zeroLoss = Boolean(
-    settings.zero_loss_shield ?? settings.zero_loss_mode ?? settings.sell_only_in_profit ?? true
-  );
-  const runFlag = settings.is_running ?? settings.bot_running ?? settings.engine_running;
-  const isRunning =
-    runFlag === null || runFlag === undefined ? Boolean(settings.bot_enabled) : Boolean(runFlag);
-  const mode = normalizeTradingMode(
-    settings.workspace_mode ?? settings.trading_mode ?? settings.mode
-  );
-  // DEMO and LIVE each own an independent power switch. Rows written before those
-  // columns existed fall back to the single legacy flag scoped to their own mode.
-  const demoFlag = settings.demo_bot_running;
-  const liveFlag = settings.live_bot_running;
-  const demoRunning =
-    demoFlag === null || demoFlag === undefined ? isRunning && mode === 'virtual' : Boolean(demoFlag);
-  const liveRunning =
-    liveFlag === null || liveFlag === undefined ? isRunning && mode === 'live' : Boolean(liveFlag);
-  // One-tap strategy preset chosen in the terminal decides the exact RSI buy band.
-  const presetId = ['safe', 'balanced', 'scalping'].includes(String(settings.strategy_preset || ''))
-    ? String(settings.strategy_preset)
-    : null;
-  const presetBands = {
-    safe: { min: 40, max: 65 },
-    balanced: { min: 40, max: 72 },
-    scalping: { min: 35, max: 78 },
-  };
-  const rsiBand = presetId ? presetBands[presetId] : null;
-  return {
-    isRunning: demoRunning || liveRunning,
-    strategyPreset: presetId,
-    rsiMin: rsiBand ? rsiBand.min : 40,
-    rsiMax: rsiBand ? rsiBand.max : mode === 'virtual' ? 78 : 72,
-    demoRunning,
-    liveRunning,
-    mode,
-    telegramEnabled: settings.telegram_enabled !== false,
-    // One shared @TaseenMarketBot talks to every user; only the chat differs.
-    telegramToken: String(
-      TELEGRAM_BOT_TOKEN || settings.telegram_bot_token || settings.bot_token || ''
-    ).trim(),
-    // Strictly this workspace's own chat — never the global TELEGRAM_CHAT_ID.
-    telegramChatId: String(settings.chat_id || settings.telegram_chat_id || '').trim(),
-    lotRequested: Math.max(1, Number(settings.trade_amount ?? settings.amount_per_trade ?? 10)),
-    pairs: normalizePairList(settings.enabled_pairs),
-    tpPct: Number(settings.take_profit_pct || 2.4),
-    dcaEnabled: settings.dca_enabled !== false,
-    dcaStepPct: Math.max(0.2, Number(settings.dca_step_pct || 1.5)),
-    dcaMaxBuys: Math.max(1, Number(settings.dca_max_buys || 12)),
-    zeroLoss,
-    stopLossPct: Math.abs(Number(settings.stop_loss_pct || 1.5)),
-    stopLossEnabled: !zeroLoss && Boolean(settings.stop_loss_enabled),
-    maxPerPair: Number(settings.max_amount_per_pair || 500),
-    maxOpenTrades: Math.max(1, Number(settings.max_open_trades || 5)),
-    trailingStopPct: Math.max(0, Number(settings.trailing_stop_pct ?? 1.5)),
-    dailyMaxLossPct: Math.max(0, Number(settings.daily_max_loss_pct ?? 5)),
-    // Smart auto-compounding: size each ticket from the live workspace balance.
-    autoCompounding: Boolean(settings.auto_compounding),
-    compoundAllocationPct: Math.min(
-      100,
-      Math.max(0.5, Number(settings.compound_allocation_pct ?? 5))
-    ),
-    // Multi-timeframe bullish filter (15m/5m/1m signals must agree with 1h trend).
-    multiTimeframeFilter: settings.multi_timeframe_filter !== false,
-  };
+/** Binds this worker's env bot token to the pure config resolver. */
+function resolveTradingConfigFor(settings) {
+  return resolveTradingConfig(settings, { telegramToken: TELEGRAM_BOT_TOKEN });
 }
 
 /** Rows written before the `mode` column existed are still separable by id prefix. */
@@ -2573,28 +2454,6 @@ function dhakaDateKey(now = new Date()) {
 }
 
 let lastDailyReportKey = null;
-
-/**
- * The workspace the trader is actually on: the engine switch that is currently ON
- * wins, then the account's own declared trading mode, then the workspace row. The
- * report's label, trade filter and balance are all derived from this one value, so
- * a stale `trading_mode` column can never mix LIVE numbers with DEMO trades.
- */
-function resolveReportWorkspaceMode(settings, cfg) {
-  if (cfg.liveRunning && !cfg.demoRunning) return 'live';
-  if (cfg.demoRunning && !cfg.liveRunning) return 'virtual';
-  const accountMode = String(settings?.__account?.trading_mode || '')
-    .trim()
-    .toLowerCase();
-  if (accountMode === 'live' || accountMode === 'virtual') return accountMode;
-  const rowMode = String(
-    settings?.workspace_mode ?? settings?.trading_mode ?? settings?.mode ?? ''
-  )
-    .trim()
-    .toLowerCase();
-  if (rowMode === 'live' || rowMode === 'virtual') return rowMode;
-  return cfg.mode;
-}
 
 /**
  * Daily performance card for one workspace, delivered to that trader's own chat.
@@ -3356,7 +3215,7 @@ async function handleTelegramCommand(rawText, token, chatId, operatorName, userS
     case '/stop_bot': {
       const isLive = settingsModeLabel(settings) === 'LIVE';
       // Pausing VIRTUAL must leave the LIVE engine untouched (and vice versa).
-      const flags = resolveTradingConfig(settings);
+      const flags = resolveTradingConfigFor(settings);
       const otherRunning = isLive ? flags.demoRunning : flags.liveRunning;
       const result = await updateSettingsWithFallback(settings.id, {
         [isLive ? 'live_bot_running' : 'demo_bot_running']: false,
@@ -4072,15 +3931,22 @@ async function runCycleForUserMode(settings, mode) {
         .eq('id', tr.id);
       if (pnlError && isMissingColumnError(pnlError)) {
         // Pre-upgrade schema: keep PnL live and fall back to entry-only trailing.
+        const missingColumnError = pnlError;
         const { peak_price: _ignoredPeak, ...legacyPatch } = pnlPatch;
         ({ error: pnlError } = await supabase
           .from('trades')
           .update(legacyPatch)
           .eq('id', tr.id));
+        // The fallback only succeeds when peak_price was the offending column, so that
+        // is a real schema gap: log it loudly and flag the degraded state for the UI.
+        if (!pnlError) await notePeakPriceNotPersisted(cfg.scope, missingColumnError);
+      } else if (!pnlError) {
+        await notePeakPricePersisted();
       }
       tr.current_price = livePx;
       tr.profit_usdt = profitUsdt;
       tr.profit_pct = profitPct;
+      // Kept in memory even when the write failed, so this process keeps trailing armed.
       tr.peak_price = peakPrice;
     }
 
@@ -4097,13 +3963,18 @@ async function runCycleForUserMode(settings, mode) {
           .filter((row) => tradeModeOf(row) === cfg.mode)
           .reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
         const equity = cfg.mode === 'live' ? liveSpot : virtualBalance;
-        const dayOpenEquity = Math.max(1, equity - realizedToday);
-        const lossPct = realizedToday < 0 ? (Math.abs(realizedToday) / dayOpenEquity) * 100 : 0;
-        dailyLossBreached = lossPct >= cfg.dailyMaxLossPct;
+        const guard = evaluateDailyLossGuard({
+          realizedToday,
+          equity,
+          dailyMaxLossPct: cfg.dailyMaxLossPct,
+        });
+        dailyLossBreached = guard.halted;
         if (dailyLossBreached) {
           await warnThrottled(
             'daily-max-loss',
-            `Daily loss guard hit — realized loss ${lossPct.toFixed(2)}% of $${dayOpenEquity.toFixed(
+            `Daily loss guard hit — realized loss ${guard.lossPct.toFixed(
+              2
+            )}% of $${guard.dayOpenEquity.toFixed(
               2
             )} opening equity (limit ${cfg.dailyMaxLossPct}%). New entries paused until 00:00 Asia/Dhaka.`,
             null,
@@ -4260,16 +4131,24 @@ async function runCycleForUserMode(settings, mode) {
           continue;
         }
 
-        // DCA re-buy on a dip below the lowest open entry.
-        if (!dailyLossBreached && !crashGuard.blocked && cfg.dcaEnabled && pairOpen.length < cfg.dcaMaxBuys) {
-          const lowestEntry = Math.min(...pairOpen.map((t) => Number(t.entry_price)));
-          const dropPct = ((lowestEntry - livePx) / lowestEntry) * 100;
+        // DCA re-buy on a dip below the lowest open entry, capped per pair.
+        {
           // Auto-compounding sizes every DCA ticket from the current balance too.
           const dcaNotional = resolveEntryNotional(
             cfg,
             cfg.mode === 'live' ? liveSpot : virtualBalance
           );
-          if (dropPct >= cfg.dcaStepPct && totalInvested + dcaNotional <= cfg.maxPerPair) {
+          const dcaPlan = planDcaRebuy({
+            pairOpen,
+            livePx,
+            cfg,
+            notional: dcaNotional,
+            totalInvested,
+            dailyLossBreached,
+            crashBlocked: crashGuard.blocked,
+          });
+          const dropPct = dcaPlan.dropPct;
+          if (dcaPlan.ok) {
             let row = null;
             if (cfg.mode === 'live') {
               const buy = await buyWithGuards(
@@ -4337,7 +4216,17 @@ async function runCycleForUserMode(settings, mode) {
             });
           }
         }
-      } else if (!dailyLossBreached && !crashGuard.blocked && activeTrades.length < cfg.maxOpenTrades) {
+      } else if (
+        canOpenAnotherTrade({
+          activeTrades,
+          maxOpenTrades: cfg.maxOpenTrades,
+          dailyLossBreached,
+          crashBlocked: crashGuard.blocked,
+          mode: cfg.mode,
+          // The explicit LIVE key guard immediately below stays the enforcement point.
+          hasCredentials: true,
+        }).allowed
+      ) {
         if (cfg.mode === 'live' && !cfg.hasCredentials) {
           await warnThrottled(
             'live-missing-keys',
@@ -4521,7 +4410,7 @@ async function runCycle() {
       );
     }
     for (const row of active) {
-      const flags = resolveTradingConfig(row);
+      const flags = resolveTradingConfigFor(row);
       await mirrorAccountRunState(scopeOf(row), flags.demoRunning, flags.liveRunning);
       try {
         await runCycleForUser(row);

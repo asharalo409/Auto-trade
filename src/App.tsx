@@ -628,6 +628,7 @@ export default function App() {
                   voiceEnabled={terminal.voiceEnabled}
                   audioReady={terminal.audioReady}
                   crashGuards={terminal.crashGuards}
+                  trailingWatermarkDegraded={terminal.trailingWatermarkDegraded}
                   onToggleVoice={terminal.toggleVoice}
                   onTestVoice={terminal.testVoice}
                   onCloseAll={terminal.closeAllPositions}

@@ -226,7 +226,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                       <span className="text-cyan-300">${trade.current_price}</span>
                     </div>
                     <div className="text-right">
-                      <span className="block text-slate-500">TP TARGET</span>
+                      <span className="block text-slate-500">{t.tpTarget}</span>
                       <span className="text-emerald-300">${trade.take_profit_price}</span>
                     </div>
                   </div>
@@ -275,7 +275,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                       onClick={() => onCloseTrade(trade.id)}
                       className="min-h-[34px] px-3 py-1 text-[11px]"
                     >
-                      {blockedByZeroLoss ? 'SHIELD HOLD' : t.closePosition}
+                      {blockedByZeroLoss ? t.shieldHold : t.closePosition}
                     </NeonButton>
                   </div>
                 </motion.div>
@@ -291,7 +291,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
         rightSlot={
           <div className="flex flex-wrap items-center gap-2.5">
             <span className="font-mono-tech text-xs text-slate-400">
-              {filteredHistory.length} RECORDS
+              {filteredHistory.length} {t.recordsSuffix}
             </span>
             <NeonButton
               variant={csvDone ? 'emerald' : 'cyan'}
@@ -300,7 +300,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
               className="min-h-[34px] px-3 py-1 text-[11px]"
             >
               {csvDone ? <Check className="h-3.5 w-3.5" /> : <Download className="h-3.5 w-3.5" />}
-              {csvDone ? t.csvExported : `📥 Export CSV`}
+              {csvDone ? t.csvExported : `📥 ${t.exportCsvBtn}`}
             </NeonButton>
           </div>
         }
@@ -327,9 +327,9 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
             className="min-h-[40px] rounded-lg border border-slate-700/80 bg-[#05060a] px-3 font-mono-tech text-xs text-slate-200 focus:border-cyan-400 focus:outline-none"
           >
             <option value="ALL">{t.filterStatus}</option>
-            <option value="OPEN">OPEN</option>
-            <option value="CLOSED">CLOSED</option>
-            <option value="CANCELLED">CANCELLED</option>
+            <option value="OPEN">{t.tradeStatusOpen}</option>
+            <option value="CLOSED">{t.tradeStatusClosed}</option>
+            <option value="CANCELLED">{t.tradeStatusCancelled}</option>
           </select>
 
           <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#05060a] p-1">
@@ -367,15 +367,15 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
             <table className="w-full min-w-[640px] text-left font-mono-tech text-xs">
               <thead>
                 <tr className="border-b border-slate-800 text-[11px] tracking-wider text-slate-400 uppercase">
-                  <th className="py-2.5 pr-3">PAIR</th>
-                  <th className="py-2.5 pr-3">MODE</th>
-                  <th className="py-2.5 pr-3">STATUS</th>
+                  <th className="py-2.5 pr-3">{t.colPair}</th>
+                  <th className="py-2.5 pr-3">{t.colMode}</th>
+                  <th className="py-2.5 pr-3">{t.colStatus}</th>
                   <th className="py-2.5 pr-3 text-right">{t.entryPrice}</th>
                   <th className="py-2.5 pr-3 text-right">{t.currentPrice}</th>
                   <th className="py-2.5 pr-3 text-right">{t.invested}</th>
                   <th className="py-2.5 pr-3 text-right">{t.pnlLabel}</th>
-                  <th className="py-2.5 pr-3 text-right">TIME</th>
-                  <th className="py-2.5 text-right">CARD</th>
+                  <th className="py-2.5 pr-3 text-right">{t.colTime}</th>
+                  <th className="py-2.5 text-right">{t.colCard}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/70">
@@ -394,7 +394,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                               : 'bg-cyan-500/15 text-cyan-300'
                           }`}
                         >
-                          {tr.mode ?? 'LIVE'}
+                          {(tr.mode ?? 'LIVE') === 'LIVE' ? t.modeLiveShort : t.modeDemoShort}
                         </span>
                       </td>
                       <td className="py-2.5 pr-3">
@@ -407,7 +407,13 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                                 : 'text-slate-400'
                           }`}
                         >
-                          {tr.status}
+                          {tr.status === 'OPEN'
+                            ? t.tradeStatusOpen
+                            : tr.status === 'CLOSED'
+                              ? t.tradeStatusClosed
+                              : tr.status === 'CANCELLED'
+                                ? t.tradeStatusCancelled
+                                : tr.status}
                         </span>
                       </td>
                       <td className="py-2.5 pr-3 text-right text-slate-300">

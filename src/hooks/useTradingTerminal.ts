@@ -525,6 +525,9 @@ export function useTradingTerminal() {
   const [audioReady, setAudioReady] = useState<boolean>(() => voiceAnnouncer.isAudioUnlocked());
   // Flash-crash circuit breaker state, polled from the 24/7 worker (/api/guards).
   const [crashGuards, setCrashGuards] = useState<CrashGuardState[]>([]);
+  // True when the worker's database lacks trades.peak_price, so the trailing-stop
+  // high-water mark cannot be saved and a restart would disarm the trailing stop.
+  const [trailingWatermarkDegraded, setTrailingWatermarkDegraded] = useState(false);
   // Masked status of THIS user's Binance key vault (secrets stay in the worker).
   const [apiKeyStatus, setApiKeyStatus] = useState<UserApiKeyStatus>({
     linked: false,
@@ -638,6 +641,7 @@ export function useTradingTerminal() {
         const data = await res.json();
         if (cancelled) return;
         setCrashGuards(Array.isArray(data?.guards) ? data.guards : []);
+        setTrailingWatermarkDegraded(Boolean(data?.schema?.schema_degraded));
       } catch {
         // worker offline — leave the last known state alone
       }
@@ -3891,6 +3895,7 @@ export function useTradingTerminal() {
     voiceEnabled,
     audioReady,
     crashGuards,
+    trailingWatermarkDegraded,
     account,
     accountApproved,
     isAdmin,

@@ -100,6 +100,8 @@ interface CommandCenterProps {
   audioReady: boolean;
   /** Pairs currently paused by the worker's flash-crash circuit breaker. */
   crashGuards: CrashGuardState[];
+  /** The worker's DB lacks trades.peak_price, so the trailing high-water mark is not saved. */
+  trailingWatermarkDegraded: boolean;
   onToggleVoice: (enabled: boolean) => void;
   onTestVoice: () => void;
   onCloseAll: () => Promise<{ closed: number; realizedPnl: number }>;
@@ -165,6 +167,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   voiceEnabled,
   audioReady,
   crashGuards,
+  trailingWatermarkDegraded,
   onToggleVoice,
   onTestVoice,
   onCloseAll,
@@ -831,10 +834,10 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               <div className="min-w-0 flex-1">
                 <p className="truncate font-mono-tech text-[12px] font-bold text-white">
                   {tradeToast.kind === 'OPEN'
-                    ? `${tradeToast.pair} Opened`
-                    : `${tradeToast.pair} Closed: ${tradeToast.profit >= 0 ? '+' : '-'}$${Math.abs(
+                    ? `${tradeToast.pair} ${t.toastOpenedSuffix}`
+                    : `${tradeToast.pair} ${t.toastClosedSuffix}: ${tradeToast.profit >= 0 ? '+' : '-'}$${Math.abs(
                         tradeToast.profit
-                      ).toFixed(2)} ${tradeToast.profit >= 0 ? 'Profit' : 'Loss'}`}
+                      ).toFixed(2)} ${tradeToast.profit >= 0 ? t.toastProfitWord : t.toastLossWord}`}
                 </p>
                 <p className="truncate font-mono-tech text-[10px] text-slate-300">
                   {tradeToast.detail}
@@ -842,7 +845,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               </div>
               <button
                 type="button"
-                aria-label="Dismiss trade notification"
+                aria-label={t.dismissTradeToastAria}
                 onClick={() => setTradeToast(null)}
                 className="shrink-0 cursor-pointer rounded-lg border border-white/15 px-1.5 py-0.5 font-mono-tech text-[10px] text-slate-300"
               >
@@ -877,6 +880,20 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
       />
 
       {/* Crash Guard risk badge — live circuit-breaker state from the 24/7 worker */}
+      {trailingWatermarkDegraded && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-xl border border-amber-400/50 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200"
+        >
+          <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div>
+            <p className="font-mono-tech text-[10px] font-bold tracking-wider uppercase">
+              {t.schemaDegradedTitle}
+            </p>
+            <p className="text-amber-200/85">{t.schemaDegradedHint}</p>
+          </div>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <span
           className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono-tech text-[10px] font-bold tracking-wider uppercase ${
@@ -886,12 +903,12 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           }`}
           title={
             crashGuards.length > 0
-              ? `Paused pairs: ${crashGuards.map((g) => `${g.symbol} ${g.dropPct}%`).join(', ')}`
-              : 'No pair is in a flash-crash pause. Entries pause automatically on a 4% 5m drop.'
+              ? `${t.crashGuardPausedPrefix} ${crashGuards.map((g) => `${g.symbol} ${g.dropPct}%`).join(', ')}`
+              : t.crashGuardIdleHint
           }
         >
           <ShieldAlert className="h-3 w-3" />
-          {crashGuards.length > 0 ? '🛡️ Crash Guard: Active' : '🛡️ Crash Guard: Armed'}
+          {crashGuards.length > 0 ? t.crashGuardActive : t.crashGuardArmed}
         </span>
         {crashGuards.map((guard) => (
           <span
@@ -903,12 +920,13 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         ))}
         {settings.multi_timeframe_filter && (
           <span className="rounded border border-cyan-500/35 bg-cyan-500/8 px-2 py-1 font-mono-tech text-[10px] font-semibold text-cyan-300">
-            1H TREND FILTER ON
+            {t.trendFilterOn}
           </span>
         )}
         {settings.auto_compounding && (
           <span className="rounded border border-amber-500/35 bg-amber-500/8 px-2 py-1 font-mono-tech text-[10px] font-semibold text-amber-300">
-            COMPOUND {Math.round((settings.compound_allocation_pct ?? 5) * 10) / 10}%/TRADE
+            {t.compoundPrefix} {Math.round((settings.compound_allocation_pct ?? 5) * 10) / 10}%
+            {t.compoundSuffix}
           </span>
         )}
       </div>
@@ -1282,7 +1300,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                   : 'border-amber-500/45 bg-amber-500/12 text-amber-200'
               }`}
             >
-              {audioReady ? '🔊 Audio Ready' : '🔇 Tap Test Voice to Unlock'}
+              {audioReady ? t.audioReadyBadge : t.audioLockedBadge}
             </span>
             <span
               className={`font-mono-tech text-[11px] font-bold ${
@@ -1340,7 +1358,9 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                   </span>
                   <span className="font-mono-tech text-[10px] font-normal text-slate-400">
                     {activeSignalNotice.time} ·{' '}
-                    {activeSignalNotice.desktopDelivered ? 'Desktop + Terminal' : 'Terminal Alert'}
+                    {activeSignalNotice.desktopDelivered
+                      ? t.signalChannelDesktop
+                      : t.signalChannelTerminal}
                     {activeSignalNotice.telegramStatus ? ` · ${activeSignalNotice.telegramStatus}` : ''}
                   </span>
                 </div>
@@ -1351,7 +1371,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
             </button>
             <button
               type="button"
-              aria-label="Dismiss notification"
+              aria-label={t.dismissNotificationAria}
               onClick={() => setActiveSignalNotice(null)}
               className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-slate-700/70 text-slate-400 transition-colors hover:border-slate-500 hover:text-slate-100"
             >
@@ -1456,7 +1476,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                     }`}
                   />
                   <span className="mt-1.5 font-display text-sm font-bold tracking-widest uppercase">
-                    {settings.bot_enabled ? 'ON' : 'OFF'}
+                    {settings.bot_enabled ? t.botOnShort : t.botOffShort}
                   </span>
                 </motion.button>
               </div>
@@ -1588,7 +1608,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                   }}
                   formatter={(value: unknown) => [
                     `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-                    'Equity',
+                    t.equityTooltip,
                   ]}
                 />
                 <Area
@@ -1645,7 +1665,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
         <TerminalPanel
           accent="cyan"
           title={t.candlestickTitle}
-          subtitle="OHLCV · MA / EMA / BOLL / VWAP · Trade Markers (Buy & Profit/Loss)"
+          subtitle={t.chartSubtitle}
           rightSlot={<InfoTip text={t.helpCandlestick} label={t.candlestickTitle} />}
           className="lg:col-span-8"
         >
@@ -1730,7 +1750,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 type="number"
                 step="any"
                 required
-                placeholder="e.g. 98500"
+                placeholder={t.alertPricePlaceholder}
                 value={alertPriceInput}
                 onChange={(e) => setAlertPriceInput(e.target.value)}
                 className="min-h-[38px] w-full rounded-lg border border-slate-700/80 bg-[#090d16] px-3 font-mono-tech text-xs text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
@@ -1744,13 +1764,17 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           {/* Active / Triggered Alert Rules List */}
           <div className="space-y-2 rounded-xl border border-slate-800/80 bg-[#05070d] p-4 lg:col-span-7">
             <div className="flex items-center justify-between font-mono-tech text-xs font-semibold text-slate-200">
-              <span>Active Rules ({customAlerts.filter(a => a.active).length})</span>
-              <span className="text-slate-500">{customAlerts.length} Total</span>
+              <span>
+                {t.activeRulesLabel} ({customAlerts.filter((a) => a.active).length})
+              </span>
+              <span className="text-slate-500">
+                {customAlerts.length} {t.alertsTotalSuffix}
+              </span>
             </div>
             <div className="max-h-48 overflow-y-auto space-y-2 pr-1">
               {customAlerts.length === 0 ? (
                 <div className="py-6 text-center font-mono-tech text-xs text-slate-500">
-                  No price alerts configured yet. Add one on the left.
+                  {t.noPriceAlerts}
                 </div>
               ) : (
                 customAlerts.map((alert) => {
@@ -1773,7 +1797,8 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                           </span>
                         </div>
                         <div className="mt-0.5 text-[10px] text-slate-400">
-                          Current: ${currentPrice.toLocaleString()} · {alert.active ? 'Monitoring...' : 'Triggered ✓'}
+                          {t.currentPricePrefix} ${currentPrice.toLocaleString()} ·{' '}
+                          {alert.active ? t.alertMonitoring : t.alertTriggered}
                         </div>
                       </div>
                       <button
@@ -1946,7 +1971,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 </div>
                 <button
                   type="button"
-                  aria-label="Close calculator"
+                  aria-label={t.closeCalculatorAria}
                   onClick={() => setCalcOpen(false)}
                   className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition-colors hover:border-rose-400/60 hover:text-white"
                 >

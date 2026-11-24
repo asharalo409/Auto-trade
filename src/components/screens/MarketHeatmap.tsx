@@ -136,7 +136,7 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                       isEnabled ? 'text-cyan-300' : 'text-slate-500'
                     }`}
                   >
-                    {isEnabled ? 'ON' : 'OFF'}
+                    {isEnabled ? t.heatmapOn : t.heatmapOff}
                   </span>
                 </div>
 
@@ -165,7 +165,7 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                       {pair.change24h.toFixed(2)}%
                     </span>
                     {hasOpen && (
-                      <span className="text-[10px] font-semibold text-amber-300">POS</span>
+                      <span className="text-[10px] font-semibold text-amber-300">{t.heatmapPos}</span>
                     )}
                   </div>
 
@@ -181,7 +181,7 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                         <BellOff className="h-3 w-3 text-slate-500" />
                       )}
                       <span className={isAlertOn ? 'text-amber-200' : 'text-slate-500'}>
-                        {isAlertOn ? 'ALERT' : 'MUTED'}
+                        {isAlertOn ? t.heatmapAlertOn : t.heatmapAlertOff}
                       </span>
                     </span>
                     <button
@@ -270,8 +270,8 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
           >
             <TerminalPanel
               accent={selectedPair.change24h >= 0 ? 'emerald' : 'crimson'}
-              title={`${selectedPair.symbol} // CANDLESTICK & TELEMETRY`}
-              subtitle={`24h Vol: $${(selectedPair.volume24h / 1_000_000).toFixed(1)}M`}
+              title={`${selectedPair.symbol} // ${t.heatmapDetailSuffix}`}
+              subtitle={`${t.volBase}: $${(selectedPair.volume24h / 1_000_000).toFixed(1)}M`}
               rightSlot={
                 <div className="flex items-center gap-3">
                   <span className="font-mono-tech text-xs text-slate-300">
@@ -282,13 +282,13 @@ export const MarketHeatmap: React.FC<MarketHeatmapProps> = ({
                   <SciFiSwitch
                     checked={enabledPairs.includes(selectedPair.symbol)}
                     onChange={() => onTogglePair(selectedPair.symbol)}
-                    label={`Toggle ${selectedPair.symbol}`}
+                    label={`${t.pairTogglePrefix} ${selectedPair.symbol}`}
                     accent="cyan"
                   />
                   <button
                     type="button"
                     onClick={() => setSelectedSymbol('')}
-                    aria-label="Close detail"
+                    aria-label={t.heatmapCloseDetailAria}
                     className="hidden sm:inline-flex min-h-[36px] min-w-[36px] items-center justify-center rounded-lg border border-slate-700/80 text-slate-400 hover:text-white"
                   >
                     <X className="h-4 w-4" />
