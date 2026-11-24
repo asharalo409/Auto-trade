@@ -441,7 +441,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                             className="inline-flex min-h-[28px] cursor-pointer items-center gap-1 rounded border border-amber-500/45 bg-amber-500/12 px-2 py-0.5 font-mono-tech text-[10px] font-bold text-amber-200 transition-colors hover:bg-amber-500/22"
                           >
                             <Share2 className="h-3 w-3" />
-                            PnL Card
+                            {t.pnlCardBtn}
                           </button>
                         ) : (
                           <span className="text-slate-700">—</span>
@@ -462,7 +462,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
           role="dialog"
           aria-modal="true"
-          aria-label="Aegis Quant PnL card"
+          aria-label={t.cardAria}
           onClick={() => setShareTrade(null)}
         >
           <motion.div
@@ -475,7 +475,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
             <button
               type="button"
               onClick={() => setShareTrade(null)}
-              aria-label="Close PnL card"
+              aria-label={t.cardCloseAria}
               className="absolute top-3 right-3 z-10 flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-100"
             >
               <X className="h-4 w-4" />
@@ -488,7 +488,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                     AEGIS QUANT
                   </p>
                   <p className="font-mono-tech text-[10px] tracking-[0.2em] text-slate-400">
-                    MARKET TERMINAL PRO
+                    {t.cardMarketPro}
                   </p>
                 </div>
                 <span
@@ -498,24 +498,26 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
                       : 'border-cyan-400/50 bg-cyan-500/12 text-cyan-200'
                   }`}
                 >
-                  {(shareTrade.mode ?? 'LIVE') === 'LIVE' ? 'LIVE SPOT' : 'DEMO ENGINE'}
+                  {(shareTrade.mode ?? 'LIVE') === 'LIVE' ? t.cardLiveSpot : t.cardDemoEngine}
                 </span>
               </div>
 
               <p className="mt-5 font-display text-4xl font-black tracking-wide text-slate-50">
                 {shareTrade.pair}
               </p>
-              <p className="font-mono-tech text-xs tracking-widest text-emerald-400">LONG SPOT</p>
+              <p className="font-mono-tech text-xs tracking-widest text-emerald-400">
+                {t.cardLongSpot}
+              </p>
 
               <p className="mt-5 font-mono-tech text-[10px] tracking-widest text-slate-500">
-                RETURN ON INVESTMENT
+                {t.cardRoi}
               </p>
               <p className="font-display text-6xl font-black text-emerald-400">
                 +{shareTrade.profit_pct.toFixed(2)}%
               </p>
 
               <p className="mt-3 font-mono-tech text-[10px] tracking-widest text-slate-500">
-                NET PROFIT
+                {t.cardNetProfit}
               </p>
               <p className="font-display text-3xl font-black text-emerald-200">
                 +${shareTrade.profit_usdt.toFixed(2)} USD
@@ -523,11 +525,11 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
 
               <div className="mt-5 grid grid-cols-2 gap-3 font-mono-tech">
                 <div className="rounded-xl border border-slate-700/70 bg-slate-900/60 p-3">
-                  <p className="text-[10px] tracking-widest text-slate-500">ENTRY PRICE</p>
+                  <p className="text-[10px] tracking-widest text-slate-500">{t.cardEntry}</p>
                   <p className="text-base font-bold text-slate-200">${shareTrade.entry_price}</p>
                 </div>
                 <div className="rounded-xl border border-slate-700/70 bg-slate-900/60 p-3">
-                  <p className="text-[10px] tracking-widest text-slate-500">EXIT PRICE</p>
+                  <p className="text-[10px] tracking-widest text-slate-500">{t.cardExit}</p>
                   <p className="text-base font-bold text-slate-200">
                     ${shareTrade.exit_price ?? shareTrade.current_price}
                   </p>
@@ -535,7 +537,7 @@ export const TradesScreen: React.FC<TradesScreenProps> = ({
               </div>
 
               <p className="mt-4 font-mono-tech text-[10px] text-slate-500">
-                CLOSED{' '}
+                {t.cardClosed}{' '}
                 {new Date(shareTrade.closed_at ?? shareTrade.opened_at)
                   .toISOString()
                   .replace('T', ' ')

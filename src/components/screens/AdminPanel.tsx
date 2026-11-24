@@ -17,6 +17,7 @@ import { NeonButton } from '../ui/MotionPrimitives';
 import { TerminalPanel } from '../ui/TerminalPanel';
 
 interface AdminPanelProps {
+  t: Record<string, string>;
   users: AdminUserRow[];
   totals: {
     users: number;
@@ -36,11 +37,11 @@ interface AdminPanelProps {
   ) => Promise<{ ok: boolean; detail: string }>;
 }
 
-const FILTERS: { id: ApprovalStatus | 'all'; label: string }[] = [
-  { id: 'pending', label: 'Pending' },
-  { id: 'approved', label: 'Approved' },
-  { id: 'rejected', label: 'Rejected' },
-  { id: 'all', label: 'All' },
+const FILTERS: { id: ApprovalStatus | 'all'; labelKey: string }[] = [
+  { id: 'pending', labelKey: 'adminFilterPending' },
+  { id: 'approved', labelKey: 'adminFilterApproved' },
+  { id: 'rejected', labelKey: 'adminFilterRejected' },
+  { id: 'all', labelKey: 'adminFilterAll' },
 ];
 
 const statusChip = (status: ApprovalStatus): string =>
@@ -55,6 +56,7 @@ const statusChip = (status: ApprovalStatus): string =>
  * Reads the worker API, which verifies this session owns an `is_admin` account.
  */
 export const AdminPanel: React.FC<AdminPanelProps> = ({
+  t,
   users,
   totals,
   loading,
@@ -73,6 +75,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   );
 
   const pendingCount = users.filter((user) => user.approval_status === 'pending').length;
+  const statusLabel = (status: ApprovalStatus): string =>
+    status === 'approved'
+      ? t.statusApproved
+      : status === 'rejected'
+        ? t.statusRejected
+        : t.statusPending;
 
   const handleReview = async (user: AdminUserRow, decision: 'approve' | 'reject') => {
     setBusyId(user.id);
@@ -86,8 +94,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     <div className="space-y-4">
       <TerminalPanel
         accent="amber"
-        title="🛡️ ADMIN CONTROL CENTER"
-        subtitle="Registration approval · user roster · aggregate P&L"
+        title={t.adminTitle}
+        subtitle={t.adminSubtitle}
         rightSlot={
           <NeonButton
             type="button"
@@ -97,27 +105,32 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             className="min-h-[34px] px-3 py-1 text-[11px]"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-            {loading ? 'SYNCING...' : 'REFRESH'}
+            {loading ? t.adminSyncing : t.adminRefresh}
           </NeonButton>
         }
       >
         <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
           {[
-            { label: 'Traders', value: String(totals?.users ?? users.length), icon: Users, tone: 'text-cyan-300' },
             {
-              label: 'Pending',
+              label: t.adminTraders,
+              value: String(totals?.users ?? users.length),
+              icon: Users,
+              tone: 'text-cyan-300',
+            },
+            {
+              label: t.adminPending,
               value: String(totals?.pending ?? pendingCount),
               icon: Activity,
               tone: 'text-amber-300',
             },
             {
-              label: 'Approved',
+              label: t.adminApproved,
               value: String(totals?.approved ?? 0),
               icon: BadgeCheck,
               tone: 'text-emerald-300',
             },
             {
-              label: 'Community P&L',
+              label: t.adminCommunityPnl,
               value: `${(totals?.pnl_usd ?? 0) >= 0 ? '+' : '-'}$${Math.abs(
                 totals?.pnl_usd ?? 0
               ).toFixed(2)}`,
@@ -145,14 +158,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
         {totals && (
           <p className="mt-2 font-mono-tech text-[10px] text-slate-500">
-            Community P&L in BDT: ৳{Math.abs(totals.pnl_bdt).toLocaleString('en-US')} · rate ৳
-            {BDT_PER_USD}/USD
+            {t.adminBdtLine
+              .replace('{bdt}', Math.abs(totals.pnl_bdt).toLocaleString('en-US'))
+              .replace('{rate}', String(BDT_PER_USD))}
           </p>
         )}
 
         {error && (
           <div className="mt-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 font-mono-tech text-[11px] text-rose-200">
-            {error} — redeploy the worker so /api/admin/users is available.
+            {error} {t.adminErrorSuffix}
           </div>
         )}
 
@@ -169,7 +183,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         )}
       </TerminalPanel>
 
-      <TerminalPanel accent="cyan" title="USER ROSTER" subtitle={`${users.length} registered account(s)`}>
+      <TerminalPanel
+        accent="cyan"
+        title={t.adminRosterTitle}
+        subtitle={t.adminRosterSub.replace('{count}', String(users.length))}
+      >
         <div className="mb-3 flex flex-wrap gap-1.5">
           {FILTERS.map((item) => {
             const count =
@@ -188,7 +206,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     : 'border-slate-800 text-slate-400 hover:border-slate-600 hover:text-slate-200'
                 }`}
               >
-                {item.label} · {count}
+                {t[item.labelKey]} · {count}
               </button>
             );
           })}
@@ -196,7 +214,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
         {visible.length === 0 ? (
           <div className="rounded-xl border border-slate-800 bg-[#05070d] px-4 py-8 text-center font-mono-tech text-[11px] text-slate-500">
-            {loading ? 'Loading registered accounts…' : 'No accounts in this view.'}
+            {loading ? t.adminLoading : t.adminEmpty}
           </div>
         ) : (
           <ul className="space-y-2">
@@ -228,19 +246,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         </span>
                         {user.is_admin && (
                           <span className="flex items-center gap-1 rounded border border-amber-400/50 bg-amber-500/10 px-1 font-mono-tech text-[8px] font-bold tracking-wider text-amber-200 uppercase">
-                            <ShieldCheck className="h-2.5 w-2.5" /> admin
+                            <ShieldCheck className="h-2.5 w-2.5" /> {t.adminAdminBadge}
                           </span>
                         )}
                         {isSelf && (
                           <span className="rounded border border-slate-600 px-1 font-mono-tech text-[8px] tracking-wider text-slate-400 uppercase">
-                            you
+                            {t.adminYouBadge}
                           </span>
                         )}
                       </div>
                       <div className="mt-0.5 truncate font-mono-tech text-[10px] text-slate-400">
                         {user.email}
                         {user.telegram_username ? ` · @${user.telegram_username}` : ''}
-                        {user.telegram_chat_id ? ` · chat ${user.telegram_chat_id}` : ' · no chat id'}
+                        {user.telegram_chat_id
+                          ? ` ${t.adminChatPrefix} ${user.telegram_chat_id}`
+                          : ` ${t.adminNoChat}`}
                       </div>
                     </div>
                     <span
@@ -248,7 +268,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         user.approval_status
                       )}`}
                     >
-                      {user.approval_status}
+                      {statusLabel(user.approval_status)}
                     </span>
                   </div>
 
@@ -258,13 +278,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         user.trading_mode === 'LIVE' ? 'text-rose-300' : 'text-cyan-300'
                       }
                     >
-                      {user.trading_mode}
+                      {user.trading_mode === 'LIVE' ? t.adminModeLive : t.adminModeVirtual}
                     </span>
-                    <span>{user.total_trades} trades</span>
+                    <span>
+                      {user.total_trades} {t.adminTradesSuffix}
+                    </span>
                     <span>
                       {user.total_trades > 0
-                        ? `${((user.win_trades / user.total_trades) * 100).toFixed(1)}% win`
-                        : 'no closed trades'}
+                        ? `${((user.win_trades / user.total_trades) * 100).toFixed(1)}${t.adminWinSuffix}`
+                        : t.adminNoClosed}
                     </span>
                     <span
                       className={
@@ -275,12 +297,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       {Math.abs(user.realized_pnl_usd).toFixed(2)}
                     </span>
                     <span className={user.has_keys ? 'text-emerald-300' : 'text-amber-300'}>
-                      {user.has_keys ? 'keys linked' : 'no keys'}
+                      {user.has_keys ? t.adminKeysLinked : t.adminNoKeys}
                     </span>
                     {user.bot_running && (
                       <span className="flex items-center gap-1 text-emerald-300">
                         <span className="h-1 w-1 animate-pulse rounded-full bg-emerald-400" />
-                        engine live
+                        {t.adminEngineLive}
                       </span>
                     )}
                   </div>
@@ -294,7 +316,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       className="min-h-[32px] px-2.5 text-[10px]"
                     >
                       <Check className="h-3 w-3" />
-                      {busy ? '...' : 'Approve'}
+                      {busy ? '...' : t.adminApprove}
                     </NeonButton>
                     <NeonButton
                       type="button"
@@ -304,7 +326,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       className="min-h-[32px] px-2.5 text-[10px]"
                     >
                       <X className="h-3 w-3" />
-                      Reject
+                      {t.adminReject}
                     </NeonButton>
                   </div>
                 </li>
@@ -315,8 +337,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
         <p className="mt-3 flex items-start gap-1.5 font-mono-tech text-[9px] leading-relaxed text-slate-500">
           <ShieldX className="mt-0.5 h-3 w-3 shrink-0 text-slate-600" />
-          Approving from here also sends the applicant a Telegram welcome on @TaseenMarketBot. API
-          keys and balances are never exposed in this roster.
+          {t.adminFooter}
         </p>
       </TerminalPanel>
     </div>

@@ -283,6 +283,7 @@ export default function App() {
       {/* Top Live Ticker */}
       <div className="relative z-30">
         <TickerBar
+          t={t}
           pairs={terminal.marketPairs}
           botStatus={terminal.botStatus}
           mode={terminal.activeWorkspace}
@@ -566,6 +567,7 @@ export default function App() {
           </div>
         ) : terminal.isAuthenticated && terminal.account && !terminal.accountApproved ? (
           <PendingApprovalScreen
+            t={t}
             account={terminal.account}
             onRefresh={terminal.refreshAccount}
             onSignOut={terminal.signOut}
@@ -698,6 +700,7 @@ export default function App() {
 
               {activeTab === 'admin' && terminal.isAdmin && (
                 <AdminPanel
+                  t={t}
                   users={terminal.adminUsers}
                   totals={terminal.adminTotals}
                   loading={terminal.adminLoading}
@@ -815,7 +818,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowAccountGate(false)}
-                aria-label="Close"
+                aria-label={t.gateCloseAria}
                 className="absolute top-3 right-3 rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:text-slate-100"
               >
                 <X className="h-4 w-4" />
@@ -826,30 +829,26 @@ export default function App() {
                   id="account-required-title"
                   className="font-display text-lg font-bold tracking-wider uppercase"
                 >
-                  Account Required
+                  {t.gateTitle}
                 </h3>
               </div>
-              <p className="mt-3 text-xs leading-relaxed text-slate-300">
-                Live trading, your Binance Spot keys and 24/7 automated execution run inside a
-                private, admin-approved workspace. Virtual Demo stays free — keep exploring, or
-                create an account to go LIVE.
-              </p>
+              <p className="mt-3 text-xs leading-relaxed text-slate-300">{t.gateBody}</p>
               <ul className="mt-3 space-y-1 font-mono-tech text-[11px] text-slate-400">
-                <li>• Register with full name, photo, email, password and Telegram chat ID</li>
-                <li>• An admin approves your account instantly from @TaseenMarketBot</li>
-                <li>• Then save keys once and see your real USDT + BDT balance immediately</li>
+                <li>• {t.gateBullet1}</li>
+                <li>• {t.gateBullet2}</li>
+                <li>• {t.gateBullet3}</li>
               </ul>
               <div className="mt-5 flex flex-wrap items-center justify-end gap-2">
                 <NeonButton variant="ghost" onClick={() => setShowAccountGate(false)}>
-                  Keep Browsing
+                  {t.gateKeepBrowsing}
                 </NeonButton>
                 <NeonButton variant="cyan" onClick={() => openAuth('SIGNIN')}>
                   <LogIn className="h-3.5 w-3.5" />
-                  Log In
+                  {t.gateLogIn}
                 </NeonButton>
                 <NeonButton variant="emerald" onClick={() => openAuth('SIGNUP')}>
                   <UserPlus className="h-3.5 w-3.5" />
-                  Register
+                  {t.gateRegister}
                 </NeonButton>
               </div>
             </motion.div>
@@ -859,6 +858,7 @@ export default function App() {
 
       {/* Community P&L leaderboard (aggregates only — keys stay private) */}
       <LeaderboardModal
+        t={t}
         open={showLeaderboard}
         onClose={() => setShowLeaderboard(false)}
         entries={terminal.leaderboard}
@@ -874,6 +874,7 @@ export default function App() {
         </div>
         <div className="hidden lg:block">
           <TickerBar
+            t={t}
             pairs={terminal.marketPairs}
             botStatus={terminal.botStatus}
             mode={terminal.activeWorkspace}

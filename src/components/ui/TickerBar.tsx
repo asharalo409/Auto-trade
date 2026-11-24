@@ -2,6 +2,7 @@ import React from 'react';
 import { BotStatus, PairMarketData } from '../../types/trading';
 
 interface TickerBarProps {
+  t: Record<string, string>;
   pairs: PairMarketData[];
   botStatus: BotStatus;
   mode: 'DEMO' | 'LIVE';
@@ -11,6 +12,7 @@ interface TickerBarProps {
 }
 
 export const TickerBar: React.FC<TickerBarProps> = ({
+  t,
   pairs,
   botStatus,
   mode,
@@ -30,13 +32,21 @@ export const TickerBar: React.FC<TickerBarProps> = ({
     change: p.change24h,
   }));
 
+  const statusLabel =
+    botStatus === 'RUNNING'
+      ? t.statusRunning
+      : botStatus === 'STOPPED'
+        ? t.statusStopped
+        : t.statusOffline;
+  const modeLabel = mode === 'LIVE' ? t.modeLiveShort : t.modeDemoShort;
+
   const statusText =
     position === 'top'
-      ? `ENGINE:${botStatus} · WORKSPACE:${mode} · OPEN:${openCount} · EQUITY:$${balance.toLocaleString(
+      ? `${t.tickerEngine}:${statusLabel} · ${t.tickerWorkspace}:${modeLabel} · ${t.tickerOpen}:${openCount} · ${t.tickerEquity}:$${balance.toLocaleString(
           'en-US',
           { minimumFractionDigits: 2 }
         )}`
-      : `BINANCE SPOT STREAM · 10 PAIRS MONITORED · REALTIME TELEMETRY ACTIVE`;
+      : t.tickerStream;
 
   const renderStrip = (prefix: string) => (
     <div className="flex items-center gap-5 px-4 font-mono-tech text-[10px] tracking-wider whitespace-nowrap">

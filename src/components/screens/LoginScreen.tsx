@@ -84,7 +84,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       // 160x160 WebP/JPEG data URL — small enough to store on the users row.
       setAvatarUrl(await fileToAvatarDataUrl(file));
     } catch (err) {
-      setAvatarError(err instanceof Error ? err.message : 'Could not process that image');
+      setAvatarError(err instanceof Error ? err.message : t.loginErrAvatar);
     }
   };
   const [loading, setLoading] = useState(false);
@@ -98,20 +98,20 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     setInfoMsg(null);
     setEmailNotice(null);
     if (!email.trim() || !password.trim()) {
-      setError('ইমেইল এবং পাসওয়ার্ড দুটিই দিন।');
+      setError(t.loginErrEmailPassword);
       return;
     }
     if (authMode === 'SIGNUP') {
       if (password.length < 6) {
-        setError('পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।');
+        setError(t.loginErrPasswordMin);
         return;
       }
       if (password !== confirmPassword) {
-        setError('দুইটি পাসওয়ার্ড এক হতে হবে।');
+        setError(t.loginErrPasswordMismatch);
         return;
       }
       if (!fullName.trim()) {
-        setError('Full name is required for admin approval.');
+        setError(t.loginErrFullName);
         return;
       }
       const typedChatId = telegramChatId.trim();
@@ -119,9 +119,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         isReservedAdminChatId(typedChatId) &&
         String(telegramIdentity.chatId ?? '') !== typedChatId
       ) {
-        setError(
-          'That Telegram chat ID belongs to the platform administrator. Open @TaseenMarketBot, send /start, and use the chat ID it replies with.'
-        );
+        setError(t.loginErrReservedChat);
         return;
       }
       setLoading(true);
@@ -129,15 +127,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       const check = await checkEmailWithApyhub(email.trim(), { disposableChecks: true });
       if (check.status === 'invalid') {
         setLoading(false);
-        setError(
-          'এই ইমেইলটি গ্রহণ করা যাচ্ছে না — ফরম্যাট/ডোমেইন সঠিক নয় অথবা এটি ডিসপোজেবল ইমেইল। (Format, domain & disposable check — not mailbox ownership.)'
-        );
+        setError(t.loginErrEmailRejected);
         return;
       }
       if (!check.ok) {
-        setEmailNotice(
-          'ApyHub ইমেইল যাচাই পাওয়া যায়নি — যাচাই ছাড়াই অ্যাকাউন্ট তৈরি হচ্ছে। (Validation service unavailable.)'
-        );
+        setEmailNotice(t.loginEmailNotice);
       }
       const res = await onSignUp(email.trim(), password, {
         fullName: fullName.trim(),
@@ -163,7 +157,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     setError(null);
     setInfoMsg(null);
     if (!email.trim()) {
-      setError('আগে আপনার ইমেইল লিখুন।');
+      setError(t.loginErrEmailFirst);
       return;
     }
     setResetBusy(true);
@@ -181,11 +175,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     setError(null);
     setInfoMsg(null);
     if (!/^\d{6}$/.test(resetCode.trim())) {
-      setError('Telegram-এ পাঠানো ৬ ডিজিটের কোডটি দিন। (Enter the 6-digit code.)');
+      setError(t.loginErrResetCode);
       return;
     }
     if (resetPassword.length < 8) {
-      setError('নতুন পাসওয়ার্ড কমপক্ষে ৮ অক্ষরের হতে হবে।');
+      setError(t.loginErrNewPasswordMin);
       return;
     }
     setResetBusy(true);
@@ -231,7 +225,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           <button
             type="button"
             onClick={onReplayBoot}
-            title="Replay boot sequence"
+            title={t.loginReplayHint}
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-700/80 px-2.5 py-1.5 font-mono-tech text-[11px] text-slate-300 transition-colors hover:border-cyan-400/60 hover:text-cyan-300"
           >
             <Terminal className="h-3.5 w-3.5" />
@@ -256,7 +250,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            Sign In
+            {t.loginTabSignIn}
           </button>
           <button
             type="button"
@@ -273,13 +267,13 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            Register
+            {t.loginTabRegister}
           </button>
         </div>
 
         {!isSupabaseConfigured && (
           <div className="mb-4 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-200">
-            Supabase environment keys সেট না থাকলে নিচের সবুজ বাটনে চাপ দিয়ে সরাসরি Virtual Demo মোডে ঢুকতে পারবেন।
+            {t.loginSupabaseMissing}
           </div>
         )}
 
@@ -290,12 +284,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 type="button"
                 onClick={() => avatarInputRef.current?.click()}
                 className="group relative h-16 w-16 shrink-0 cursor-pointer overflow-hidden rounded-full border border-emerald-400/40 bg-[#05060a]"
-                aria-label="Upload profile photo"
+                aria-label={t.loginProfilePhoto}
               >
                 {avatarUrl ? (
                   <img
                     src={avatarUrl}
-                    alt="Profile preview"
+                    alt={t.loginProfilePhoto}
                     className="h-full w-full object-cover"
                     referrerPolicy="no-referrer"
                   />
@@ -310,7 +304,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               </button>
               <div className="min-w-0">
                 <div className="font-mono-tech text-[11px] tracking-wider text-slate-300 uppercase">
-                  Profile Photo
+                  {t.loginProfilePhoto}
                 </div>
                 <button
                   type="button"
@@ -318,10 +312,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   className="mt-1 flex items-center gap-1.5 rounded border border-slate-700 px-2 py-1 font-mono-tech text-[10px] text-slate-200 hover:border-emerald-400/60 hover:text-emerald-300"
                 >
                   <Camera className="h-3.5 w-3.5" />
-                  {avatarUrl ? 'Change photo' : 'Choose photo'}
+                  {avatarUrl ? t.loginChangePhoto : t.loginChoosePhoto}
                 </button>
                 <p className="mt-1 font-mono-tech text-[9px] text-slate-500">
-                  Auto-compressed to 160×160. {telegramIdentity.photoUrl ? 'Telegram photo pre-filled.' : 'Optional.'}
+                  {t.loginPhotoHint}{' '}
+                  {telegramIdentity.photoUrl ? t.loginPhotoPrefilled : t.loginPhotoOptional}
                 </p>
               </div>
               <input
@@ -349,14 +344,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 htmlFor="operator-full-name"
                 className="mb-1.5 block font-mono-tech text-[11px] tracking-wider text-slate-300 uppercase"
               >
-                Full Name
+                {t.loginFullName}
               </label>
               <input
                 id="operator-full-name"
                 type="text"
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
-                placeholder="Your full name"
+                placeholder={t.loginFullNamePlaceholder}
                 autoComplete="name"
                 disabled={!isSupabaseConfigured}
                 className="min-h-[44px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 py-2.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 transition-colors focus:border-emerald-400 focus:outline-none disabled:opacity-50"
@@ -382,8 +377,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               className="min-h-[44px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 py-2.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 transition-colors focus:border-cyan-400 focus:outline-none disabled:opacity-50"
             />
             <p className="mt-1.5 font-mono-tech text-[10px] leading-relaxed text-slate-500">
-              ApyHub checks format, domain &amp; disposable addresses on sign-up — not mailbox
-              ownership.
+              {t.loginEmailHint}
             </p>
             {emailNotice && (
               <p className="mt-1.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-200">
@@ -398,23 +392,21 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 htmlFor="operator-chat-id"
                 className="mb-1.5 block font-mono-tech text-[11px] tracking-wider text-slate-300 uppercase"
               >
-                Telegram Chat ID
+                {t.loginTelegramChatId}
               </label>
               <input
                 id="operator-chat-id"
                 type="text"
                 value={telegramChatId}
                 onChange={(e) => setTelegramChatId(e.target.value)}
-                placeholder="e.g. 123456789"
+                placeholder={t.loginChatPlaceholder}
                 inputMode="numeric"
                 autoComplete="off"
                 disabled={!isSupabaseConfigured}
                 className="min-h-[44px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 py-2.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 transition-colors focus:border-emerald-400 focus:outline-none disabled:opacity-50"
               />
               <p className="mt-1.5 font-mono-tech text-[10px] leading-relaxed text-slate-500">
-                {telegramIdentity.isTelegram
-                  ? 'Auto-filled from your Telegram profile. Trade alerts will be sent here.'
-                  : 'Not in Telegram? Open @TaseenMarketBot, send /start, and copy the chat id it replies with. This is where your private alerts arrive.'}
+                {telegramIdentity.isTelegram ? t.loginChatAutoFilled : t.loginChatHint}
               </p>
             </div>
           )}
@@ -444,7 +436,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 htmlFor="operator-confirm-password"
                 className="mb-1.5 block font-mono-tech text-[11px] tracking-wider text-slate-300 uppercase"
               >
-                Confirm Password
+                {t.loginConfirmPassword}
               </label>
               <input
                 id="operator-confirm-password"
@@ -483,9 +475,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               >
                 {authMode === 'SIGNUP' && <UserPlus className="h-3.5 w-3.5" />}
                 {loading
-                  ? 'PROCESSING...'
+                  ? t.loginProcessing
                   : authMode === 'SIGNUP'
-                    ? 'Create Account (Pending Approval)'
+                    ? t.loginCreateAccount
                     : t.signInBtn}
               </NeonButton>
             )}
@@ -498,7 +490,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 className="flex cursor-pointer items-center justify-end gap-1.5 font-mono-tech text-[11px] text-cyan-400 hover:underline disabled:opacity-60"
               >
                 <Send className="h-3 w-3" />
-                {resetBusy ? 'SENDING CODE...' : 'Forgot Password? (Telegram code)'}
+                {resetBusy ? t.loginSendingCode : t.loginForgot}
               </button>
             )}
 
@@ -506,12 +498,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               <div className="space-y-2.5 rounded-xl border border-cyan-500/35 bg-cyan-500/[0.06] p-3">
                 <div className="flex items-center gap-1.5 font-mono-tech text-[11px] font-bold text-cyan-200 uppercase">
                   <KeyRound className="h-3.5 w-3.5" />
-                  Telegram Password Reset
+                  {t.loginResetTitle}
                 </div>
                 <p className="font-mono-tech text-[10px] leading-relaxed text-slate-400">
-                  Open @TaseenMarketBot — the 6-digit code for{' '}
-                  <span className="text-slate-200">{email.trim() || 'your email'}</span> was sent to
-                  your registered chat.
+                  {t.loginResetHintPrefix}{' '}
+                  <span className="text-slate-200">
+                    {email.trim() || t.loginResetYourEmail}
+                  </span>{' '}
+                  {t.loginResetHintSuffix}
                 </p>
                 <input
                   type="text"
@@ -519,7 +513,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   maxLength={6}
                   value={resetCode}
                   onChange={(e) => setResetCode(e.target.value.replace(/\D/g, ''))}
-                  placeholder="6-digit code"
+                  placeholder={t.loginCodePlaceholder}
                   autoComplete="one-time-code"
                   className="min-h-[42px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 font-mono-tech text-sm tracking-[0.4em] text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
                 />
@@ -527,7 +521,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   type="password"
                   value={resetPassword}
                   onChange={(e) => setResetPassword(e.target.value)}
-                  placeholder="New password (min. 8 characters)"
+                  placeholder={t.loginNewPasswordPlaceholder}
                   autoComplete="new-password"
                   className="min-h-[42px] w-full rounded-lg border border-slate-700/80 bg-[#05060a] px-3.5 font-mono-tech text-sm text-slate-100 placeholder-slate-600 focus:border-cyan-400 focus:outline-none"
                 />
@@ -542,7 +536,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                     }}
                     className="cursor-pointer font-mono-tech text-[10px] text-slate-400 hover:text-slate-200"
                   >
-                    Cancel
+                    {t.cancel}
                   </button>
                   <NeonButton
                     type="button"
@@ -551,7 +545,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                     onClick={() => void handleConfirmReset()}
                     className="min-h-[36px] px-3 py-1 text-[11px]"
                   >
-                    {resetBusy ? 'UPDATING...' : 'SET NEW PASSWORD'}
+                    {resetBusy ? t.loginUpdating : t.loginSetPassword}
                   </NeonButton>
                 </div>
               </div>
@@ -564,11 +558,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               className="w-full"
             >
               <Play className="h-3.5 w-3.5" />
-              Continue as Guest · Virtual Demo
+              {t.loginGuest}
             </NeonButton>
             <p className="text-center font-mono-tech text-[10px] leading-relaxed text-slate-500">
-              Guests can browse live charts and paper-trade. LIVE mode and Binance keys ask you to
-              register or log in.
+              {t.loginGuestHint}
             </p>
           </div>
         </form>

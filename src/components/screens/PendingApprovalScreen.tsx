@@ -6,6 +6,7 @@ import { AccountProfile } from '../../types/trading';
 import { NeonButton } from '../ui/MotionPrimitives';
 
 interface PendingApprovalScreenProps {
+  t: Record<string, string>;
   account: AccountProfile;
   onRefresh: () => Promise<void> | void;
   onSignOut: () => void;
@@ -17,6 +18,7 @@ interface PendingApprovalScreenProps {
  * until `approval_status === 'approved'`.
  */
 export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
+  t,
   account,
   onRefresh,
   onSignOut,
@@ -24,6 +26,12 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
   const reducedMotion = useReducedMotion();
   const [checking, setChecking] = useState(false);
   const rejected = account.approval_status === 'rejected';
+  const statusLabel =
+    account.approval_status === 'approved'
+      ? t.statusApproved
+      : account.approval_status === 'rejected'
+        ? t.statusRejected
+        : t.statusPending;
 
   const handleCheck = async () => {
     setChecking(true);
@@ -70,7 +78,7 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
           )}
           <div className="min-w-0">
             <div className="truncate font-display text-lg font-bold text-slate-100">
-              {account.full_name || 'New Trader'}
+              {account.full_name || t.approvalNewTrader}
             </div>
             <div className="truncate font-mono-tech text-[11px] text-slate-400">{account.email}</div>
           </div>
@@ -88,35 +96,35 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
           </span>
           <div>
             <div className="font-mono-tech text-[10px] tracking-widest text-slate-400 uppercase">
-              AEGIS QUANT // ACCESS CONTROL
+              {t.approvalAccessControl}
             </div>
             <h1 className="mt-1 font-display text-xl font-bold tracking-wide text-slate-100 uppercase">
-              {rejected ? 'Account Not Approved' : 'Account Pending Admin Approval'}
+              {rejected ? t.approvalRejectedTitle : t.approvalPendingTitle}
             </h1>
           </div>
         </div>
 
         <p className="mt-4 text-xs leading-relaxed text-slate-300">
-          {rejected
-            ? 'The administrator declined this registration. If you believe this is a mistake, contact the admin with your email below and register again once cleared.'
-            : 'Your registration was submitted successfully. The administrator has been notified on Telegram and will approve it shortly — this page unlocks automatically once approved.'}
+          {rejected ? t.approvalRejectedBody : t.approvalPendingBody}
         </p>
 
         <div className="mt-5 space-y-2 rounded-xl border border-slate-800 bg-[#05070d] p-3 font-mono-tech text-[11px]">
           <div className="flex items-center justify-between gap-3">
-            <span className="text-slate-500 uppercase">Full name</span>
+            <span className="text-slate-500 uppercase">{t.approvalFullName}</span>
             <span className="truncate text-slate-100">{account.full_name || '—'}</span>
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-slate-500 uppercase">Email</span>
+            <span className="text-slate-500 uppercase">{t.approvalEmail}</span>
             <span className="truncate text-slate-100">{account.email}</span>
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-slate-500 uppercase">Telegram chat</span>
-            <span className="truncate text-amber-200">{account.telegram_chat_id || 'not linked'}</span>
+            <span className="text-slate-500 uppercase">{t.approvalTelegramChat}</span>
+            <span className="truncate text-amber-200">
+              {account.telegram_chat_id || t.approvalNotLinked}
+            </span>
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-slate-500 uppercase">Status</span>
+            <span className="text-slate-500 uppercase">{t.approvalStatus}</span>
             <span
               className={`rounded border px-1.5 py-0.5 font-bold uppercase ${
                 rejected
@@ -124,7 +132,7 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
                   : 'border-amber-400/50 bg-amber-500/10 text-amber-300'
               }`}
             >
-              {account.approval_status}
+              {statusLabel}
             </span>
           </div>
         </div>
@@ -132,10 +140,7 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
         {!account.telegram_chat_id && !rejected && (
           <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200">
             <Send className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>
-              No Telegram chat linked, so alerts cannot be delivered. Open @TaseenMarketBot, send
-              /start, then add the chat id it returns in Settings once approved.
-            </span>
+            <span>{t.approvalNoChat}</span>
           </div>
         )}
 
@@ -148,17 +153,17 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
             className="w-full"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${checking ? 'animate-spin' : ''}`} />
-            {checking ? 'CHECKING STATUS...' : 'CHECK APPROVAL STATUS'}
+            {checking ? t.approvalChecking : t.approvalCheckBtn}
           </NeonButton>
           <NeonButton type="button" variant="ghost" onClick={onSignOut} className="w-full">
             <LogOut className="h-3.5 w-3.5" />
-            Sign out
+            {t.approvalSignOut}
           </NeonButton>
         </div>
 
         <p className="mt-4 flex items-center justify-center gap-1.5 font-mono-tech text-[10px] text-slate-500">
           <CheckCircle2 className="h-3 w-3 text-emerald-400" />
-          Session stays active — approval is detected on refresh.
+          {t.approvalSessionHint}
         </p>
       </motion.div>
     </div>

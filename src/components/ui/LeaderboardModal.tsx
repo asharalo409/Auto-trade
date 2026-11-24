@@ -6,6 +6,7 @@ import { LeaderboardEntry } from '../../types/trading';
 import { NeonButton } from './MotionPrimitives';
 
 interface LeaderboardModalProps {
+  t: Record<string, string>;
   open: boolean;
   onClose: () => void;
   entries: LeaderboardEntry[];
@@ -25,6 +26,7 @@ function signedUsd(value: number): string {
  * names, mode, win rate and net PnL — never balances or API keys.
  */
 export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
+  t,
   open,
   onClose,
   entries,
@@ -42,7 +44,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
       className="fixed inset-0 z-[60] flex items-end justify-center bg-black/85 backdrop-blur-sm sm:items-center sm:p-4"
       role="dialog"
       aria-modal="true"
-      aria-label="Community leaderboard"
+      aria-label={t.lbTitle}
       onClick={onClose}
     >
       <div
@@ -56,18 +58,16 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
             </span>
             <div>
               <h3 className="font-display text-sm font-bold tracking-widest text-amber-200 uppercase">
-                Community Leaderboard
+                {t.lbTitle}
               </h3>
-              <p className="font-mono-tech text-[10px] text-slate-400">
-                Net realized P&L · all traders on @TaseenMarketBot
-              </p>
+              <p className="font-mono-tech text-[10px] text-slate-400">{t.lbSub}</p>
             </div>
           </div>
           <div className="flex items-center gap-1.5">
             <button
               type="button"
               onClick={onRefresh}
-              aria-label="Refresh leaderboard"
+              aria-label={t.lbRefreshAria}
               className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:border-amber-400/60 hover:text-amber-300"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
@@ -75,7 +75,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
             <button
               type="button"
               onClick={onClose}
-              aria-label="Close leaderboard"
+              aria-label={t.lbCloseAria}
               className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:border-rose-400/60 hover:text-rose-300"
             >
               <X className="h-4 w-4" />
@@ -85,11 +85,11 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
 
         <div className="grid grid-cols-3 gap-2 border-b border-slate-800/80 px-4 py-2.5 font-mono-tech text-[10px]">
           <div>
-            <div className="text-slate-500 uppercase">Traders</div>
+            <div className="text-slate-500 uppercase">{t.lbTraders}</div>
             <div className="text-sm font-bold text-slate-100">{entries.length}</div>
           </div>
           <div>
-            <div className="text-slate-500 uppercase">Community P&L</div>
+            <div className="text-slate-500 uppercase">{t.lbCommunityPnl}</div>
             <div
               className={`text-sm font-bold ${
                 totalProfit >= 0 ? 'text-emerald-300' : 'text-rose-300'
@@ -99,7 +99,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
             </div>
           </div>
           <div>
-            <div className="text-slate-500 uppercase">Your Rank</div>
+            <div className="text-slate-500 uppercase">{t.lbYourRank}</div>
             <div className="text-sm font-bold text-amber-300">
               {mine >= 0 ? `#${mine + 1}` : '—'}
             </div>
@@ -109,8 +109,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
         <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
           {entries.length === 0 ? (
             <div className="px-4 py-10 text-center font-mono-tech text-[11px] text-slate-400">
-              No closed trades yet. Start the engine and the first settled trade puts you on the
-              board.
+              {t.lbEmpty}
             </div>
           ) : (
             <ul className="space-y-1.5">
@@ -151,7 +150,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
                         )}
                         {isYou && (
                           <span className="shrink-0 rounded bg-amber-500/20 px-1 font-mono-tech text-[8px] font-bold tracking-wider text-amber-200 uppercase">
-                            you
+                            {t.lbYou}
                           </span>
                         )}
                       </div>
@@ -165,13 +164,18 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
                         >
                           {entry.mode}
                         </span>
-                        <span>{entry.win_rate.toFixed(1)}% win</span>
+                        <span>
+                          {entry.win_rate.toFixed(1)}
+                          {t.lbWinSuffix}
+                        </span>
                         <span>·</span>
-                        <span>{entry.trades} trades</span>
+                        <span>
+                          {entry.trades} {t.lbTradesSuffix}
+                        </span>
                         {entry.running && (
                           <span className="flex items-center gap-1 text-emerald-300">
                             <span className="h-1 w-1 animate-pulse rounded-full bg-emerald-400" />
-                            live
+                            {t.lbLive}
                           </span>
                         )}
                       </div>
@@ -197,12 +201,11 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
 
         <div className="border-t border-slate-800/80 bg-[#05070d] px-4 py-2.5">
           <p className="font-mono-tech text-[9px] leading-relaxed text-slate-500">
-            Only aggregated P&L is shared (USD · ৳{BDT_PER_USD}/USD). API keys, balances and
-            individual trades stay private to each trader's workspace.
+            {t.lbFooter.replace('{rate}', String(BDT_PER_USD))}
           </p>
           <div className="mt-2 flex justify-end">
             <NeonButton type="button" variant="amber" onClick={onClose} className="min-h-[32px] px-3 text-[11px]">
-              Close
+              {t.lbClose}
             </NeonButton>
           </div>
         </div>
