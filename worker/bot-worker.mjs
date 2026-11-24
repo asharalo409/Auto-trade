@@ -1240,6 +1240,58 @@ if (PORT > 0) {
         return;
       }
 
+      /**
+       * Manual "Send Daily Report Now" from the terminal. Renders exactly the same
+       * card the midnight scheduler sends, delivered to the CALLER's own linked
+       * Telegram chat through @TaseenMarketBot.
+       */
+      if (req.method === 'POST' && pathname === '/api/daily-report/send') {
+        try {
+          const authUser = await verifyAccessToken(req);
+          if (!authUser) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Sign in required' }));
+            return;
+          }
+          const me = await fetchAccountById(authUser.id);
+          if (!me) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Account not found' }));
+            return;
+          }
+          if (String(me.approval_status || '').toLowerCase() !== 'approved') {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Approved accounts only' }));
+            return;
+          }
+          if (!String(me.telegram_chat_id || '').trim()) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                ok: false,
+                detail: 'No Telegram chat linked — open @TaseenMarketBot and send /start, then save that chat ID in Settings.',
+              })
+            );
+            return;
+          }
+          const row = await ensureWorkspaceForAccount(me);
+          const sent = row ? await sendDailyPnlReportFor(row) : false;
+          res.writeHead(sent ? 200 : 502, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              ok: sent,
+              detail: sent
+                ? 'Daily report delivered to your Telegram chat'
+                : 'Telegram delivery failed — check the bot token and that the chat is linked',
+            })
+          );
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
       /* ------------------------------------------------------------------ *
        * Admin console API (Supabase session + is_admin required)
        * ------------------------------------------------------------------ */
@@ -1998,10 +2050,14 @@ async function checkHigherTimeframeTrend(symbol, cfg) {
     // DEMO uses a responsive band: ordinary in-trend movement (up to 2.5% below
     // the 1h EMA20) and a wider RSI ceiling still count as a healthy entry, so the
     // 24/7 paper engine keeps scanning and trading instead of vetoing every cycle.
-    const relaxed = cfg.mode === 'virtual' || !cfg.multiTimeframeFilter;
+    // A one-tap strategy preset pins the exact RSI band, so Safe stays strict in
+    // DEMO too. Without a preset the legacy relaxed DEMO band still applies.
+    const relaxed = !cfg.strategyPreset && cfg.mode === 'virtual';
     const emaFloor = relaxed ? ema20 * 0.975 : ema20;
     const bullish = lastClose >= emaFloor;
-    const healthyRsi = relaxed ? rsi <= 78 : rsi >= 40 && rsi <= 72;
+    const rsiMin = Number(cfg.rsiMin ?? 40);
+    const rsiMax = Number(cfg.rsiMax ?? (relaxed ? 78 : 72));
+    const healthyRsi = rsi >= rsiMin && rsi <= rsiMax;
     return {
       ok: bullish && healthyRsi,
       close: lastClose,
@@ -2009,8 +2065,8 @@ async function checkHigherTimeframeTrend(symbol, cfg) {
       rsi,
       relaxed,
       reason: !bullish
-        ? `1h close ${lastClose.toFixed(4)} more than 2.5% below 1h EMA20 ${ema20.toFixed(4)}`
-        : `1h RSI ${rsi.toFixed(1)} above the ${relaxed ? '78' : '72'} buy ceiling`,
+        ? `1h close ${lastClose.toFixed(4)} below 1h EMA20 ${ema20.toFixed(4)}`
+        : `1h RSI ${rsi.toFixed(1)} outside the ${rsiMin}-${rsiMax} buy band`,
     };
   } catch (err) {
     console.warn(`[MTF FILTER] ${symbol} 1h trend check skipped:`, err.message);
@@ -2366,8 +2422,21 @@ function resolveTradingConfig(settings) {
     demoFlag === null || demoFlag === undefined ? isRunning && mode === 'virtual' : Boolean(demoFlag);
   const liveRunning =
     liveFlag === null || liveFlag === undefined ? isRunning && mode === 'live' : Boolean(liveFlag);
+  // One-tap strategy preset chosen in the terminal decides the exact RSI buy band.
+  const presetId = ['safe', 'balanced', 'scalping'].includes(String(settings.strategy_preset || ''))
+    ? String(settings.strategy_preset)
+    : null;
+  const presetBands = {
+    safe: { min: 40, max: 65 },
+    balanced: { min: 40, max: 72 },
+    scalping: { min: 35, max: 78 },
+  };
+  const rsiBand = presetId ? presetBands[presetId] : null;
   return {
     isRunning: demoRunning || liveRunning,
+    strategyPreset: presetId,
+    rsiMin: rsiBand ? rsiBand.min : 40,
+    rsiMax: rsiBand ? rsiBand.max : mode === 'virtual' ? 78 : 72,
     demoRunning,
     liveRunning,
     mode,
@@ -2479,10 +2548,13 @@ function dhakaDateKey(now = new Date()) {
 
 let lastDailyReportKey = null;
 
-/** One midnight report per workspace, delivered to that trader's private chat. */
+/**
+ * Daily performance card for one workspace, delivered to that trader's own chat.
+ * Every approved account with a linked chat gets one, whether its engine is
+ * running or idle, and the terminal's "Send Daily Report Now" reuses it.
+ */
 async function sendDailyPnlReportFor(settings) {
   const cfg = await buildUserCfg(settings);
-  if (!cfg.isRunning) return false;
 
   const since = new Date(Date.now() - 24 * 3600_000).toISOString();
   const { data: rows } = await queryTrades(cfg.scope, { status: 'CLOSED', since });
@@ -2494,13 +2566,11 @@ async function sendDailyPnlReportFor(settings) {
   const realized = closed.reduce((sum, row) => sum + Number(row.profit_usdt || 0), 0);
 
   let liveSpot = Number(settings.balance_usdt || 0);
-  let liveTotal = liveSpot;
   if (cfg.hasCredentials) {
     try {
       const portfolio = await fetchBinancePortfolioUsdt(cfg.apiKey, cfg.apiSecret, cfg.useTestnet);
       if (portfolio) {
         liveSpot = portfolio.spot;
-        liveTotal = portfolio.total;
       }
     } catch (err) {
       console.warn('[DAILY REPORT] Portfolio sync skipped:', err.message);
@@ -2509,26 +2579,29 @@ async function sendDailyPnlReportFor(settings) {
 
   const virtualBalance = readVirtualBalance(settings);
   const bdtRealized = Math.round(realized * BDT_PER_USD);
-  const bdtLive = Math.round(liveTotal * BDT_PER_USD);
-  const bdtVirtual = Math.round(virtualBalance * BDT_PER_USD);
+  // Available = spendable cash for the active workspace (Spot USDT when LIVE).
+  const availableUsd = cfg.mode === 'live' ? liveSpot : virtualBalance;
+  const bdtAvailable = Math.round(availableUsd * BDT_PER_USD);
 
   const lines = [
-    '<b>📊 AEGIS DAILY REPORT</b>',
-    `🗓 ${dhakaDateKey()} · Asia/Dhaka · past 24h`,
-    `🎛 Workspace: <b>${MODE_LABEL[cfg.mode]}</b> · Engine ${
+    '<b>📊 AEGIS DAILY P&amp;L REPORT</b>',
+    `👤 <b>${cfg.displayName}</b>`,
+    `🎛 Mode: <b>${MODE_LABEL[cfg.mode]}</b> · Engine ${
       cfg.isRunning ? '🟢 RUNNING' : '⚪ STOPPED'
     }`,
+    `🗓 ${dhakaDateKey()} · Asia/Dhaka · past 24h`,
     '',
-    `📈 Trades closed: <b>${totalTrades}</b>`,
-    `✅ Win rate: <b>${winRate.toFixed(1)}%</b> (${wins}W / ${losses}L)`,
-    `💰 Realized PnL: <b>${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}</b> (৳${bdtRealized.toLocaleString(
+    `💰 Today's Realized P&amp;L: <b>${realized >= 0 ? '+' : '-'}$${Math.abs(realized).toFixed(
+      2
+    )} USD</b> (৳${Math.abs(bdtRealized).toLocaleString('en-US')} BDT)`,
+    `📈 Total Closed Trades: <b>${totalTrades}</b> · Win Rate: <b>${winRate.toFixed(
+      1
+    )}%</b> (${wins}W / ${losses}L)`,
+    `🏦 Available Balance: <b>$${availableUsd.toFixed(2)} USD</b> (৳${bdtAvailable.toLocaleString(
       'en-US'
-    )})`,
+    )} BDT)`,
     '',
-    `🏦 Live portfolio: $${liveTotal.toFixed(2)} · tradeable Spot $${liveSpot.toFixed(2)} (৳${bdtLive.toLocaleString(
-      'en-US'
-    )})`,
-    `🧪 Virtual balance: $${virtualBalance.toFixed(2)} (৳${bdtVirtual.toLocaleString('en-US')})`,
+    '<i>Tap “Open Terminal” to review positions and the full ledger.</i>',
   ];
 
   if (!cfg.telegramEnabled || !cfg.telegramToken || !cfg.telegramChatId) return false;

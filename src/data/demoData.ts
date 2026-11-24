@@ -127,6 +127,8 @@ alter table public.settings add column if not exists voice_language text default
 alter table public.settings add column if not exists auto_compounding boolean default false;
 alter table public.settings add column if not exists compound_allocation_pct numeric default 5;
 alter table public.settings add column if not exists multi_timeframe_filter boolean default true;
+-- One-tap strategy preset (safe | balanced | scalping) chosen in the RISK tab.
+alter table public.settings add column if not exists strategy_preset text;
 alter table public.trades add column if not exists mode text default 'live';
 
 -- 6. MULTI-USER PLATFORM (one isolated workspace per Telegram user)
@@ -422,6 +424,7 @@ export const INITIAL_DEMO_SETTINGS: BotSettings = {
   auto_compounding: false,
   compound_allocation_pct: 5,
   multi_timeframe_filter: true,
+  strategy_preset: null,
   mode: 'DEMO',
   enabled_pairs: [
     'BTCUSDT',

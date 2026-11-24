@@ -48,6 +48,7 @@ import { TERMINAL_THEMES } from './lib/themes';
 import { BackgroundPresetId, Language, TabId, TradingMode } from './types/trading';
 
 const STORAGE_BG_PREDATOR_KEY = 'aegis_bg_predator_v1';
+const STORAGE_LANG_KEY = 'aegis_language_v1';
 
 const PREDATOR_BG_SRC: Record<Exclude<BackgroundPresetId, 'none'>, string> = {
   tiger: '/src/assets/images/predator_tiger_red_eyes_1795118033481.jpg',
@@ -57,7 +58,14 @@ const PREDATOR_BG_SRC: Record<Exclude<BackgroundPresetId, 'none'>, string> = {
 
 export default function App() {
   const reducedMotion = useReducedMotion();
-  const [lang, setLang] = useState<Language>('en');
+  const [lang, setLang] = useState<Language>(() => {
+    if (typeof window === 'undefined') return 'en';
+    try {
+      return window.localStorage.getItem(STORAGE_LANG_KEY) === 'bn' ? 'bn' : 'en';
+    } catch {
+      return 'en';
+    }
+  });
   const [activeTab, setActiveTab] = useState<TabId>('command');
   const [bootComplete, setBootComplete] = useState(false);
   const [pendingLiveConfirm, setPendingLiveConfirm] = useState(false);
@@ -131,13 +139,19 @@ export default function App() {
     { id: 'settings', label: t.navSettings, icon: SettingsIcon },
     // Admin console only exists for accounts flagged is_admin in Supabase.
     ...(terminal.isAdmin
-      ? [{ id: 'admin' as TabId, label: 'Admin', icon: ShieldCheck }]
+      ? [{ id: 'admin' as TabId, label: t.navAdmin, icon: ShieldCheck }]
       : []),
   ];
 
-  const toggleLanguage = () => {
+  const handleSetLanguage = (next: Language) => {
+    if (next === lang) return;
     audioSynth.playClick();
-    setLang((prev) => (prev === 'en' ? 'bn' : 'en'));
+    setLang(next);
+    try {
+      window.localStorage.setItem(STORAGE_LANG_KEY, next);
+    } catch {
+      // ignore storage errors
+    }
   };
 
   const handleTabChange = (tab: TabId) => {
@@ -312,7 +326,7 @@ export default function App() {
                 className="flex min-h-[30px] cursor-pointer items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider text-amber-200 uppercase hover:border-amber-400/70 hover:text-amber-100"
               >
                 <Trophy className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">Board</span>
+                <span className="hidden sm:inline">{t.navLeaderboard}</span>
               </button>
             )}
             <span
@@ -476,14 +490,32 @@ export default function App() {
               </div>
             )}
 
-            <button
-              type="button"
-              onClick={toggleLanguage}
-              className="tap-target flex min-h-[36px] cursor-pointer items-center gap-1.5 rounded-lg border border-slate-700/80 bg-[#090d16] px-2.5 py-1 font-mono-tech text-[11px] font-semibold text-slate-200 transition-colors hover:border-cyan-400/60 hover:text-cyan-300 whitespace-nowrap"
+            {/* Bilingual pill — EN | বাংলা, persisted in localStorage */}
+            <div
+              role="group"
+              aria-label="Language"
+              className="flex min-h-[32px] items-center rounded-full border border-slate-700/80 bg-[#090d16] p-0.5"
             >
-              <Languages className="h-3.5 w-3.5 text-cyan-400" />
-              <span className="hidden sm:inline">{lang === 'en' ? 'বাংলা' : 'EN'}</span>
-            </button>
+              <Languages className="mx-1 h-3.5 w-3.5 shrink-0 text-cyan-400" />
+              {(['en', 'bn'] as Language[]).map((code) => {
+                const active = lang === code;
+                return (
+                  <button
+                    key={code}
+                    type="button"
+                    onClick={() => handleSetLanguage(code)}
+                    aria-pressed={active}
+                    className={`min-h-[26px] cursor-pointer rounded-full px-2 font-mono-tech text-[10px] font-bold tracking-wider uppercase transition-all whitespace-nowrap ${
+                      active
+                        ? 'bg-cyan-500/25 text-cyan-100 shadow-[0_0_12px_rgba(34,211,238,0.35)]'
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                  >
+                    {code === 'en' ? 'EN' : 'বাংলা'}
+                  </button>
+                );
+              })}
+            </div>
 
             {terminalUnlocked && (
               <button
@@ -649,6 +681,7 @@ export default function App() {
                   t={t}
                   trades={terminal.trades}
                   stats={terminal.stats}
+                  onSendDailyReport={terminal.sendDailyReport}
                 />
               )}
 
@@ -658,6 +691,8 @@ export default function App() {
                   settings={terminal.settings}
                   stats={terminal.stats}
                   trades={terminal.trades}
+                  activePreset={terminal.settings.strategy_preset}
+                  onApplyPreset={terminal.applyStrategyPreset}
                 />
               )}
 
@@ -883,7 +918,7 @@ export default function App() {
                             : 'text-slate-500 active:text-slate-300'
                         }`}
                       >
-                        {isLiveMode ? 'Live' : 'Virtual'}
+                        {isLiveMode ? t.dockLive : t.dockVirtual}
                       </button>
                     );
                   })}
@@ -918,7 +953,7 @@ export default function App() {
                     engineRunning ? 'text-emerald-300' : 'text-slate-500'
                   }`}
                 >
-                  {engineToggling ? '…' : engineRunning ? 'Running' : 'Stopped'}
+                  {engineToggling ? '…' : engineRunning ? t.dockRunning : t.dockStopped}
                 </span>
               </div>
 
@@ -939,8 +974,8 @@ export default function App() {
                   className={dockTabClass(showLeaderboard)}
                 >
                   <Trophy className="relative z-10 h-[18px] w-[18px] text-amber-300" />
-                  <span className="relative z-10 font-mono-tech text-[9px] font-semibold tracking-tight uppercase">
-                    Leaderboard
+                                      <span className="relative z-10 font-mono-tech text-[9px] font-semibold tracking-tight uppercase">
+                    {t.navLeaderboard}
                   </span>
                 </button>
               </div>

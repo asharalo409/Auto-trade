@@ -139,6 +139,8 @@ export interface BotSettings {
   compound_allocation_pct?: number;
   /** Requires the 1h trend (close > EMA20, RSI 40-72) before any fresh BUY. */
   multi_timeframe_filter?: boolean;
+  /** One-tap strategy preset last applied by the user (drives the RSI buy band). */
+  strategy_preset?: 'safe' | 'balanced' | 'scalping' | null;
   mode: TradingMode;
   enabled_pairs: string[];
   telegram_enabled: boolean;

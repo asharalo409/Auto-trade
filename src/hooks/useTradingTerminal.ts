@@ -21,6 +21,7 @@ import { describeAuthError } from '../lib/authErrors';
 import { hasOwnerAdminAccess, isReservedAdminChatId } from '../lib/adminAccess';
 import { resolveWorkspaceIdentity } from '../lib/userIdentity';
 import { MIN_TRADEABLE_USDT } from '../lib/tradeLimits';
+import { getStrategyPreset, StrategyPresetId } from '../lib/strategyPresets';
 import { getTimeBasedTheme } from '../lib/themes';
 import {
   balanceSentence,
@@ -182,6 +183,12 @@ function normalizeSettings(row: Record<string, unknown>, fallback: BotSettings):
       row.multi_timeframe_filter === null || row.multi_timeframe_filter === undefined
         ? (fallback.multi_timeframe_filter ?? true)
         : Boolean(row.multi_timeframe_filter),
+    strategy_preset:
+      row.strategy_preset === 'safe' ||
+      row.strategy_preset === 'balanced' ||
+      row.strategy_preset === 'scalping'
+        ? row.strategy_preset
+        : (fallback.strategy_preset ?? null),
     mode: ((row.mode ?? row.workspace_mode ?? row.trading_mode ?? fallback.mode) as TradingMode),
     enabled_pairs,
     telegram_enabled: telegramEnabled,
@@ -2089,7 +2096,8 @@ export function useTradingTerminal() {
         patch.daily_max_loss_pct !== undefined ||
         patch.auto_compounding !== undefined ||
         patch.compound_allocation_pct !== undefined ||
-        patch.multi_timeframe_filter !== undefined
+        patch.multi_timeframe_filter !== undefined ||
+        patch.strategy_preset !== undefined
       ) {
         const uiSync = {
           sound_enabled: next.sound_enabled,
@@ -2106,6 +2114,7 @@ export function useTradingTerminal() {
           auto_compounding: next.auto_compounding ?? false,
           compound_allocation_pct: next.compound_allocation_pct ?? 5,
           multi_timeframe_filter: next.multi_timeframe_filter ?? true,
+          strategy_preset: next.strategy_preset ?? null,
         };
         setDemoSettings((p) => ({ ...p, ...uiSync }));
         setLiveSettings((p) => ({ ...p, ...uiSync }));
@@ -2167,6 +2176,7 @@ export function useTradingTerminal() {
           auto_compounding: next.auto_compounding ?? false,
           compound_allocation_pct: next.compound_allocation_pct ?? 5,
           multi_timeframe_filter: next.multi_timeframe_filter ?? true,
+          strategy_preset: next.strategy_preset ?? null,
           dca_enabled: next.dca_enabled,
           dca_step_pct: next.dca_step_pct,
           dca_max_buys: next.dca_max_buys,
@@ -2204,6 +2214,58 @@ export function useTradingTerminal() {
     },
     [activeWorkspace, demoSettings, isAuthenticated, isDemoMode, liveSettings, telegramConfig]
   );
+
+  /**
+   * One-tap strategy preset: writes the whole preset bundle (TP, trailing stop,
+   * trade cap, DCA, allocation) plus its RSI buy band to the workspace row so the
+   * 24/7 worker picks up the exact same strategy the operator just chose.
+   */
+  const applyStrategyPreset = useCallback(
+    async (id: StrategyPresetId) => {
+      const preset = getStrategyPreset(id);
+      if (!preset) return;
+      await updateSettings({ ...preset.patch, strategy_preset: id });
+      appendLog(activeWorkspace, {
+        id: createUniqueId('LOG'),
+        level: 'INFO',
+        pair: null,
+        message: `Strategy preset applied: ${preset.label.en.toUpperCase()} — TP ${preset.patch.take_profit_pct}% · trailing ${preset.patch.trailing_stop_pct}% · max ${preset.patch.max_open_trades} trades · RSI ${preset.rsiMin}-${preset.rsiMax}.`,
+        created_at: new Date().toISOString(),
+      });
+    },
+    [activeWorkspace, appendLog, updateSettings]
+  );
+
+  /**
+   * "Send Daily Report Now": asks the 24/7 worker to deliver this trader's daily
+   * PnL summary through @TaseenMarketBot right away, using the same renderer as
+   * the midnight scheduler.
+   */
+  const sendDailyReport = useCallback(async () => {
+    if (!isAuthenticated) {
+      return { ok: false, detail: 'Sign in to send the daily report to your Telegram chat' };
+    }
+    try {
+      const res = await fetch(`${WORKER_URL}/api/daily-report/send`, {
+        method: 'POST',
+        headers: workerAuthHeaders(),
+        body: JSON.stringify({ mode: activeWorkspace }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; detail?: string; error?: string };
+      const detail = String(data.detail || data.error || (res.ok ? 'Daily report sent' : `HTTP ${res.status}`));
+      appendLog(activeWorkspace, {
+        id: createUniqueId('LOG'),
+        level: data.ok ? 'INFO' : 'WARNING',
+        pair: null,
+        message: data.ok ? `Daily PnL report sent to Telegram — ${detail}` : `Daily report failed: ${detail}`,
+        created_at: new Date().toISOString(),
+      });
+      return { ok: Boolean(data.ok), detail };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'Daily report request failed';
+      return { ok: false, detail };
+    }
+  }, [activeWorkspace, appendLog, isAuthenticated, workerAuthHeaders]);
 
   /**
    * Executes a real Binance Spot MARKET order through the 24/7 worker, which owns the
@@ -3819,6 +3881,8 @@ export function useTradingTerminal() {
     getEquitySeries,
     toggleBot,
     updateSettings,
+    applyStrategyPreset,
+    sendDailyReport,
     togglePair,
     closeTrade,
     placeQuickTrade,

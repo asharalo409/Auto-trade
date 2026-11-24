@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -12,7 +12,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { LineChart, Target, TrendingDown, TrendingUp, Wallet } from 'lucide-react';
+import { Loader2, LineChart, Send, Target, TrendingDown, TrendingUp, Wallet } from 'lucide-react';
 import { Trade } from '../../types/trading';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { TerminalPanel } from '../ui/TerminalPanel';
@@ -20,6 +20,8 @@ import { TerminalPanel } from '../ui/TerminalPanel';
 interface PerformanceScreenProps {
   t: Record<string, string>;
   trades: Trade[];
+  /** Asks the 24/7 worker to DM this trader's daily summary via @TaseenMarketBot. */
+  onSendDailyReport?: () => Promise<{ ok: boolean; detail: string }>;
   stats: {
     balance: number;
     totalProfit: number;
@@ -83,7 +85,31 @@ const PerfTooltip: React.FC<{
   );
 };
 
-export const PerformanceScreen: React.FC<PerformanceScreenProps> = ({ t, trades, stats }) => {
+export const PerformanceScreen: React.FC<PerformanceScreenProps> = ({
+  t,
+  trades,
+  stats,
+  onSendDailyReport,
+}) => {
+  const [reportSending, setReportSending] = useState(false);
+  const [reportResult, setReportResult] = useState<{ ok: boolean; detail: string } | null>(null);
+
+  const handleSendDailyReport = async () => {
+    if (!onSendDailyReport || reportSending) return;
+    setReportSending(true);
+    setReportResult(null);
+    try {
+      setReportResult(await onSendDailyReport());
+    } catch (err) {
+      setReportResult({
+        ok: false,
+        detail: err instanceof Error ? err.message : 'Daily report request failed',
+      });
+    } finally {
+      setReportSending(false);
+    }
+  };
+
   const { points, metrics } = useMemo(() => {
     const closed = trades
       .filter((tr) => tr.status === 'CLOSED')
@@ -191,7 +217,39 @@ export const PerformanceScreen: React.FC<PerformanceScreenProps> = ({ t, trades,
 
   return (
     <div className="space-y-4">
-      <TerminalPanel accent="cyan" title={t.perfTitle} subtitle={t.perfSub}>
+      <TerminalPanel
+        accent="cyan"
+        title={t.perfTitle}
+        subtitle={t.perfSub}
+        rightSlot={
+          <div className="flex flex-col items-end gap-1">
+            <button
+              type="button"
+              onClick={() => void handleSendDailyReport()}
+              disabled={reportSending || !onSendDailyReport}
+              className="flex min-h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border border-cyan-500/50 bg-cyan-500/10 px-2.5 py-1 font-mono-tech text-[10px] font-bold tracking-wider text-cyan-200 uppercase transition-colors hover:border-cyan-300 hover:text-cyan-100 disabled:opacity-60"
+            >
+              {reportSending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Send className="h-3.5 w-3.5" />
+              )}
+              {reportSending
+                ? t.dailyReportSending ?? 'SENDING...'
+                : t.dailyReportBtn ?? 'Send Daily Report Now'}
+            </button>
+            {reportResult && (
+              <span
+                className={`max-w-[220px] text-right font-mono-tech text-[10px] ${
+                  reportResult.ok ? 'text-emerald-300' : 'text-rose-300'
+                }`}
+              >
+                {reportResult.detail}
+              </span>
+            )}
+          </div>
+        }
+      >
         <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
           {kpis.map((kpi) => (
             <div

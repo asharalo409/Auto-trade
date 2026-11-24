@@ -1,5 +1,6 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
+import { Check, Gauge, ShieldCheck, Zap } from 'lucide-react';
 import {
   Area,
   AreaChart,
@@ -14,11 +15,20 @@ import {
   YAxis,
 } from 'recharts';
 import { BotSettings, Trade } from '../../types/trading';
+import { STRATEGY_PRESETS, StrategyPresetId } from '../../lib/strategyPresets';
 import { AnimatedNumber } from '../ui/AnimatedNumber';
 import { TerminalPanel } from '../ui/TerminalPanel';
 
+const PRESET_ICONS: Record<StrategyPresetId, React.ComponentType<{ className?: string }>> = {
+  safe: ShieldCheck,
+  balanced: Gauge,
+  scalping: Zap,
+};
+
 interface RiskPanelProps {
   t: Record<string, string>;
+  activePreset?: string | null;
+  onApplyPreset?: (id: StrategyPresetId) => Promise<void> | void;
   settings: BotSettings;
   stats: {
     balance: number;
@@ -48,8 +58,33 @@ function toLocalDateKey(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-export const RiskPanel: React.FC<RiskPanelProps> = ({ t, settings, stats, trades }) => {
+export const RiskPanel: React.FC<RiskPanelProps> = ({
+  t,
+  settings,
+  stats,
+  trades,
+  activePreset,
+  onApplyPreset,
+}) => {
   const reducedMotion = useReducedMotion();
+  const [applyingPreset, setApplyingPreset] = useState<StrategyPresetId | null>(null);
+  const selectedPreset = activePreset ?? settings.strategy_preset ?? null;
+
+  const presetCopy: Record<StrategyPresetId, { label: string; blurb: string }> = {
+    safe: { label: t.presetSafe ?? 'Safe', blurb: t.presetSafeDesc ?? '' },
+    balanced: { label: t.presetBalanced ?? 'Balanced', blurb: t.presetBalancedDesc ?? '' },
+    scalping: { label: t.presetScalping ?? 'Scalping', blurb: t.presetScalpingDesc ?? '' },
+  };
+
+  const handleApplyPreset = async (id: StrategyPresetId) => {
+    if (!onApplyPreset || applyingPreset) return;
+    setApplyingPreset(id);
+    try {
+      await onApplyPreset(id);
+    } finally {
+      setApplyingPreset(null);
+    }
+  };
   const limit = Math.max(1, settings.daily_loss_limit);
   const lossRatio = Math.min(1, stats.todayLoss / limit);
   const lossPct = Math.round(lossRatio * 100);
@@ -137,6 +172,64 @@ export const RiskPanel: React.FC<RiskPanelProps> = ({ t, settings, stats, trades
 
   return (
     <div className="space-y-4">
+      {/* One-tap strategy presets — writes the full bundle to Supabase immediately */}
+      <TerminalPanel
+        accent="cyan"
+        title={t.presetTitle ?? 'Strategy Presets'}
+        subtitle={t.presetSub ?? 'Configure the engine with a single tap'}
+        rightSlot={
+          selectedPreset ? (
+            <span className="flex items-center gap-1 rounded-full border border-emerald-400/60 bg-emerald-500/15 px-2 py-0.5 font-mono-tech text-[10px] font-bold tracking-wider text-emerald-200 uppercase">
+              <Check className="h-3 w-3" />
+              {t.presetActive ?? 'ACTIVE'}
+            </span>
+          ) : null
+        }
+      >
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {STRATEGY_PRESETS.map((preset) => {
+            const Icon = PRESET_ICONS[preset.id];
+            const active = selectedPreset === preset.id;
+            const busy = applyingPreset === preset.id;
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => void handleApplyPreset(preset.id)}
+                disabled={busy}
+                aria-pressed={active}
+                className={`relative flex min-h-[76px] cursor-pointer flex-col items-start gap-1 rounded-xl border px-3 py-2.5 text-left transition-all active:scale-[0.99] disabled:opacity-70 ${
+                  active
+                    ? `${preset.accent.border} ${preset.accent.bg} ${preset.accent.glow}`
+                    : 'border-slate-800 bg-[#05070d] hover:border-slate-600'
+                }`}
+              >
+                <span
+                  className={`flex items-center gap-1.5 font-mono-tech text-xs font-bold tracking-wider uppercase ${
+                    active ? preset.accent.text : 'text-slate-200'
+                  }`}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  {presetCopy[preset.id].label}
+                  {active && (
+                    <span className="ml-auto rounded-full border border-current px-1.5 py-px text-[9px] tracking-widest">
+                      {busy ? '···' : t.presetActive ?? 'ACTIVE'}
+                    </span>
+                  )}
+                </span>
+                <span className="font-mono-tech text-[10px] leading-snug text-slate-400">
+                  {presetCopy[preset.id].blurb}
+                </span>
+                <span className="font-mono-tech text-[9px] tracking-wide text-slate-500 uppercase">
+                  TP {preset.patch.take_profit_pct}% · TS {preset.patch.trailing_stop_pct}% · MAX{' '}
+                  {preset.patch.max_open_trades} · RSI {preset.rsiMin}–{preset.rsiMax}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </TerminalPanel>
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         <TerminalPanel
           accent={lossRatio >= 0.8 ? 'crimson' : 'amber'}
