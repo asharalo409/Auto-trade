@@ -1246,7 +1246,28 @@ if (PORT > 0) {
        * Telegram chat through @TaseenMarketBot.
        */
       if (req.method === 'POST' && pathname === '/api/daily-report/send') {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', async () => {
         try {
+          // The terminal sends the workspace it is showing; anything else is ignored.
+          let requestedMode = '';
+          try {
+            requestedMode = String(JSON.parse(body || '{}').mode || '')
+              .trim()
+              .toLowerCase();
+          } catch {
+            requestedMode = '';
+          }
+          // "DEMO" / "VIRTUAL" / "LIVE" all arrive lowercased from the terminal.
+          const modeOverride =
+            requestedMode === 'live' || requestedMode === 'real'
+              ? 'live'
+              : requestedMode === 'demo' || requestedMode === 'virtual'
+                ? 'virtual'
+                : null;
           const authUser = await verifyAccessToken(req);
           if (!authUser) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -1275,7 +1296,7 @@ if (PORT > 0) {
             return;
           }
           const row = await ensureWorkspaceForAccount(me);
-          const sent = row ? await sendDailyPnlReportFor(row) : false;
+          const sent = row ? await sendDailyPnlReportFor(row, { modeOverride }) : false;
           res.writeHead(sent ? 200 : 502, { 'Content-Type': 'application/json' });
           res.end(
             JSON.stringify({
@@ -1289,6 +1310,7 @@ if (PORT > 0) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: err.message }));
         }
+        });
         return;
       }
 
@@ -2342,19 +2364,23 @@ const DEMO_MTF_FALLBACK_COOLDOWN_MS = 20 * 60_000;
 const demoMtfFallbackState = new Map();
 
 function demoMtfFallbackKey(cfg, symbol) {
-  return `${cfg.scope || cfg.id || 'owner'}:${symbol}`;
+  // The preset is part of the streak key: switching strategy starts from a clean
+  // veto count instead of inheriting the previous preset's tolerated streak.
+  return `${cfg.scope || cfg.id || 'owner'}:${symbol}:${cfg.strategyPreset || 'auto'}`;
 }
 
 /**
  * Records one 1h-trend veto for a DEMO symbol and reports whether the bounded fallback
- * should let this paper entry through anyway.
+ * should let this paper entry through anyway. A selected strategy preset is
+ * authoritative: its RSI band (Safe's strict 40-65) is never overridden, so the
+ * fallback only exists for workspaces that have not chosen a preset.
  */
 function trackDemoMtfVeto(cfg, symbol, nowMs) {
   const key = demoMtfFallbackKey(cfg, symbol);
   const prev = demoMtfFallbackState.get(key) || { vetos: 0, firstVetoAt: nowMs, lastOverrideAt: 0 };
   const state = { ...prev, vetos: prev.vetos + 1, firstVetoAt: prev.firstVetoAt || nowMs };
   const waitedMs = nowMs - state.firstVetoAt;
-  const isDemo = cfg.mode === 'virtual';
+  const isDemo = cfg.mode === 'virtual' && !cfg.strategyPreset;
   const enoughVetos = state.vetos >= DEMO_MTF_FALLBACK_VETO_LIMIT;
   const waitedLongEnough = waitedMs >= DEMO_MTF_FALLBACK_WAIT_MS;
   const coolingDown = nowMs - state.lastOverrideAt < DEMO_MTF_FALLBACK_COOLDOWN_MS;
@@ -2549,16 +2575,45 @@ function dhakaDateKey(now = new Date()) {
 let lastDailyReportKey = null;
 
 /**
+ * The workspace the trader is actually on: the engine switch that is currently ON
+ * wins, then the account's own declared trading mode, then the workspace row. The
+ * report's label, trade filter and balance are all derived from this one value, so
+ * a stale `trading_mode` column can never mix LIVE numbers with DEMO trades.
+ */
+function resolveReportWorkspaceMode(settings, cfg) {
+  if (cfg.liveRunning && !cfg.demoRunning) return 'live';
+  if (cfg.demoRunning && !cfg.liveRunning) return 'virtual';
+  const accountMode = String(settings?.__account?.trading_mode || '')
+    .trim()
+    .toLowerCase();
+  if (accountMode === 'live' || accountMode === 'virtual') return accountMode;
+  const rowMode = String(
+    settings?.workspace_mode ?? settings?.trading_mode ?? settings?.mode ?? ''
+  )
+    .trim()
+    .toLowerCase();
+  if (rowMode === 'live' || rowMode === 'virtual') return rowMode;
+  return cfg.mode;
+}
+
+/**
  * Daily performance card for one workspace, delivered to that trader's own chat.
  * Every approved account with a linked chat gets one, whether its engine is
  * running or idle, and the terminal's "Send Daily Report Now" reuses it.
  */
-async function sendDailyPnlReportFor(settings) {
+async function sendDailyPnlReportFor(settings, { modeOverride = null } = {}) {
   const cfg = await buildUserCfg(settings);
+  // Manual sends carry the workspace the operator is looking at; the midnight
+  // scheduler derives it from the running engine / account mode.
+  const reportMode =
+    modeOverride === 'live' || modeOverride === 'virtual'
+      ? modeOverride
+      : resolveReportWorkspaceMode(settings, cfg);
+  const reportRunning = reportMode === 'live' ? cfg.liveRunning : cfg.demoRunning;
 
   const since = new Date(Date.now() - 24 * 3600_000).toISOString();
   const { data: rows } = await queryTrades(cfg.scope, { status: 'CLOSED', since });
-  const closed = (rows || []).filter((row) => tradeModeOf(row) === cfg.mode);
+  const closed = (rows || []).filter((row) => tradeModeOf(row) === reportMode);
   const totalTrades = closed.length;
   const wins = closed.filter((row) => Number(row.profit_usdt || 0) > 0).length;
   const losses = Math.max(0, totalTrades - wins);
@@ -2580,14 +2635,14 @@ async function sendDailyPnlReportFor(settings) {
   const virtualBalance = readVirtualBalance(settings);
   const bdtRealized = Math.round(realized * BDT_PER_USD);
   // Available = spendable cash for the active workspace (Spot USDT when LIVE).
-  const availableUsd = cfg.mode === 'live' ? liveSpot : virtualBalance;
+  const availableUsd = reportMode === 'live' ? liveSpot : virtualBalance;
   const bdtAvailable = Math.round(availableUsd * BDT_PER_USD);
 
   const lines = [
     '<b>📊 AEGIS DAILY P&amp;L REPORT</b>',
     `👤 <b>${cfg.displayName}</b>`,
-    `🎛 Mode: <b>${MODE_LABEL[cfg.mode]}</b> · Engine ${
-      cfg.isRunning ? '🟢 RUNNING' : '⚪ STOPPED'
+    `🎛 Mode: <b>${MODE_LABEL[reportMode]}</b> · Engine ${
+      reportRunning ? '🟢 RUNNING' : '⚪ STOPPED'
     }`,
     `🗓 ${dhakaDateKey()} · Asia/Dhaka · past 24h`,
     '',
@@ -2610,7 +2665,7 @@ async function sendDailyPnlReportFor(settings) {
   });
   await appendLog(
     'INFO',
-    `[${MODE_LABEL[cfg.mode]}] Daily report sent to ${cfg.displayName} — ${totalTrades} trades, ${winRate.toFixed(
+    `[${MODE_LABEL[reportMode]}] Daily report sent to ${cfg.displayName} — ${totalTrades} trades, ${winRate.toFixed(
       1
     )}% win rate, realized $${realized.toFixed(2)}.`
   );
