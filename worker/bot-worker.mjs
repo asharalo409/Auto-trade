@@ -2177,6 +2177,62 @@ async function fetchBinancePortfolioUsdt(apiKey, apiSecret, useTestnet) {
   };
 }
 
+/*
+ * Binance Earn trap: with Auto-Subscribe ON, idle USDT is swept out of Spot into
+ * Simple Earn, so the live engine silently has nothing tradeable. Spot USDT is the
+ * only balance a Spot order can spend (Funding and Earn cannot be traded), so when
+ * Spot is below the $5 floor while Earn holds funds we tell that trader exactly how
+ * to move it back — once per cooldown window, never to the admin's chat.
+ */
+const EARN_ALERT_COOLDOWN_MS = 6 * 3600_000;
+const EARN_ALERT_MIN_SPOT_USDT = 5;
+/** scope -> last alert timestamp (worker state; resets when Spot is funded again). */
+const lastEarnAlertAt = new Map();
+
+function earnAlertKey(cfg) {
+  return String(cfg?.scope || cfg?.id || 'owner');
+}
+
+async function checkEarnWalletTrap(cfg, portfolio) {
+  if (!cfg?.hasCredentials || !portfolio) return;
+  const key = earnAlertKey(cfg);
+  // Whole Spot USDT position (free + locked in an open order), not the portfolio total.
+  const spotUsdt = Number(portfolio.usdtFree || 0) + Number(portfolio.usdtLocked || 0);
+  const earnBalance = Number(portfolio.earn || 0);
+  // Funds are back on Spot: the condition cleared, so the next trap alerts at once.
+  if (spotUsdt >= EARN_ALERT_MIN_SPOT_USDT) {
+    lastEarnAlertAt.delete(key);
+    return;
+  }
+  if (!(earnBalance > 0)) return;
+  const now = Date.now();
+  // Recorded before the send so the 6h window holds even if Telegram is down.
+  if (now - (lastEarnAlertAt.get(key) || 0) < EARN_ALERT_COOLDOWN_MS) return;
+  lastEarnAlertAt.set(key, now);
+
+  const text = [
+    '⚠️ <b>LIVE SPOT BALANCE LOW — FUNDS IN EARN WALLET</b>',
+    `• Live Spot USDT: $${spotUsdt.toFixed(2)}`,
+    `• Binance Earn Balance: $${earnBalance.toFixed(2)}`,
+    'Your bot cannot trade because your USDT moved to Binance Earn.',
+    '👉 <b>How to fix:</b> Open Binance App → <b>Wallets → Earn</b>, turn <b>OFF</b> <code>Auto-Subscribe</code> for USDT, and tap <b>Redeem</b> to move your funds back to <b>Spot Wallet</b>.',
+  ].join('\n');
+
+  // Strictly this workspace's own chat: sendTelegram never falls back to the admin.
+  const sent = await sendTelegram(text, cfg.telegramToken, cfg.telegramChatId, {
+    replyMarkup: TELEGRAM_OPEN_TERMINAL_MARKUP,
+  });
+
+  const logMsg = `Live Spot USDT below $5 ($${spotUsdt.toFixed(2)}) while $${earnBalance.toFixed(
+    2
+  )} sits in Earn — disable Auto-Subscribe on Binance`;
+  console.warn(`[EARN ALERT] ${key}: ${logMsg}`);
+  await appendLog('WARNING', logMsg);
+  if (!sent && cfg.telegramChatId) {
+    console.warn(`[EARN ALERT] Telegram delivery to ${key} failed; retrying after the cooldown.`);
+  }
+}
+
 async function placeBinanceMarketOrder(symbol, side, quoteOrderQty, quantity, apiKey, apiSecret, useTestnet) {
   const params = {
     symbol,
@@ -3865,6 +3921,8 @@ async function runCycleForUserMode(settings, mode) {
         if (portfolio) {
           liveSpot = portfolio.spot;
           heartbeatPatch.balance_usdt = portfolio.total;
+          // LIVE only: warn when the tradeable Spot USDT sits in Simple Earn instead.
+          if (mode === 'live' && cfg.liveRunning) await checkEarnWalletTrap(cfg, portfolio);
           const balanceKeyId = cfg.scope || 'owner';
           if (lastLoggedBalance.get(balanceKeyId) !== portfolio.total) {
             lastLoggedBalance.set(balanceKeyId, portfolio.total);
